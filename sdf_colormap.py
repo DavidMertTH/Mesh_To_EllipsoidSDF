@@ -1,8 +1,13 @@
+"""
+sdf_colormap.py — SDF-specific color mapping utilities for pyqtgraph.
+"""
+
 import numpy as np
 import pyqtgraph as pg
 
 
 def make_sdf_colormap() -> pg.ColorMap:
+
     pos = np.array([0.0, 0.45, 0.50, 0.55, 1.0], dtype=float)
     colors = np.array([
         [242, 230,  65, 255],
