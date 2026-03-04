@@ -16,6 +16,9 @@ Both SDF panels share the same AABB / grid so slices are directly comparable.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import numpy as np
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -27,11 +30,20 @@ from ellipsoid import EllipsoidSet, create_demo_ellipsoids
 from viewer3d import MeshViewer3D, EllipsoidViewer3D
 from widgets import SdfSlicePanel
 
+# Supported mesh file extensions (trimesh)
+MESH_EXTENSIONS = {".obj", ".stl", ".ply", ".glb", ".gltf", ".off", ".dae"}
+
+# Default mesh directory relative to this file
+DEFAULT_MESH_DIR = Path(__file__).parent / "meshes"
+
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, mesh_dir: Path | str | None = None):
         super().__init__()
         self.setWindowTitle("Mesh → Ellipsoid SDF Approximation")
+
+        self._mesh_dir = Path(mesh_dir) if mesh_dir else DEFAULT_MESH_DIR
+        self._mesh_dir.mkdir(parents=True, exist_ok=True)
 
         wp.init()
         self._device = "cuda" if wp.is_cuda_available() else "cpu"
@@ -40,28 +52,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ellipsoids: EllipsoidSet = create_demo_ellipsoids(device=self._device)
 
         self._last_mesh_result: SdfResult | None = None
-
-
         self._mesh_viewer = MeshViewer3D()
         self._mesh_sdf_panel = SdfSlicePanel()
 
         self._ell_viewer = EllipsoidViewer3D()
         self._ell_sdf_panel = SdfSlicePanel()
+        self._status = self.statusBar()
 
         self._build_layout()
         self._build_toolbar()
         self._connect_signals()
 
-        self._status = self.statusBar()
-        self._status.showMessage(
-            "Drag & drop a mesh onto the top-left view. "
-            "SDF + demo ellipsoids will be computed automatically."
-        )
-
         self._ell_viewer.show_ellipsoids(self._ellipsoids)
 
-
     def _build_layout(self):
+        central = QtWidgets.QWidget()
+        root_layout = QtWidgets.QVBoxLayout(central)
+        root_layout.setContentsMargins(4, 4, 4, 4)
+        root_layout.setSpacing(4)
+
+        # ── Mesh selector bar ─────────────────────────────────────────────
+        selector_bar = QtWidgets.QHBoxLayout()
+        selector_bar.setSpacing(6)
+
+        selector_bar.addWidget(QtWidgets.QLabel("Mesh:"))
+
+        self._mesh_combo = QtWidgets.QComboBox()
+        self._mesh_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed,
+        )
+        selector_bar.addWidget(self._mesh_combo)
+
+        self._btn_refresh = QtWidgets.QPushButton("↻")
+        self._btn_refresh.setFixedWidth(32)
+        self._btn_refresh.setToolTip("Rescan meshes/ folder")
+        selector_bar.addWidget(self._btn_refresh)
+
+        self._btn_open_dir = QtWidgets.QPushButton("📂 Open folder")
+        self._btn_open_dir.setToolTip(f"Open {self._mesh_dir}")
+        selector_bar.addWidget(self._btn_open_dir)
+
+        root_layout.addLayout(selector_bar)
+
+        # ── 2×2 splitter grid ────────────────────────────────────────────
         top_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         top_splitter.addWidget(self._mesh_viewer.widget)
         top_splitter.addWidget(self._mesh_sdf_panel)
@@ -77,7 +110,12 @@ class MainWindow(QtWidgets.QMainWindow):
         main_splitter.addWidget(bot_splitter)
         main_splitter.setSizes([450, 450])
 
-        self.setCentralWidget(main_splitter)
+        root_layout.addWidget(main_splitter, 1)
+
+        self.setCentralWidget(central)
+
+        # Populate combo on startup
+        self._scan_mesh_dir()
 
     def _build_toolbar(self):
         act_compute = QtGui.QAction("Compute SDF Grid (G)", self)
@@ -89,14 +127,67 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addAction(act_compute)
 
     def _connect_signals(self):
+        # Drag-and-drop on mesh viewer
         self._mesh_viewer.widget.fileDropped.connect(self._on_file_dropped)
 
+        # Compute buttons on both panels
         self._mesh_sdf_panel.computeRequested.connect(self._on_compute_all)
         self._ell_sdf_panel.computeRequested.connect(self._on_compute_all)
+
+        # Mesh selector
+        self._mesh_combo.activated.connect(self._on_combo_selected)
+        self._btn_refresh.clicked.connect(self._scan_mesh_dir)
+        self._btn_open_dir.clicked.connect(self._open_mesh_dir)
+
+    # ── mesh directory scanning ───────────────────────────────────────────
+
+    def _scan_mesh_dir(self):
+        """Scan the meshes/ folder and populate the combo box."""
+        self._mesh_combo.blockSignals(True)
+
+        prev_text = self._mesh_combo.currentText()
+        self._mesh_combo.clear()
+        self._mesh_combo.addItem("— select mesh —")
+
+        if self._mesh_dir.is_dir():
+            files = sorted(
+                f for f in self._mesh_dir.iterdir()
+                if f.is_file() and f.suffix.lower() in MESH_EXTENSIONS
+            )
+            for f in files:
+                self._mesh_combo.addItem(f.name, str(f))
+
+        # Try to restore previous selection
+        idx = self._mesh_combo.findText(prev_text)
+        if idx >= 1:
+            self._mesh_combo.setCurrentIndex(idx)
+
+        self._mesh_combo.blockSignals(False)
+
+        count = self._mesh_combo.count() - 1  # minus placeholder
+        self._status.showMessage(
+            f"Found {count} mesh(es) in {self._mesh_dir}. "
+            f"Select from dropdown or drag & drop."
+        )
+
+    def _on_combo_selected(self, index: int):
+        if index < 1:
+            return
+        path = self._mesh_combo.itemData(index)
+        if path:
+            self._load_mesh(path)
+
+    def _open_mesh_dir(self):
+        """Open the meshes/ folder in the OS file explorer."""
+        path = str(self._mesh_dir.resolve())
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
 
     # ── slots ─────────────────────────────────────────────────────────────
 
     def _on_file_dropped(self, path: str):
+        self._load_mesh(path)
+
+    def _load_mesh(self, path: str):
         try:
             mesh = load_and_prepare(path, target_scale=1.0)
 
@@ -106,16 +197,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mesh_viewer.show_mesh(verts, faces)
             self._sdf.set_mesh(verts, faces)
 
+            # Sync combo box with loaded file
+            name = Path(path).name
+            idx = self._mesh_combo.findText(name)
+            self._mesh_combo.blockSignals(True)
+            if idx >= 1:
+                self._mesh_combo.setCurrentIndex(idx)
+            else:
+                self._mesh_combo.setCurrentIndex(0)
+            self._mesh_combo.blockSignals(False)
+
             self._status.showMessage(
                 f"Loaded: {path} | verts={len(verts)} faces={len(faces)} | device={self._device}"
             )
 
+            # Auto-compute both SDFs
             self._on_compute_all()
 
         except Exception as e:
             self._status.showMessage(f"Failed to load: {path} ({e})")
 
     def _on_compute_all(self, n: int | None = None):
+        """Compute mesh SDF, then ellipsoid SDF using the same grid."""
         if not self._sdf.is_ready:
             self._status.showMessage("Load a mesh first.")
             return
@@ -123,7 +226,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if n is None:
             n = self._mesh_sdf_panel.requested_n
 
-        # ── 1. Mesh SDF ──────────────────────────────────────────────────
         self._status.showMessage(f"Computing mesh SDF (n={n}) on {self._device} …")
         try:
             mesh_result = self._sdf.compute_voxel_grid(n=n)
