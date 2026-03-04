@@ -1,3 +1,11 @@
+"""
+sdf_compute.py — Warp-based SDF computation on triangle meshes.
+
+Provides:
+  - GPU/CPU kernels for single-point and voxel-grid SDF queries.
+  - SdfComputer class that manages mesh upload and grid computation.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,3 +1,10 @@
+"""
+widgets.py — Reusable Qt widgets for the SDF viewer application.
+
+  - DropGLView:  GLViewWidget that accepts file drag-and-drop.
+  - SdfSlicePanel: Right-side panel showing an XY slice of the SDF grid.
+"""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -14,6 +21,7 @@ from sdf_colormap import make_sdf_lut
 # ── 3-D viewport with drag-and-drop ──────────────────────────────────────────
 
 class DropGLView(gl.GLViewWidget):
+    """GLViewWidget that emits *fileDropped(str)* when a file is dropped on it."""
 
     fileDropped = QtCore.Signal(str)
 
@@ -41,6 +49,13 @@ class DropGLView(gl.GLViewWidget):
 # ── SDF slice panel ──────────────────────────────────────────────────────────
 
 class SdfSlicePanel(QtWidgets.QWidget):
+    """
+    Panel that displays an XY slice through a 3-D SDF grid.
+
+    Signals:
+        computeRequested(int)  – emitted when the user clicks Compute.
+                                 Carries the requested grid resolution *n*.
+    """
 
     computeRequested = QtCore.Signal(int)
 
@@ -53,6 +68,10 @@ class SdfSlicePanel(QtWidgets.QWidget):
     # ── public API ────────────────────────────────────────────────────────
 
     def set_sdf(self, grid: np.ndarray) -> None:
+        """
+        Provide a new SDF volume (nz, ny, nx) and refresh the view.
+        The Z slider is automatically adjusted.
+        """
         self._sdf_grid = grid
         n = grid.shape[0]
 

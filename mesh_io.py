@@ -1,8 +1,13 @@
+"""
+mesh_io.py — Loading, flattening, and normalizing triangle meshes via trimesh.
+"""
+
 import numpy as np
 import trimesh
 
 
 def as_trimesh_scene(path: str) -> trimesh.Scene:
+    """Load any mesh file as a trimesh.Scene (handles multi-geometry)."""
     loaded = trimesh.load(path, force="scene")
     if isinstance(loaded, trimesh.Trimesh):
         scene = trimesh.Scene()
@@ -12,6 +17,10 @@ def as_trimesh_scene(path: str) -> trimesh.Scene:
 
 
 def scene_to_single_mesh(scene: trimesh.Scene) -> trimesh.Trimesh:
+    """
+    Flatten a Scene into one Trimesh in world coordinates.
+    Triangulated, merged.
+    """
     geom = scene.to_geometry()
 
     if isinstance(geom, trimesh.Trimesh):
@@ -36,6 +45,7 @@ def scene_to_single_mesh(scene: trimesh.Scene) -> trimesh.Trimesh:
 
 
 def normalize_mesh(mesh: trimesh.Trimesh, target_scale: float = 1.0) -> trimesh.Trimesh:
+    """Center at origin and scale to fit into [-target_scale, target_scale]."""
     v = mesh.vertices
     center = (v.min(axis=0) + v.max(axis=0)) * 0.5
     v = v - center
@@ -47,6 +57,10 @@ def normalize_mesh(mesh: trimesh.Trimesh, target_scale: float = 1.0) -> trimesh.
 
 
 def load_and_prepare(path: str, target_scale: float = 1.0) -> trimesh.Trimesh:
+    """
+    Convenience: load → flatten → normalize in one call.
+    Returns a single Trimesh with float32 verts and int32 faces.
+    """
     scene = as_trimesh_scene(path)
     mesh = scene_to_single_mesh(scene)
     mesh = normalize_mesh(mesh, target_scale=target_scale)
