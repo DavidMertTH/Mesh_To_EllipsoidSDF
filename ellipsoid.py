@@ -67,7 +67,6 @@ def _ellipsoid_union_sdf_kernel(
     out_sdf[tid] = min_d
 
 
-# ── Data container for a single ellipsoid ─────────────────────────────────────
 
 @dataclass
 class Ellipsoid:
@@ -80,7 +79,6 @@ class Ellipsoid:
         return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
 
-# ── Ellipsoid set ─────────────────────────────────────────────────────────────
 
 class EllipsoidSet:
 
@@ -105,7 +103,6 @@ class EllipsoidSet:
     def count(self) -> int:
         return self.centers.shape[0]
 
-    # ── update (e.g. from ML optimiser) ───────────────────────────────────
 
     def set_parameters(
         self,
@@ -154,7 +151,6 @@ class EllipsoidSet:
 
         return out.numpy().reshape((nz, ny, nx)).astype(np.float32, copy=False)
 
-    # ── Mesh generation for 3-D visualisation ─────────────────────────────
 
     def generate_meshes(self, subdivisions: int = 3) -> List[trimesh.Trimesh]:
 
