@@ -20,14 +20,14 @@ from widgets import DropGLView
 # ── Colour palette for ellipsoids ─────────────────────────────────────────────
 
 ELLIPSOID_PALETTE = [
-    (0.90, 0.40, 0.25, 0.75),
-    (0.30, 0.75, 0.45, 0.75),
-    (0.35, 0.50, 0.90, 0.75),
-    (0.85, 0.70, 0.20, 0.75),
-    (0.70, 0.30, 0.80, 0.75),
-    (0.25, 0.80, 0.80, 0.75),
-    (0.90, 0.50, 0.70, 0.75),
-    (0.55, 0.85, 0.30, 0.75),
+    (242 / 255, 230 / 255,  65 / 255, 0.70),   # gold (edge colour)
+    ( 73 / 255,  98 / 255, 242 / 255, 0.70),   # blue (mesh face colour)
+    (242 / 255, 213 / 255,  65 / 255, 0.70),   # warm gold
+    ( 24 / 255,  40 / 255,  89 / 255, 0.85),   # deep navy
+    (140 / 255, 160 / 255, 242 / 255, 0.70),   # light periwinkle
+    (200 / 255, 195 / 255,  55 / 255, 0.70),   # muted olive-gold
+    ( 50 / 255,  70 / 255, 160 / 255, 0.75),   # mid blue
+    (220 / 255, 220 / 255, 180 / 255, 0.65),   # pale warm white
 ]
 
 
@@ -90,14 +90,6 @@ class MeshViewer3D(_BaseViewer):
 # ── Ellipsoid viewer ──────────────────────────────────────────────────────────
 
 class EllipsoidViewer3D(_BaseViewer):
-    """
-    Shows a set of ellipsoids as coloured triangle meshes.
-
-    Usage:
-        viewer.show_ellipsoids(ellipsoid_set)
-        viewer.clear_ellipsoids()
-    """
-
     def __init__(self):
         super().__init__()
         self._items: List[gl.GLMeshItem] = []
