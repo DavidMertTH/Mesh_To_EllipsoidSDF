@@ -29,6 +29,7 @@ from sdf_compute import SdfComputer, SdfResult
 from ellipsoid import EllipsoidSet, create_demo_ellipsoids
 from viewer3d import MeshViewer3D, EllipsoidViewer3D
 from widgets import SdfSlicePanel
+from optimization import OptimizationWorker
 
 # Supported mesh file extensions (trimesh)
 MESH_EXTENSIONS = {".obj", ".stl", ".ply", ".glb", ".gltf", ".off", ".dae"}
@@ -64,6 +65,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_signals()
 
         self._ell_viewer.show_ellipsoids(self._ellipsoids)
+
+        self._opt_worker: OptimizationWorker | None = None
 
     def _build_layout(self):
         central = QtWidgets.QWidget()
@@ -259,13 +262,20 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
 
-    def update_ellipsoids(self, ellipsoid_set: EllipsoidSet) -> None:
+    def update_ellipsoids(
+            self,
+            ellipsoid_set: EllipsoidSet,
+            use_last_mesh_grid: bool = True,
+            origin: np.ndarray = None,
+            dx: float = None,
+            n: int = None,
+    ) -> None:
 
         self._ellipsoids = ellipsoid_set
 
         self._ell_viewer.show_ellipsoids(self._ellipsoids)
 
-        if self._last_mesh_result is not None:
+        if use_last_mesh_grid and self._last_mesh_result is not None:
             r = self._last_mesh_result
             ell_grid = self._ellipsoids.compute_sdf_grid(
                 origin=r.origin,
@@ -273,3 +283,58 @@ class MainWindow(QtWidgets.QMainWindow):
                 n=r.n,
             )
             self._ell_sdf_panel.set_sdf(ell_grid)
+        elif origin is not None and dx is not None and n is not None:
+            ell_grid = self._ellipsoids.compute_sdf_grid(
+                origin=origin,
+                dx=dx,
+                n=n,
+            )
+            self._ell_sdf_panel.set_sdf(ell_grid)
+
+    # ── async optimization ────────────────────────────────────────────
+
+    def start_optimization(
+        self,
+        method: str = "naive",
+        num_steps: int = 2000,
+        report_every: int = 20,
+    ) -> None:
+        """Launch the optimisation loop in a background thread."""
+        self.stop_optimization()  # stop any running worker first
+
+        self._opt_worker = OptimizationWorker(
+            method=method,
+            num_steps=num_steps,
+            report_every=report_every,
+            parent=self,
+        )
+        self._opt_worker.step_done.connect(self._on_opt_step)
+        self._opt_worker.finished.connect(self._on_opt_finished)
+        self._opt_worker.start()
+        self._status.showMessage(f"Optimization started ({method}) …")
+
+    def stop_optimization(self) -> None:
+        """Gracefully stop a running optimisation worker."""
+        if self._opt_worker is not None and self._opt_worker.isRunning():
+            self._opt_worker.request_stop()
+            self._opt_worker.wait()
+            self._opt_worker = None
+
+    def _on_opt_step(
+            self,
+            step: int,
+            loss: float,
+            ell_set: EllipsoidSet,
+            use_last_mesh_grid: bool,
+            origin: np.ndarray,
+            dx: float,
+            n: int,
+    ) -> None:
+        """Slot called on the main thread whenever the worker reports progress."""
+        print(f"Step {step}: loss = {loss:.6f}")
+        self.update_ellipsoids(ell_set, use_last_mesh_grid, origin, dx, n)
+        self._status.showMessage(f"Optimizing … step {step}  loss={loss:.6f}")
+
+    def _on_opt_finished(self) -> None:
+        self._status.showMessage("Optimization finished.")
+        self._opt_worker = None
