@@ -5,6 +5,7 @@ import warp.optim
 import numpy as np
 
 from PySide6 import QtCore
+from numpy.ma.core import shape
 
 from ellipsoid import Ellipsoid
 from ellipsoid import EllipsoidSet
@@ -15,6 +16,7 @@ def _ellipsoid_union_sdf_kernel_flat(
     centers: wp.array(dtype=wp.vec3),
     radii: wp.array(dtype=wp.vec3),
     rot_flat: wp.array(dtype=wp.float32),
+    min_d: wp.array4d(dtype=wp.float32),
     num_ellipsoids: int,
     origin: wp.vec3,
     dx: float,
@@ -37,9 +39,9 @@ def _ellipsoid_union_sdf_kernel_flat(
         (float(iz) + 0.5) * dx,
     )
 
-    min_d = float(1.0e6)
+    min_d[ix, iy, iz, 0] = 1.0e6
 
-    for i in range(5):
+    for i in range(num_ellipsoids):
         # Read 4 consecutive floats and build a normalised quaternion
         base = i * 4
         q = wp.normalize(wp.quat(
@@ -69,9 +71,9 @@ def _ellipsoid_union_sdf_kernel_flat(
         k1_safe = wp.max(k1, 1.0e-8)
         d = k0 * (k0 - 1.0) / k1_safe
 
-        min_d = wp.min(min_d, d)
+        min_d[ix, iy, iz, i + 1] = wp.min(min_d[ix, iy, iz, i], d)
 
-    out_sdf[tid] = min_d
+    out_sdf[tid] = min_d[ix, iy, iz, num_ellipsoids]
 
 
 @wp.kernel
@@ -274,23 +276,25 @@ class OptimizationWorker(QtCore.QThread):
             dtype=wp.float32, device=device, requires_grad=False,
         )
 
-        num_e = gt_set.count
+        num_e = 10 #gt_set.count
         pred_centers = wp.array(
             #gt_set.centers + np.random.randn(*gt_set.centers.shape).astype(np.float32) * 1.0,
-            (np.random.rand(*gt_set.centers.shape).astype(np.float32) - 0.5) * 2.0 * 0.8, # range [-0.8, 0.8)
+            (np.random.rand( num_e, 3 ).astype(np.float32) - 0.5) * 2.0 * 0.5, # range [-0.5, 0.5)
             dtype=wp.vec3, device=device, requires_grad=True,
         )
         pred_radii = wp.array(
             #gt_set.radii + np.random.randn(*gt_set.radii.shape).astype(np.float32) * 0.5,
-            np.ones_like(gt_set.radii) * 0.1,
+            np.ones((num_e, 3)) * 0.1,
             #gt_set.radii.copy(),
             dtype=wp.vec3, device=device, requires_grad=True,
         )
         # Use a flat float32 array for rotations (Adam-compatible)
+        unity_quats = np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (num_e, 1))
         pred_rot_flat = wp.array(
-            gt_set.rotations.copy().flatten(),
+            unity_quats.flatten(),
             dtype=wp.float32, device=device, requires_grad=True,
         )
+        min_d_cache = wp.zeros(shape = (n, n, n, num_e + 1), dtype=wp.float32, device=device, requires_grad=True)
 
         sdf_pred = wp.empty(total, dtype=wp.float32, device=device, requires_grad=True)
         loss = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
@@ -310,10 +314,11 @@ class OptimizationWorker(QtCore.QThread):
 
             tape = wp.Tape()
             with tape:
+                min_d_cache.zero_()
                 wp.launch(
                     _ellipsoid_union_sdf_kernel_flat,
                     dim=total,
-                    inputs=[pred_centers, pred_radii, pred_rot_flat,
+                    inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
                             num_e, wp_origin, float(dx), n, n, n, sdf_pred],
                     device=device,
                 )
@@ -341,7 +346,7 @@ class OptimizationWorker(QtCore.QThread):
 
                 gt_color = (0.0, 1.0, 0.0, 0.5)
                 pred_color = (1.0, 1.0, 0.0, 0.9)
-                colors = [gt_color for _ in range(num_e)]
+                colors = [gt_color for _ in range(gt_set.count)]
                 colors.extend([pred_color for _ in range(num_e)])
                 ell_set.set_parameters(
                     centers,
