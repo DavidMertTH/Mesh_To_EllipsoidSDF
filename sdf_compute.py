@@ -160,6 +160,7 @@ class SdfComputer:
         if max_extent <= 0.0:
             raise ValueError("Degenerate AABB (extent <= 0).")
 
+        max_extent += 0.5 * max_extent  # add small margin to avoid zero-extent cases
         dx = max_extent / float(n)
         center = 0.5 * (vmin + vmax)
         half = 0.5 * max_extent
