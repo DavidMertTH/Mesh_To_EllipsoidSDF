@@ -1,11 +1,8 @@
-﻿import time
-
-import warp as wp
+﻿import warp as wp
 import warp.optim
 import numpy as np
 
 from PySide6 import QtCore
-from numpy.ma.core import shape
 
 from ellipsoid import Ellipsoid
 from ellipsoid import EllipsoidSet
@@ -146,12 +143,22 @@ class OptimizationWorker(QtCore.QThread):
 
     def __init__(
         self,
-        method: str = "naive",       # "naive" or "adam"
+        sdf_target_np: np.ndarray,       # (nz, ny, nx) float32 – mesh SDF
+        origin: np.ndarray,              # (3,) float32
+        dx: float,
+        n: int,
+        num_ellipsoids: int = 10,
+        method: str = "adam",
         num_steps: int = 2000,
         report_every: int = 20,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
+        self._sdf_target_np = sdf_target_np
+        self._origin = origin
+        self._dx = dx
+        self._n = n
+        self._num_ellipsoids = num_ellipsoids
         self._method = method
         self._num_steps = num_steps
         self._report_every = report_every
@@ -175,33 +182,33 @@ class OptimizationWorker(QtCore.QThread):
     # ── naive SGD ─────────────────────────────────────────────────────
 
     def _run_naive(self):
-        gt_set = create_demo_ellipsoids(device=device)
-        origin = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
-        n = 128
-        dx = 2.0 / n
+        origin = self._origin
+        n = self._n
+        dx = self._dx
         total = n * n * n
+        num_e = self._num_ellipsoids
 
         sdf_target = wp.array(
-            gt_set.compute_sdf_grid(origin, dx, n).flatten(),
+            self._sdf_target_np.flatten(),
             dtype=wp.float32, device=device, requires_grad=False,
         )
 
-        num_e = gt_set.count
         pred_centers = wp.array(
-            gt_set.centers + np.random.randn(*gt_set.centers.shape).astype(np.float32) * 1.0,
+            (np.random.rand(num_e, 3).astype(np.float32) - 0.5) * 2.0 * 0.5,
             dtype=wp.vec3, device=device, requires_grad=True,
         )
         pred_radii = wp.array(
-            gt_set.radii + np.random.randn(*gt_set.radii.shape).astype(np.float32) * 0.5,
-            # gt_set.radii.copy(),
+            np.ones((num_e, 3), dtype=np.float32) * 0.1,
             dtype=wp.vec3, device=device, requires_grad=True,
         )
         # Use a flat float32 array for rotations (4 floats per ellipsoid)
         # so that they are differentiable with any Warp optimizer
+        unity_quats = np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (num_e, 1))
         pred_rot_flat = wp.array(
-            gt_set.rotations.copy().flatten(),
+            unity_quats.flatten(),
             dtype=wp.float32, device=device, requires_grad=True,
         )
+        min_d_cache = wp.zeros(shape=(n, n, n, num_e + 1), dtype=wp.float32, device=device, requires_grad=True)
 
         sdf_pred = wp.empty(total, dtype=wp.float32, device=device, requires_grad=True)
         loss = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
@@ -215,10 +222,11 @@ class OptimizationWorker(QtCore.QThread):
 
             tape = wp.Tape()
             with tape:
+                min_d_cache.zero_()
                 wp.launch(
                     _ellipsoid_union_sdf_kernel_flat,
                     dim=total,
-                    inputs=[pred_centers, pred_radii, pred_rot_flat,
+                    inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
                             num_e, wp_origin, float(dx), n, n, n, sdf_pred],
                     device=device,
                 )
@@ -250,14 +258,10 @@ class OptimizationWorker(QtCore.QThread):
 
             if step % self._report_every == 0:
                 ell_set = EllipsoidSet()
-                centers = np.concatenate((gt_set.centers, pred_centers.numpy()))
-                radii = np.concatenate((gt_set.radii, pred_radii.numpy()))
-                # Reshape flat float32 back to (N, 4) for EllipsoidSet
-                rotations = np.concatenate((gt_set.rotations, pred_rot_flat.numpy().reshape(-1, 4)))
                 ell_set.set_parameters(
-                    centers,
-                    radii,
-                    rotations,
+                    pred_centers.numpy(),
+                    pred_radii.numpy(),
+                    pred_rot_flat.numpy().reshape(-1, 4),
                 )
                 loss_val = float(loss.numpy()[0])
                 self.step_done.emit(step, loss_val, ell_set, True, origin, dx, n)
@@ -265,27 +269,23 @@ class OptimizationWorker(QtCore.QThread):
     # ── Adam ──────────────────────────────────────────────────────────
 
     def _run_adam(self):
-        gt_set = create_demo_ellipsoids(device=device)
-        origin = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
-        n = 128
-        dx = 2.0 / n
+        origin = self._origin
+        n = self._n
+        dx = self._dx
         total = n * n * n
+        num_e = self._num_ellipsoids
 
         sdf_target = wp.array(
-            gt_set.compute_sdf_grid(origin, dx, n).flatten(),
+            self._sdf_target_np.flatten(),
             dtype=wp.float32, device=device, requires_grad=False,
         )
 
-        num_e = 10 #gt_set.count
         pred_centers = wp.array(
-            #gt_set.centers + np.random.randn(*gt_set.centers.shape).astype(np.float32) * 1.0,
-            (np.random.rand( num_e, 3 ).astype(np.float32) - 0.5) * 2.0 * 0.5, # range [-0.5, 0.5)
+            (np.random.rand(num_e, 3).astype(np.float32) - 0.5) * 2.0 * 0.5,
             dtype=wp.vec3, device=device, requires_grad=True,
         )
         pred_radii = wp.array(
-            #gt_set.radii + np.random.randn(*gt_set.radii.shape).astype(np.float32) * 0.5,
-            np.ones((num_e, 3)) * 0.1,
-            #gt_set.radii.copy(),
+            np.ones((num_e, 3), dtype=np.float32) * 0.1,
             dtype=wp.vec3, device=device, requires_grad=True,
         )
         # Use a flat float32 array for rotations (Adam-compatible)
@@ -294,7 +294,7 @@ class OptimizationWorker(QtCore.QThread):
             unity_quats.flatten(),
             dtype=wp.float32, device=device, requires_grad=True,
         )
-        min_d_cache = wp.zeros(shape = (n, n, n, num_e + 1), dtype=wp.float32, device=device, requires_grad=True)
+        min_d_cache = wp.zeros(shape=(n, n, n, num_e + 1), dtype=wp.float32, device=device, requires_grad=True)
 
         sdf_pred = wp.empty(total, dtype=wp.float32, device=device, requires_grad=True)
         loss = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
@@ -302,8 +302,6 @@ class OptimizationWorker(QtCore.QThread):
         wp_origin = wp.vec3(float(origin[0]), float(origin[1]), float(origin[2]))
         lr = 0.01
 
-        #params = [pred_centers]
-        #params = [pred_centers, pred_radii]
         params = [pred_centers, pred_radii, pred_rot_flat]
         grads = [p.grad.flatten() for p in params]
         optimizer = wp.optim.Adam(params, lr=lr)
@@ -332,34 +330,19 @@ class OptimizationWorker(QtCore.QThread):
 
             tape.backward(loss)
             optimizer.step(grads)
-            # Re-normalize quaternions after Adam step
-            # wp.launch(_normalize_flat_quats, dim=num_e,
-            #           inputs=[pred_rot_flat], device=device)
             tape.zero()
 
             if step % self._report_every == 0:
                 ell_set = EllipsoidSet()
-                centers = np.concatenate((gt_set.centers, pred_centers.numpy()))
-                radii = np.concatenate((gt_set.radii, pred_radii.numpy()))
-                # Reshape flat float32 back to (N, 4) for EllipsoidSet
-                rotations = np.concatenate((gt_set.rotations, pred_rot_flat.numpy().reshape(-1, 4)))
-
-                gt_color = (0.0, 1.0, 0.0, 0.5)
-                pred_color = (1.0, 1.0, 0.0, 0.9)
-                colors = [gt_color for _ in range(gt_set.count)]
-                colors.extend([pred_color for _ in range(num_e)])
                 ell_set.set_parameters(
-                    centers,
-                    radii,
-                    rotations,
-                    colors
+                    pred_centers.numpy(),
+                    pred_radii.numpy(),
+                    pred_rot_flat.numpy().reshape(-1, 4),
                 )
                 loss_val = float(loss.numpy()[0])
                 self.step_done.emit(step, loss_val, ell_set, True, origin, dx, n)
-                #self.step_done.emit(step, loss_val, None, None, None, None, None)
                 if loss_val < 1e-10:
                     break
-                #time.sleep(0.2)  # Yield to UI thread
 
 
 def create_demo_ellipsoids(device: str = "cpu") -> EllipsoidSet:
