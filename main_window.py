@@ -332,7 +332,8 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Slot called on the main thread whenever the worker reports progress."""
         print(f"Step {step}: loss = {loss:.6f}")
-        self.update_ellipsoids(ell_set, use_last_mesh_grid, origin, dx, n)
+        if ell_set is not None:
+            self.update_ellipsoids(ell_set, use_last_mesh_grid, origin, dx, n)
         self._status.showMessage(f"Optimizing … step {step}  loss={loss:.6f}")
 
     def _on_opt_finished(self) -> None:

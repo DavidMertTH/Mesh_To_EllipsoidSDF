@@ -103,7 +103,19 @@ class EllipsoidViewer3D(_BaseViewer):
         meshes = ellipsoid_set.generate_meshes(subdivisions=3)
 
         for i, mesh in enumerate(meshes):
-            color = ELLIPSOID_PALETTE[i % len(ELLIPSOID_PALETTE)]
+            if ellipsoid_set.colors is not None:
+                if len(ellipsoid_set.colors) == 1:
+                    color = ellipsoid_set.colors[0]
+                elif len(ellipsoid_set.colors) == ellipsoid_set.count:
+                    color = ellipsoid_set.colors[i]
+                else:
+                    raise ValueError(
+                        f"Invalid color specification for ellipsoids: "
+                        f"expected different colors of length 1 or n_ellipsoids = {ellipsoid_set.count}, "
+                        f"got {len(ellipsoid_set.colors)}."
+                    )
+            else:
+                color = ELLIPSOID_PALETTE[i % len(ELLIPSOID_PALETTE)]
             item = gl.GLMeshItem(
                 vertexes=mesh.vertices,
                 faces=mesh.faces,

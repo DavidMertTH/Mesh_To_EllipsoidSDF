@@ -87,6 +87,7 @@ class EllipsoidSet:
         self.centers: np.ndarray = np.empty((0, 3), dtype=np.float32)
         self.radii: np.ndarray = np.empty((0, 3), dtype=np.float32)
         self.rotations: np.ndarray = np.empty((0, 4), dtype=np.float32)
+        self.colors: list = None
 
 
     @classmethod
@@ -109,12 +110,14 @@ class EllipsoidSet:
         centers: np.ndarray,
         radii: np.ndarray,
         rotations: np.ndarray,
+        colors: Optional[list] = None,
     ) -> None:
 
         assert centers.shape[0] == radii.shape[0] == rotations.shape[0]
         self.centers = centers.astype(np.float32, copy=False)
         self.radii = radii.astype(np.float32, copy=False)
         self.rotations = rotations.astype(np.float32, copy=False)
+        self.colors = colors
 
     def compute_sdf_grid(
         self,
