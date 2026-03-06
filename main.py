@@ -12,7 +12,7 @@ def main():
     win = MainWindow()
     win.resize(1400, 1000)
     win.show()
-    win.start_optimization(method="adam", num_steps=2000, report_every=20)
+    win.start_optimization(method="adam", num_steps=7000, report_every=20)
     sys.exit(pg.exec())
 
 
