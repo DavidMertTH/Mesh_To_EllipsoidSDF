@@ -4,7 +4,11 @@ viewer3d.py — 3-D scene viewers for meshes and ellipsoids.
 Hierarchy:
   _BaseViewer          – shared setup (GL widget, grid, axis)
   MeshViewer3D         – shows a single triangle mesh
-  EllipsoidViewer3D    – shows a set of ellipsoid meshes with per-ellipsoid colours
+  EllipsoidViewer3D    – shows a set of ellipsoids as a single concatenated
+                         GLMeshItem with per-face colours.  A unit icosphere
+                         is precomputed once; each update only applies
+                         NumPy transforms (scale → rotate → translate) and
+                         concatenates.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 import numpy as np
+import trimesh
 import pyqtgraph.opengl as gl
 
 from widgets import DropGLView
@@ -19,16 +24,92 @@ from widgets import DropGLView
 
 # ── Colour palette for ellipsoids ─────────────────────────────────────────────
 
-ELLIPSOID_PALETTE = [
-    (242 / 255, 230 / 255,  65 / 255, 0.70),   # gold (edge colour)
-    ( 73 / 255,  98 / 255, 242 / 255, 0.70),   # blue (mesh face colour)
-    (242 / 255, 213 / 255,  65 / 255, 0.70),   # warm gold
-    ( 24 / 255,  40 / 255,  89 / 255, 0.85),   # deep navy
-    (140 / 255, 160 / 255, 242 / 255, 0.70),   # light periwinkle
-    (200 / 255, 195 / 255,  55 / 255, 0.70),   # muted olive-gold
-    ( 50 / 255,  70 / 255, 160 / 255, 0.75),   # mid blue
-    (220 / 255, 220 / 255, 180 / 255, 0.65),   # pale warm white
-]
+ELLIPSOID_PALETTE = np.array([
+    [242, 230,  65, 179],
+    [ 73,  98, 242, 179],
+    [242, 213,  65, 179],
+    [ 24,  40,  89, 217],
+    [140, 160, 242, 179],
+    [200, 195,  55, 179],
+    [ 50,  70, 160, 191],
+    [220, 220, 180, 166],
+], dtype=np.float32) / 255.0
+
+DEFAULT_OPT_COLOR = np.array([73, 98, 242, 179], dtype=np.float32) / 255.0
+
+
+# ── Precomputed unit icosphere ────────────────────────────────────────────────
+
+def _make_unit_icosphere(subdivisions: int = 3):
+    """Create a unit icosphere once.  Returns (verts, faces) as float32/int32."""
+    sphere = trimesh.creation.icosphere(subdivisions=subdivisions)
+    verts = np.ascontiguousarray(sphere.vertices, dtype=np.float32)
+    faces = np.ascontiguousarray(sphere.faces, dtype=np.int32)
+    return verts, faces
+
+_UNIT_VERTS, _UNIT_FACES = _make_unit_icosphere(3)
+_UNIT_N_VERTS = _UNIT_VERTS.shape[0]
+_UNIT_N_FACES = _UNIT_FACES.shape[0]
+
+
+def _quat_to_rotation_matrix(quat_xyzw: np.ndarray) -> np.ndarray:
+    """Convert (x,y,z,w) quaternion to a 3×3 rotation matrix (float32)."""
+    x, y, z, w = quat_xyzw.astype(np.float64)
+    n = np.sqrt(x*x + y*y + z*z + w*w)
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float32)
+    x /= n; y /= n; z /= n; w /= n
+    xx, yy, zz = x*x, y*y, z*z
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+    return np.array([
+        [1 - 2*(yy+zz),     2*(xy-wz),     2*(xz+wy)],
+        [    2*(xy+wz), 1 - 2*(xx+zz),     2*(yz-wx)],
+        [    2*(xz-wy),     2*(yz+wx), 1 - 2*(xx+yy)],
+    ], dtype=np.float32)
+
+
+def build_concatenated_mesh(
+    centers: np.ndarray,
+    radii: np.ndarray,
+    rotations: np.ndarray,
+    colors: Optional[np.ndarray] = None,
+) -> tuple:
+    """Build a single concatenated mesh from N ellipsoid parameters.
+
+    Returns (all_verts, all_faces, all_face_colors).
+    """
+    n_ell = centers.shape[0]
+    if n_ell == 0:
+        return (np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.int32),
+                np.empty((0, 4), dtype=np.float32))
+
+    V = _UNIT_N_VERTS
+    F = _UNIT_N_FACES
+
+    all_verts = np.empty((n_ell * V, 3), dtype=np.float32)
+    all_faces = np.empty((n_ell * F, 3), dtype=np.int32)
+    all_face_colors = np.empty((n_ell * F, 4), dtype=np.float32)
+
+    for i in range(n_ell):
+        v = _UNIT_VERTS * radii[i]
+        R = _quat_to_rotation_matrix(rotations[i])
+        v = v @ R.T
+        v += centers[i]
+
+        vs = i * V
+        fs = i * F
+        all_verts[vs:vs + V] = v
+        all_faces[fs:fs + F] = _UNIT_FACES + vs
+
+        if colors is not None and len(colors) > 0:
+            c = colors[i % len(colors)] if len(colors) > 1 else colors[0]
+        else:
+            c = ELLIPSOID_PALETTE[i % len(ELLIPSOID_PALETTE)]
+        all_face_colors[fs:fs + F] = c
+
+    return all_verts, all_faces, all_face_colors
 
 
 # ── Base viewer ───────────────────────────────────────────────────────────────
@@ -90,44 +171,87 @@ class MeshViewer3D(_BaseViewer):
 # ── Ellipsoid viewer ──────────────────────────────────────────────────────────
 
 class EllipsoidViewer3D(_BaseViewer):
+    """
+    Shows a set of ellipsoids as **one** GLMeshItem.
+
+    A unit icosphere (subdivisions=3) is precomputed once at module load.
+    Each call to ``show_ellipsoids_fast`` transforms the cached vertices
+    with per-ellipsoid scale/rotation/translation on CPU, concatenates
+    everything, and feeds the result into a single GLMeshItem with
+    per-face colours.  No trimesh recreation per ellipsoid.
+    """
+
     def __init__(self):
         super().__init__()
-        self._items: List[gl.GLMeshItem] = []
+        self._item: Optional[gl.GLMeshItem] = None
+
+    # ── fast path (raw numpy arrays) ──────────────────────────────────
+
+    def show_ellipsoids_fast(
+        self,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        rotations: np.ndarray,
+        colors: Optional[np.ndarray] = None,
+    ) -> None:
+        """Update the display from raw numpy arrays — no EllipsoidSet needed."""
+        verts, faces, face_colors = build_concatenated_mesh(
+            centers, radii, rotations, colors,
+        )
+        self._set_mesh(verts, faces, face_colors)
+
+    # ── legacy path (EllipsoidSet object) ─────────────────────────────
 
     def show_ellipsoids(self, ellipsoid_set) -> None:
-        """
-        Generate and display meshes for every ellipsoid in *ellipsoid_set*.
-        """
-        self.clear_ellipsoids()
+        """Update from an EllipsoidSet (calls show_ellipsoids_fast)."""
+        colors = None
+        if ellipsoid_set.colors is not None:
+            colors = np.array(ellipsoid_set.colors, dtype=np.float32)
+        self.show_ellipsoids_fast(
+            ellipsoid_set.centers,
+            ellipsoid_set.radii,
+            ellipsoid_set.rotations,
+            colors,
+        )
 
-        meshes = ellipsoid_set.generate_meshes(subdivisions=3)
+    def clear_ellipsoids(self) -> None:
+        if self._item is not None:
+            self._view.removeItem(self._item)
+            self._item = None
 
-        for i, mesh in enumerate(meshes):
-            if ellipsoid_set.colors is not None:
-                if len(ellipsoid_set.colors) == 1:
-                    color = ellipsoid_set.colors[0]
-                elif len(ellipsoid_set.colors) == ellipsoid_set.count:
-                    color = ellipsoid_set.colors[i]
-                else:
-                    raise ValueError(
-                        f"Invalid color specification for ellipsoids: "
-                        f"expected different colors of length 1 or n_ellipsoids = {ellipsoid_set.count}, "
-                        f"got {len(ellipsoid_set.colors)}."
-                    )
-            else:
-                color = ELLIPSOID_PALETTE[i % len(ELLIPSOID_PALETTE)]
-            item = gl.GLMeshItem(
-                vertexes=mesh.vertices,
-                faces=mesh.faces,
-                color=color,
-                smooth=True,
+    # ── internal ──────────────────────────────────────────────────────
+
+    def _set_mesh(self, verts, faces, face_colors) -> None:
+        """Replace the single GLMeshItem with new data."""
+        if verts.shape[0] == 0:
+            self.clear_ellipsoids()
+            return
+
+        md = gl.MeshData(vertexes=verts, faces=faces, faceColors=face_colors)
+
+        if self._item is not None:
+            self._item.setMeshData(meshdata=md)
+        else:
+            from OpenGL import GL as _GL
+            self._item = gl.GLMeshItem(
+                meshdata=md,
+                smooth=False,
                 drawEdges=False,
                 drawFaces=True,
             )
-            self._view.addItem(item)
-            self._items.append(item)
+            # Custom GL state: translucent blending + back-face culling.
+            # - GL_BLEND + blendFuncSeparate gives the transparency.
+            # - GL_DEPTH_TEST keeps correct front-to-back ordering.
+            # - GL_CULL_FACE removes interior / back-facing triangles
+            #   that caused the see-through artifacts.
+            self._item.setGLOptions({
+                _GL.GL_DEPTH_TEST: True,
+                _GL.GL_BLEND: True,
+                _GL.GL_CULL_FACE: True,
+                'glBlendFuncSeparate': (
+                    _GL.GL_SRC_ALPHA, _GL.GL_ONE_MINUS_SRC_ALPHA,
+                    _GL.GL_ONE, _GL.GL_ONE_MINUS_SRC_ALPHA,
+                ),
+            })
+            self._view.addItem(self._item)
 
-    def clear_ellipsoids(self) -> None:
-        for item in self._items:
-            self._view.removeItem(item)
-        self._items.clear()

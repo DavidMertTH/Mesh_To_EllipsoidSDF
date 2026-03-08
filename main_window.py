@@ -366,7 +366,8 @@ class MainWindow(QtWidgets.QMainWindow):
             report_every=report_every,
             parent=self,
         )
-        self._opt_worker.step_done.connect(self._on_opt_step)
+        self._opt_worker.step_visual.connect(self._on_opt_step_visual)
+        self._opt_worker.step_sdf.connect(self._on_opt_step_sdf)
         self._opt_worker.finished.connect(self._on_opt_finished)
         self._opt_worker.start()
 
@@ -385,7 +386,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self._btn_fit.setEnabled(self._last_mesh_result is not None)
             self._btn_stop.setEnabled(False)
 
-    def _on_opt_step(
+    def _on_opt_step_visual(
+            self,
+            step: int,
+            loss: float,
+            centers: np.ndarray,
+            radii: np.ndarray,
+            rotations: np.ndarray,
+    ) -> None:
+        """Fast slot: update the 3-D viewer from pre-copied numpy arrays.
+        No GPU sync or heavy compute happens here."""
+        print(f"Step {step}: loss = {loss:.6f}")
+        self._ell_viewer.show_ellipsoids_fast(centers, radii, rotations)
+        self._status.showMessage(f"Optimizing … step {step}  loss={loss:.6f}")
+
+    def _on_opt_step_sdf(
             self,
             step: int,
             loss: float,
@@ -395,11 +410,14 @@ class MainWindow(QtWidgets.QMainWindow):
             dx: float,
             n: int,
     ) -> None:
-        """Slot called on the main thread whenever the worker reports progress."""
-        print(f"Step {step}: loss = {loss:.6f}")
-        if ell_set is not None:
-            self.update_ellipsoids(ell_set, use_last_mesh_grid, origin, dx, n)
-        self._status.showMessage(f"Optimizing … step {step}  loss={loss:.6f}")
+        """Slow slot: update the SDF slice panel (heavier recompute)."""
+        self._ellipsoids = ell_set
+        if use_last_mesh_grid and self._last_mesh_result is not None:
+            r = self._last_mesh_result
+            ell_grid = self._ellipsoids.compute_sdf_grid(
+                origin=r.origin, dx=r.dx, n=r.n,
+            )
+            self._ell_sdf_panel.set_sdf(ell_grid)
 
     def _on_opt_finished(self) -> None:
         self._status.showMessage("Optimization finished.")

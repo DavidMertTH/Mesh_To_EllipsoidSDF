@@ -130,21 +130,30 @@ device = "cuda"
 class OptimizationWorker(QtCore.QThread):
     """Runs ellipsoid optimisation in a background thread.
 
+    All GPU → CPU readbacks happen *inside* this thread so the main
+    (UI) thread never blocks on a device sync.
+
     Signals
     -------
-    step_done(int, float, EllipsoidSet)
-        Emitted every *report_every* steps with (step, loss, current ellipsoids).
+    step_visual(int, float, ndarray, ndarray, ndarray)
+        Emitted every *report_every* steps with lightweight numpy copies
+        of (step, loss, centers(N,3), radii(N,3), rotations(N,4)).
+        Intended for the 3-D viewer (fast concatenated mesh update).
+    step_sdf(int, float, EllipsoidSet, bool, ndarray, float, int)
+        Emitted every *report_every × 5* steps with an EllipsoidSet
+        for the heavier SDF-slice recomputation.
     finished()
         Emitted when the loop ends.
     """
 
-    step_done = QtCore.Signal(int, float, object, bool, object, float, int)   # step, loss, EllipsoidSet
-    finished = QtCore.Signal()
+    step_visual = QtCore.Signal(int, float, object, object, object)
+    step_sdf    = QtCore.Signal(int, float, object, bool, object, float, int)
+    finished    = QtCore.Signal()
 
     def __init__(
         self,
-        sdf_target_np: np.ndarray,       # (nz, ny, nx) float32 – mesh SDF
-        origin: np.ndarray,              # (3,) float32
+        sdf_target_np: np.ndarray,
+        origin: np.ndarray,
         dx: float,
         n: int,
         num_ellipsoids: int = 10,
@@ -164,13 +173,8 @@ class OptimizationWorker(QtCore.QThread):
         self._report_every = report_every
         self._stop_flag = False
 
-    # ── public helpers ────────────────────────────────────────────────
-
     def request_stop(self):
-        """Ask the loop to stop at the next check-point."""
         self._stop_flag = True
-
-    # ── thread entry point ────────────────────────────────────────────
 
     def run(self):
         if self._method == "adam":
@@ -178,6 +182,27 @@ class OptimizationWorker(QtCore.QThread):
         else:
             self._run_naive()
         self.finished.emit()
+
+    # ── helper: async readback + emit ─────────────────────────────────
+
+    def _emit_progress(self, step, loss_wp, pred_centers, pred_radii,
+                       pred_rot_flat, num_e, origin, dx, n):
+        """Read back arrays in this worker thread and emit signals."""
+        wp.synchronize_device(device)
+
+        loss_val = float(loss_wp.numpy()[0])
+
+        # Lightweight readback for 3-D viewer (always)
+        c_np = pred_centers.numpy().copy()
+        r_np = pred_radii.numpy().copy()
+        q_np = pred_rot_flat.numpy().reshape(-1, 4).copy()
+        self.step_visual.emit(step, loss_val, c_np, r_np, q_np)
+
+        # Heavier SDF-slice readback (every 5th report)
+        if step % (self._report_every * 5) == 0:
+            ell_set = EllipsoidSet()
+            ell_set.set_parameters(c_np, r_np, q_np)
+            self.step_sdf.emit(step, loss_val, ell_set, True, origin, dx, n)
 
     # ── naive SGD ─────────────────────────────────────────────────────
 
@@ -257,14 +282,8 @@ class OptimizationWorker(QtCore.QThread):
             tape.zero()
 
             if step % self._report_every == 0:
-                ell_set = EllipsoidSet()
-                ell_set.set_parameters(
-                    pred_centers.numpy(),
-                    pred_radii.numpy(),
-                    pred_rot_flat.numpy().reshape(-1, 4),
-                )
-                loss_val = float(loss.numpy()[0])
-                self.step_done.emit(step, loss_val, ell_set, True, origin, dx, n)
+                self._emit_progress(step, loss, pred_centers, pred_radii,
+                                    pred_rot_flat, num_e, origin, dx, n)
 
     # ── Adam ──────────────────────────────────────────────────────────
 
@@ -306,45 +325,39 @@ class OptimizationWorker(QtCore.QThread):
         grads = [p.grad.flatten() for p in params]
         optimizer = wp.optim.Adam(params, lr=lr)
 
-        with wp.ScopedTimer("Training", synchronize=True):
-            for step in range(self._num_steps):
-                with wp.ScopedTimer(f"Step {step}", synchronize=True):
-                    if self._stop_flag:
-                        break
+        for step in range(self._num_steps):
+            if self._stop_flag:
+                break
 
-                    tape = wp.Tape()
-                    with tape:
-                        min_d_cache.zero_()
-                        wp.launch(
-                            _ellipsoid_union_sdf_kernel_flat,
-                            dim=total,
-                            inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
-                                    num_e, wp_origin, float(dx), n, n, n, sdf_pred],
-                            device=device,
-                        )
-                        loss.zero_()
-                        wp.launch(
-                            _rmse_loss_kernel,
-                            dim=total,
-                            inputs=[sdf_pred, sdf_target, loss, total],
-                            device=device,
-                        )
+            tape = wp.Tape()
+            with tape:
+                min_d_cache.zero_()
+                wp.launch(
+                    _ellipsoid_union_sdf_kernel_flat,
+                    dim=total,
+                    inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
+                            num_e, wp_origin, float(dx), n, n, n, sdf_pred],
+                    device=device,
+                )
+                loss.zero_()
+                wp.launch(
+                    _rmse_loss_kernel,
+                    dim=total,
+                    inputs=[sdf_pred, sdf_target, loss, total],
+                    device=device,
+                )
 
-                    tape.backward(loss)
-                    optimizer.step(grads)
-                    tape.zero()
+            tape.backward(loss)
+            optimizer.step(grads)
+            tape.zero()
 
-                    if step % self._report_every == 0:
-                        ell_set = EllipsoidSet()
-                        ell_set.set_parameters(
-                            pred_centers.numpy(),
-                            pred_radii.numpy(),
-                            pred_rot_flat.numpy().reshape(-1, 4),
-                        )
-                        loss_val = float(loss.numpy()[0])
-                        self.step_done.emit(step, loss_val, ell_set, True, origin, dx, n)
-                        if loss_val < 1e-10:
-                            break
+            if step % self._report_every == 0:
+                self._emit_progress(step, loss, pred_centers, pred_radii,
+                                    pred_rot_flat, num_e, origin, dx, n)
+
+                loss_val = float(loss.numpy()[0])
+                if loss_val < 1e-10:
+                    break
 
 
 def create_demo_ellipsoids(device: str = "cpu") -> EllipsoidSet:
@@ -388,3 +401,4 @@ def create_demo_ellipsoids(device: str = "cpu") -> EllipsoidSet:
     ]
 
     return EllipsoidSet.from_list(ellipsoids, device=device)
+
