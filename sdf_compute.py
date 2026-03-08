@@ -140,12 +140,13 @@ class SdfComputer:
 
     # ── voxel grid ────────────────────────────────────────────────────────
 
-    def compute_voxel_grid(self, n: int) -> SdfResult:
+    def compute_voxel_grid(self, n: int, margin: float = 0.5) -> SdfResult:
         """
         Compute an axis-aligned voxel grid SDF from the mesh AABB.
 
         Args:
             n: number of voxels along each axis.
+            margin: fractional margin added to the bounding box extent (0.0–1.0).
 
         Returns:
             SdfResult with the 3-D grid and metadata.
@@ -160,7 +161,7 @@ class SdfComputer:
         if max_extent <= 0.0:
             raise ValueError("Degenerate AABB (extent <= 0).")
 
-        max_extent += 0.5 * max_extent  # add small margin to avoid zero-extent cases
+        max_extent += margin * max_extent  # configurable margin
         dx = max_extent / float(n)
         center = 0.5 * (vmin + vmax)
         half = 0.5 * max_extent

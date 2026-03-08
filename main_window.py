@@ -94,6 +94,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_open_dir.setToolTip(f"Open {self._mesh_dir}")
         selector_bar.addWidget(self._btn_open_dir)
 
+        # ── SDF margin slider ──────────────────────────────────────────────
+        selector_bar.addSpacing(16)
+        selector_bar.addWidget(QtWidgets.QLabel("SDF Margin:"))
+
+        self._slider_margin = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._slider_margin.setRange(0, 100)       # 0–100 maps to 0.0–1.0
+        self._slider_margin.setValue(50)            # default 0.5
+        self._slider_margin.setFixedWidth(120)
+        self._slider_margin.setToolTip("Fractional margin added around the mesh bounding box (0.0–1.0)")
+        selector_bar.addWidget(self._slider_margin)
+
+        self._lbl_margin = QtWidgets.QLabel("0.50")
+        self._lbl_margin.setFixedWidth(32)
+        selector_bar.addWidget(self._lbl_margin)
+
+        self._slider_margin.valueChanged.connect(
+            lambda v: self._lbl_margin.setText(f"{v / 100:.2f}")
+        )
+
         # ── Training controls ──────────────────────────────────────────────
         selector_bar.addSpacing(16)
         selector_bar.addWidget(QtWidgets.QLabel("Ellipsoids:"))
@@ -252,9 +271,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if n is None:
             n = self._mesh_sdf_panel.requested_n
 
-        self._status.showMessage(f"Computing mesh SDF (n={n}) on {self._device} …")
+        margin = self._slider_margin.value() / 100.0
+        self._status.showMessage(f"Computing mesh SDF (n={n}, margin={margin:.2f}) on {self._device} …")
         try:
-            mesh_result = self._sdf.compute_voxel_grid(n=n)
+            mesh_result = self._sdf.compute_voxel_grid(n=n, margin=margin)
         except Exception as e:
             self._status.showMessage(f"Mesh SDF failed: {e}")
             return
