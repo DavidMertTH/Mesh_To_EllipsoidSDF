@@ -306,43 +306,45 @@ class OptimizationWorker(QtCore.QThread):
         grads = [p.grad.flatten() for p in params]
         optimizer = wp.optim.Adam(params, lr=lr)
 
-        for step in range(self._num_steps):
-            if self._stop_flag:
-                break
+        with wp.ScopedTimer("Training", synchronize=True):
+            for step in range(self._num_steps):
+                with wp.ScopedTimer(f"Step {step}", synchronize=True):
+                    if self._stop_flag:
+                        break
 
-            tape = wp.Tape()
-            with tape:
-                min_d_cache.zero_()
-                wp.launch(
-                    _ellipsoid_union_sdf_kernel_flat,
-                    dim=total,
-                    inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
-                            num_e, wp_origin, float(dx), n, n, n, sdf_pred],
-                    device=device,
-                )
-                loss.zero_()
-                wp.launch(
-                    _rmse_loss_kernel,
-                    dim=total,
-                    inputs=[sdf_pred, sdf_target, loss, total],
-                    device=device,
-                )
+                    tape = wp.Tape()
+                    with tape:
+                        min_d_cache.zero_()
+                        wp.launch(
+                            _ellipsoid_union_sdf_kernel_flat,
+                            dim=total,
+                            inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
+                                    num_e, wp_origin, float(dx), n, n, n, sdf_pred],
+                            device=device,
+                        )
+                        loss.zero_()
+                        wp.launch(
+                            _rmse_loss_kernel,
+                            dim=total,
+                            inputs=[sdf_pred, sdf_target, loss, total],
+                            device=device,
+                        )
 
-            tape.backward(loss)
-            optimizer.step(grads)
-            tape.zero()
+                    tape.backward(loss)
+                    optimizer.step(grads)
+                    tape.zero()
 
-            if step % self._report_every == 0:
-                ell_set = EllipsoidSet()
-                ell_set.set_parameters(
-                    pred_centers.numpy(),
-                    pred_radii.numpy(),
-                    pred_rot_flat.numpy().reshape(-1, 4),
-                )
-                loss_val = float(loss.numpy()[0])
-                self.step_done.emit(step, loss_val, ell_set, True, origin, dx, n)
-                if loss_val < 1e-10:
-                    break
+                    if step % self._report_every == 0:
+                        ell_set = EllipsoidSet()
+                        ell_set.set_parameters(
+                            pred_centers.numpy(),
+                            pred_radii.numpy(),
+                            pred_rot_flat.numpy().reshape(-1, 4),
+                        )
+                        loss_val = float(loss.numpy()[0])
+                        self.step_done.emit(step, loss_val, ell_set, True, origin, dx, n)
+                        if loss_val < 1e-10:
+                            break
 
 
 def create_demo_ellipsoids(device: str = "cpu") -> EllipsoidSet:
