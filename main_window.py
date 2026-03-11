@@ -1,16 +1,17 @@
 """
-main_window.py — Application main window with 2×2 layout.
+main_window.py — Application main window with 2×2 layout + evaluation panel.
 
-  ┌─────────────────────┬─────────────────────┐
-  │  Mesh 3-D Viewer    │  Mesh SDF Slice     │
-  │  (top-left)         │  (top-right)        │
-  ├─────────────────────┼─────────────────────┤
-  │  Ellipsoid 3-D      │  Ellipsoid SDF      │
-  │  Viewer (bot-left)  │  Slice (bot-right)  │
-  └─────────────────────┴─────────────────────┘
+  ┌─────────────────────┬─────────────────────┬──────────────────┐
+  │  Mesh 3-D Viewer    │  Mesh SDF Slice     │                  │
+  │  (top-left)         │  (top-right)        │   Auswertung     │
+  ├─────────────────────┼─────────────────────┤   (Konvergenz-   │
+  │  Ellipsoid 3-D      │  Ellipsoid SDF      │    kurven, Run-  │
+  │  Viewer (bot-left)  │  Slice (bot-right)  │    Verwaltung)   │
+  └─────────────────────┴─────────────────────┴──────────────────┘
 
 Top row:    loaded mesh → SDF from Warp mesh queries
 Bottom row: ellipsoid set → analytical SDF (Ínigo Quílez approx.)
+Right:      live convergence plot, run selection, naming & persistence.
 Both SDF panels share the same AABB / grid so slices are directly comparable.
 """
 
@@ -30,6 +31,7 @@ from ellipsoid import EllipsoidSet
 from viewer3d import MeshViewer3D, EllipsoidViewer3D
 from widgets import SdfSlicePanel
 from optimization import OptimizationWorker
+from run_tracker import RunTrackerPanel
 
 # Supported mesh file extensions (trimesh)
 MESH_EXTENSIONS = {".obj", ".stl", ".ply", ".glb", ".gltf", ".off", ".dae"}
@@ -58,14 +60,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._ell_viewer = EllipsoidViewer3D()
         self._ell_sdf_panel = SdfSlicePanel()
+
+        self._run_tracker = RunTrackerPanel()
+
         self._status = self.statusBar()
 
         self._build_layout()
         self._build_toolbar()
         self._connect_signals()
 
-
         self._opt_worker: OptimizationWorker | None = None
+        self._current_mesh_name: str = ""
 
     def _build_layout(self):
         central = QtWidgets.QWidget()
@@ -133,9 +138,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_stop.setEnabled(False)
         selector_bar.addWidget(self._btn_stop)
 
+        # ── Live ellipsoid count indicator ─────────────────────────────────
+        selector_bar.addSpacing(12)
+        self._lbl_ell_count = QtWidgets.QLabel("")
+        self._lbl_ell_count.setStyleSheet(
+            "font-weight: bold; color: #f2e641; font-size: 13px; padding: 0 4px;"
+        )
+        self._lbl_ell_count.setToolTip("Aktuelle Anzahl Ellipsoide")
+        selector_bar.addWidget(self._lbl_ell_count)
+
         root_layout.addLayout(selector_bar)
 
-        # ── 2×2 splitter grid ────────────────────────────────────────────
+        # ── 2×2 splitter grid + evaluation panel ─────────────────────────
         top_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         top_splitter.addWidget(self._mesh_viewer.widget)
         top_splitter.addWidget(self._mesh_sdf_panel)
@@ -146,12 +160,20 @@ class MainWindow(QtWidgets.QMainWindow):
         bot_splitter.addWidget(self._ell_sdf_panel)
         bot_splitter.setSizes([650, 650])
 
-        main_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        main_splitter.addWidget(top_splitter)
-        main_splitter.addWidget(bot_splitter)
-        main_splitter.setSizes([450, 450])
+        grid_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        grid_splitter.addWidget(top_splitter)
+        grid_splitter.addWidget(bot_splitter)
+        grid_splitter.setSizes([450, 450])
 
-        root_layout.addWidget(main_splitter, 1)
+        # Wrap 2×2 grid + evaluation panel in a horizontal splitter
+        main_hsplitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        main_hsplitter.addWidget(grid_splitter)
+        main_hsplitter.addWidget(self._run_tracker)
+        main_hsplitter.setSizes([900, 400])
+        # Prevent evaluation panel from collapsing to zero
+        main_hsplitter.setCollapsible(1, False)
+
+        root_layout.addWidget(main_hsplitter, 1)
 
         self.setCentralWidget(central)
 
@@ -241,6 +263,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self._mesh_viewer.show_mesh(verts, faces)
             self._sdf.set_mesh(verts, faces)
+
+            self._current_mesh_name = Path(path).name
 
             # Sync combo box with loaded file
             name = Path(path).name
@@ -368,8 +392,24 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._opt_worker.step_visual.connect(self._on_opt_step_visual)
         self._opt_worker.step_sdf.connect(self._on_opt_step_sdf)
+        self._opt_worker.step_metrics.connect(self._on_opt_step_metrics)
+        self._opt_worker.maintenance_done.connect(self._on_opt_maintenance)
         self._opt_worker.finished.connect(self._on_opt_finished)
         self._opt_worker.start()
+
+        # Begin tracking this run
+        self._run_tracker.begin_run(
+            mesh_name=self._current_mesh_name,
+            method=method,
+            num_ellipsoids=num_ellipsoids,
+            grid_n=r.n,
+            batch_size=self._opt_worker._batch_size,
+        )
+
+        self._lbl_ell_count.setText(f"● {num_ellipsoids} aktiv")
+        self._lbl_ell_count.setStyleSheet(
+            "font-weight: bold; color: #f2e641; font-size: 13px; padding: 0 4px;"
+        )
 
         self._btn_fit.setEnabled(False)
         self._btn_stop.setEnabled(True)
@@ -383,6 +423,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._opt_worker.request_stop()
             self._opt_worker.wait()
             self._opt_worker = None
+            self._run_tracker.finish_run()
             self._btn_fit.setEnabled(self._last_mesh_result is not None)
             self._btn_stop.setEnabled(False)
 
@@ -394,11 +435,16 @@ class MainWindow(QtWidgets.QMainWindow):
             radii: np.ndarray,
             rotations: np.ndarray,
     ) -> None:
-        """Fast slot: update the 3-D viewer from pre-copied numpy arrays.
-        No GPU sync or heavy compute happens here."""
-        print(f"Step {step}: loss = {loss:.6f}")
+        """Fast slot: update the 3-D viewer from pre-copied numpy arrays."""
+        num_ell = centers.shape[0]
+        print(f"Step {step}: loss = {loss:.6f}  ellipsoids = {num_ell}")
         self._ell_viewer.show_ellipsoids_fast(centers, radii, rotations)
-        self._status.showMessage(f"Optimizing … step {step}  loss={loss:.6f}")
+        self._lbl_ell_count.setText(f"● {num_ell} aktiv")
+        self._status.showMessage(f"Optimizing … step {step}  loss={loss:.6f}  ellipsoids={num_ell}")
+
+    def _on_opt_step_metrics(self, metrics: dict) -> None:
+        """Forward the full metrics dict to the run tracker."""
+        self._run_tracker.record_step(metrics)
 
     def _on_opt_step_sdf(
             self,
@@ -419,8 +465,26 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self._ell_sdf_panel.set_sdf(ell_grid)
 
+    def _on_opt_maintenance(
+            self,
+            step: int,
+            n_before: int,
+            n_pruned: int,
+            n_spawned: int,
+    ) -> None:
+        """Forward maintenance events to the run tracker."""
+        self._run_tracker.record_maintenance(step, n_before, n_pruned, n_spawned)
+
     def _on_opt_finished(self) -> None:
         self._status.showMessage("Optimization finished.")
+        self._run_tracker.finish_run()
         self._opt_worker = None
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._btn_stop.setEnabled(False)
+        # Keep the final count visible but mark as done
+        txt = self._lbl_ell_count.text()
+        if txt:
+            self._lbl_ell_count.setText(txt.replace("aktiv", "final"))
+            self._lbl_ell_count.setStyleSheet(
+                "font-weight: bold; color: #8ca0f2; font-size: 13px; padding: 0 4px;"
+            )
