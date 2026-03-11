@@ -91,8 +91,8 @@ class SdfComputer:
         val    = comp.query_point([0.0, 0.0, 0.0])
     """
 
-    def __init__(self, device: str = "cpu"):
-        self.device = device
+    def __init__(self, device: str | None = None):
+        self.device = device or ("cuda" if wp.is_cuda_available() else "cpu")
         self._warp_mesh: Optional[wp.Mesh] = None
         self._verts: Optional[np.ndarray] = None
 

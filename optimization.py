@@ -1,31 +1,91 @@
-﻿import warp as wp
+﻿"""
+optimization.py — Ellipsoid fitting via differentiable SDF.
+
+MINI-BATCH + CONSERVATIVE POPULATION MANAGEMENT:
+  - Epoch-based mini-batch sampling (index indirection).
+  - Periodic maintenance (every `maintenance_every` iterations):
+      1. PRUNE (conservative) — only remove ellipsoids that are truly
+         redundant: either (a) degenerate (collapsed to near-zero volume)
+         or (b) *contained* inside a larger ellipsoid (center is inside
+         the larger one AND all radii are smaller).
+         → Large ellipsoids are never removed in favour of small ones.
+         → A budget cap limits removals to `max_prune_fraction` of the
+           population per round so training stays stable.
+      2. SPAWN — fill vacancies at high-error regions via farthest-point
+         sampling (same as before).
+"""
+
+import warp as wp
 import warp.optim
 import numpy as np
 
 from PySide6 import QtCore
 
-from ellipsoid import Ellipsoid
-from ellipsoid import EllipsoidSet
+from ellipsoid import (
+    Ellipsoid, EllipsoidSet,
+    SDF_QUILEZ, SDF_SC_MIN, SDF_SC_MEAN, SDF_SC_GMEAN, SDF_METHOD_NAMES,
+)
+
+
+# ── Warp kernels ──────────────────────────────────────────────────────────────
+
+
+@wp.func
+def _single_ellipsoid_sdf(local_p: wp.vec3, r: wp.vec3, sdf_mode: int) -> float:
+    """Compute SDF for a single ellipsoid in its local frame."""
+    scaled = wp.vec3(
+        local_p[0] / r[0],
+        local_p[1] / r[1],
+        local_p[2] / r[2],
+    )
+    k0 = wp.length(scaled)
+
+    d = 1.0e6
+    if sdf_mode == 0:
+        # Quílez: k0*(k0-1)/k1
+        scaled2 = wp.vec3(
+            local_p[0] / (r[0] * r[0]),
+            local_p[1] / (r[1] * r[1]),
+            local_p[2] / (r[2] * r[2]),
+        )
+        k1 = wp.length(scaled2)
+        k1_safe = wp.max(k1, 1.0e-8)
+        d = k0 * (k0 - 1.0) / k1_safe
+    elif sdf_mode == 1:
+        # Scaled-sphere (min r)
+        r_scale = wp.min(wp.min(r[0], r[1]), r[2])
+        d = (k0 - 1.0) * r_scale
+    elif sdf_mode == 2:
+        # Scaled-sphere (mean r)
+        r_scale = (r[0] + r[1] + r[2]) / 3.0
+        d = (k0 - 1.0) * r_scale
+    else:
+        # Scaled-sphere (geometric mean r)
+        r_scale = wp.pow(r[0] * r[1] * r[2], 1.0 / 3.0)
+        d = (k0 - 1.0) * r_scale
+
+    return d
 
 
 @wp.kernel
-def _ellipsoid_union_sdf_kernel_flat(
+def _ellipsoid_sdf_kernel_batch(
     centers: wp.array(dtype=wp.vec3),
     radii: wp.array(dtype=wp.vec3),
     rot_flat: wp.array(dtype=wp.float32),
-    min_d: wp.array4d(dtype=wp.float32),
+    min_d: wp.array2d(dtype=wp.float32),
     num_ellipsoids: int,
     origin: wp.vec3,
     dx: float,
     nx: int,
     ny: int,
     nz: int,
+    indices: wp.array(dtype=wp.int32),
     out_sdf: wp.array(dtype=wp.float32),
+    sdf_mode: int,
 ):
-    """SDF kernel that reads rotations from a flat float32 array
-    (4 consecutive floats per ellipsoid: x, y, z, w) so that the
-    array is compatible with Warp's Adam optimizer."""
-    tid = wp.tid()
+    bid = wp.tid()
+    tid = indices[bid]
+
     ix = tid % nx
     iy = (tid // nx) % ny
     iz = tid // (nx * ny)
@@ -36,10 +96,9 @@ def _ellipsoid_union_sdf_kernel_flat(
         (float(iz) + 0.5) * dx,
     )
 
-    min_d[ix, iy, iz, 0] = 1.0e6
+    min_d[bid, 0] = 1.0e6
 
     for i in range(num_ellipsoids):
-        # Read 4 consecutive floats and build a normalised quaternion
         base = i * 4
         q = wp.normalize(wp.quat(
             rot_flat[base + 0],
@@ -50,40 +109,32 @@ def _ellipsoid_union_sdf_kernel_flat(
         local_p = wp.quat_rotate_inv(q, p - centers[i])
         r = radii[i]
 
-        scaled = wp.vec3(
-            local_p[0] / r[0],
-            local_p[1] / r[1],
-            local_p[2] / r[2],
-        )
-        scaled2 = wp.vec3(
-            local_p[0] / (r[0] * r[0]),
-            local_p[1] / (r[1] * r[1]),
-            local_p[2] / (r[2] * r[2]),
-        )
+        d = _single_ellipsoid_sdf(local_p, r, sdf_mode)
 
-        k0 = wp.length(scaled)
-        k1 = wp.length(scaled2)
+        min_d[bid, i + 1] = wp.min(min_d[bid, i], d)
 
-        # Clamp to avoid division by zero (keeps autodiff stable)
-        k1_safe = wp.max(k1, 1.0e-8)
-        d = k0 * (k0 - 1.0) / k1_safe
+    out_sdf[bid] = min_d[bid, num_ellipsoids]
 
-        min_d[ix, iy, iz, i + 1] = wp.min(min_d[ix, iy, iz, i], d)
 
-    out_sdf[tid] = min_d[ix, iy, iz, num_ellipsoids]
+@wp.func
+def soft_clamp(x: float, limit: float) -> float:
+    return limit * wp.tanh(x / limit)
 
 
 @wp.kernel
-def _rmse_loss_kernel(
+def _rmse_loss_kernel_batch(
     sdf_pred: wp.array(dtype=wp.float32),
     sdf_target: wp.array(dtype=wp.float32),
+    indices: wp.array(dtype=wp.int32),
     loss: wp.array(dtype=wp.float32),
-    n: int,
+    batch_size: int,
 ):
-    tid = wp.tid()
-    diff = sdf_pred[tid] - sdf_target[tid]
-    # Accumulate squared error; divide by n outside or use atomic
-    wp.atomic_add(loss, 0, diff * diff / float(n))
+    bid = wp.tid()
+    tid = indices[bid]
+    limit = 0.1
+    diff = wp.abs(soft_clamp(sdf_pred[bid], limit) - soft_clamp(sdf_target[tid], limit))
+    wp.atomic_add(loss, 0, diff / float(batch_size))
+
 
 @wp.kernel
 def _sgd_step_vec3(
@@ -109,8 +160,6 @@ def _sgd_step_f32(
 def _normalize_flat_quats(
     rot_flat: wp.array(dtype=wp.float32),
 ):
-    """Normalize every group of 4 consecutive floats to unit length.
-    Launch with dim = num_ellipsoids."""
     tid = wp.tid()
     base = tid * 4
     x = rot_flat[base + 0]
@@ -124,31 +173,88 @@ def _normalize_flat_quats(
     rot_flat[base + 3] = w * inv_len
 
 
-device = "cuda"
+device = "cuda" if wp.is_cuda_available() else "cpu"
 
+
+def _soft_clamp_np(x: np.ndarray, limit: float) -> np.ndarray:
+    return limit * np.tanh(x / limit)
+
+
+# ── Epoch-based index sampler ─────────────────────────────────────────────────
+
+class EpochSampler:
+    def __init__(self, total: int, batch_size: int,
+                 rng: np.random.Generator | None = None):
+        self.total = total
+        self.batch_size = batch_size
+        self._rng = rng or np.random.default_rng()
+        self._indices = np.arange(total, dtype=np.int32)
+        self._cursor = total
+
+    def next_batch(self) -> np.ndarray:
+        if self._cursor + self.batch_size > self.total:
+            self._rng.shuffle(self._indices)
+            self._cursor = 0
+        batch = self._indices[self._cursor : self._cursor + self.batch_size]
+        self._cursor += self.batch_size
+        return np.ascontiguousarray(batch)
+
+
+# ── Quaternion helper (numpy) ─────────────────────────────────────────────────
+
+def _quat_to_rot_matrix(quat_xyzw: np.ndarray) -> np.ndarray:
+    """(4,) quaternion → (3,3) rotation matrix."""
+    q = quat_xyzw.astype(np.float64)
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    q /= n
+    x, y, z, w = q
+    return np.array([
+        [1 - 2*(y*y+z*z),   2*(x*y-w*z),   2*(x*z+w*y)],
+        [  2*(x*y+w*z), 1 - 2*(x*x+z*z),   2*(y*z-w*x)],
+        [  2*(x*z-w*y),   2*(y*z+w*x), 1 - 2*(x*x+y*y)],
+    ], dtype=np.float64)
+
+
+# ── Worker ────────────────────────────────────────────────────────────────────
 
 class OptimizationWorker(QtCore.QThread):
-    """Runs ellipsoid optimisation in a background thread.
+    """Ellipsoid fitting with mini-batch sampling + conservative population mgmt.
 
-    All GPU → CPU readbacks happen *inside* this thread so the main
-    (UI) thread never blocks on a device sync.
+    Pruning philosophy
+    ------------------
+    Large ellipsoids are the backbone of the approximation and are
+    *never* removed in favour of smaller ones.  A small ellipsoid is
+    only pruned when it is **contained** inside a larger one — meaning
+    its centre lies inside the larger ellipsoid (normalised distance
+    < containment_thresh) and all its radii are smaller.
 
-    Signals
-    -------
-    step_visual(int, float, ndarray, ndarray, ndarray)
-        Emitted every *report_every* steps with lightweight numpy copies
-        of (step, loss, centers(N,3), radii(N,3), rotations(N,4)).
-        Intended for the 3-D viewer (fast concatenated mesh update).
-    step_sdf(int, float, EllipsoidSet, bool, ndarray, float, int)
-        Emitted every *report_every × 5* steps with an EllipsoidSet
-        for the heavier SDF-slice recomputation.
-    finished()
-        Emitted when the loop ends.
+    Per maintenance round at most ``max_prune_fraction`` of the current
+    population is removed so training stays stable.
+
+    Parameters
+    ----------
+    maintenance_every : int
+        Prune/spawn cycle frequency (default 200 — frequent but gentle).
+    containment_thresh : float
+        Normalised-distance threshold for considering a point "inside"
+        the larger ellipsoid.  1.0 = exactly on the surface.
+        Default 0.8 (well inside).
+    max_prune_fraction : float
+        At most this fraction of the population may be pruned per round
+        (default 0.15 = 15 %).
+    min_volume_abs : float
+        Absolute volume floor — ellipsoids with prod(radii) below this
+        are considered degenerate (default 1e-8).
     """
 
-    step_visual = QtCore.Signal(int, float, object, object, object)
-    step_sdf    = QtCore.Signal(int, float, object, bool, object, float, int)
-    finished    = QtCore.Signal()
+    step_visual      = QtCore.Signal(int, float, object, object, object)
+    step_sdf         = QtCore.Signal(int, float, object, bool, object, float, int)
+    maintenance_done = QtCore.Signal(int, int, int, int)
+    finished         = QtCore.Signal()
+
+    DEFAULT_BATCH_FRACTION = 0.125
 
     def __init__(
         self,
@@ -160,6 +266,13 @@ class OptimizationWorker(QtCore.QThread):
         method: str = "adam",
         num_steps: int = 2000,
         report_every: int = 20,
+        batch_fraction: float | None = None,
+        batch_size: int | None = None,
+        maintenance_every: int = 200,
+        containment_thresh: float = 0.8,
+        max_prune_fraction: float = 0.15,
+        min_volume_abs: float = 1e-8,
+        sdf_mode: int = SDF_QUILEZ,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
@@ -172,6 +285,19 @@ class OptimizationWorker(QtCore.QThread):
         self._num_steps = num_steps
         self._report_every = report_every
         self._stop_flag = False
+        self._sdf_mode = sdf_mode
+
+        self._maintenance_every = maintenance_every
+        self._containment_thresh = containment_thresh
+        self._max_prune_fraction = max_prune_fraction
+        self._min_volume_abs = min_volume_abs
+
+        total = n * n * n
+        if batch_size is not None:
+            self._batch_size = min(batch_size, total)
+        else:
+            frac = batch_fraction or self.DEFAULT_BATCH_FRACTION
+            self._batch_size = max(1024, min(int(total * frac), total))
 
     def request_stop(self):
         self._stop_flag = True
@@ -183,26 +309,411 @@ class OptimizationWorker(QtCore.QThread):
             self._run_naive()
         self.finished.emit()
 
-    # ── helper: async readback + emit ─────────────────────────────────
+    # ── progress reporting ────────────────────────────────────────────
 
     def _emit_progress(self, step, loss_wp, pred_centers, pred_radii,
                        pred_rot_flat, num_e, origin, dx, n):
-        """Read back arrays in this worker thread and emit signals."""
         wp.synchronize_device(device)
-
         loss_val = float(loss_wp.numpy()[0])
 
-        # Lightweight readback for 3-D viewer (always)
         c_np = pred_centers.numpy().copy()
         r_np = pred_radii.numpy().copy()
         q_np = pred_rot_flat.numpy().reshape(-1, 4).copy()
         self.step_visual.emit(step, loss_val, c_np, r_np, q_np)
 
-        # Heavier SDF-slice readback (every 5th report)
-        if step % (self._report_every * 5) == 0:
+        if step % (self._report_every * 10) == 0:
             ell_set = EllipsoidSet()
             ell_set.set_parameters(c_np, r_np, q_np)
             self.step_sdf.emit(step, loss_val, ell_set, True, origin, dx, n)
+
+    # ── buffer allocation ─────────────────────────────────────────────
+
+    def _init_inside_mesh(self, num_e: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Generate initial ellipsoid parameters placed inside the mesh.
+
+        Uses farthest-point sampling on interior voxels (sdf_target < 0)
+        to get diverse starting positions.  Initial radii are proportional
+        to local depth so ellipsoids start at a reasonable size.
+        """
+        origin = self._origin
+        dx = self._dx
+        n = self._n
+
+        flat_target = self._sdf_target_np.ravel()
+        interior_mask = flat_target < 0.0
+        interior_idx = np.where(interior_mask)[0]
+
+        if len(interior_idx) == 0:
+            # Fallback: random in bounding box
+            centers = (np.random.rand(num_e, 3).astype(np.float32) - 0.5)
+            radii = np.ones((num_e, 3), dtype=np.float32) * 0.1
+            rots = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (num_e, 1))
+            return centers, radii, rots
+
+        # Convert interior voxels to world positions
+        iz, iy, ix = np.unravel_index(interior_idx, (n, n, n))
+        interior_world = origin + (np.stack([ix, iy, iz], axis=1).astype(np.float32) + 0.5) * dx
+        interior_depth = np.abs(flat_target[interior_idx])  # distance to surface
+
+        # Use depth as "importance" for FPS — prefer deep interior points
+        selected = self._farthest_point_sample(
+            interior_world, interior_depth, num_e,
+            existing_centers=np.empty((0, 3), dtype=np.float32),
+        )
+
+        centers = interior_world[selected].astype(np.float32)
+        local_depth = interior_depth[selected]
+
+        # Initial radii: 60% of local depth, at least 2×dx
+        min_r = float(dx) * 2.0
+        init_r = np.clip(local_depth * 0.6, min_r, None)
+        radii = np.stack([init_r, init_r, init_r], axis=1).astype(np.float32)
+
+        rots = np.tile(
+            np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (num_e, 1),
+        )
+        return centers, radii, rots
+
+    def _alloc_buffers(
+        self,
+        num_e: int,
+        batch_size: int,
+        total: int,
+        centers_np: np.ndarray | None = None,
+        radii_np: np.ndarray | None = None,
+        rot_np: np.ndarray | None = None,
+    ) -> dict:
+        sdf_target = wp.array(
+            self._sdf_target_np.flatten(),
+            dtype=wp.float32, device=device, requires_grad=False,
+        )
+
+        if centers_np is None:
+            centers_np, radii_np, rot_np = self._init_inside_mesh(num_e)
+        if radii_np is None:
+            radii_np = np.ones((num_e, 3), dtype=np.float32) * 0.1
+        if rot_np is None:
+            rot_np = np.tile(
+                np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (num_e, 1),
+            )
+
+        pred_centers = wp.array(
+            centers_np.astype(np.float32), dtype=wp.vec3,
+            device=device, requires_grad=True,
+        )
+        pred_radii = wp.array(
+            radii_np.astype(np.float32), dtype=wp.vec3,
+            device=device, requires_grad=True,
+        )
+        pred_rot_flat = wp.array(
+            rot_np.astype(np.float32).flatten(), dtype=wp.float32,
+            device=device, requires_grad=True,
+        )
+        min_d_cache = wp.zeros(
+            shape=(batch_size, num_e + 1),
+            dtype=wp.float32, device=device, requires_grad=True,
+        )
+        sdf_pred = wp.empty(
+            batch_size, dtype=wp.float32, device=device, requires_grad=True,
+        )
+        loss = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
+        wp_indices = wp.empty(batch_size, dtype=wp.int32, device=device)
+
+        return dict(
+            sdf_target=sdf_target,
+            pred_centers=pred_centers,
+            pred_radii=pred_radii,
+            pred_rot_flat=pred_rot_flat,
+            min_d_cache=min_d_cache,
+            sdf_pred=sdf_pred,
+            loss=loss,
+            wp_indices=wp_indices,
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # CONSERVATIVE POPULATION MANAGEMENT
+    # ══════════════════════════════════════════════════════════════════
+
+    def _do_maintenance(
+        self,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        rotations: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, int, int]:
+        """Conservative prune + spawn.
+
+        Returns (centers, radii, rotations, changed, n_pruned, n_spawned).
+        """
+        n_before = len(centers)
+        budget = max(1, int(n_before * self._max_prune_fraction))
+
+        # ── 1. Remove clearly degenerate ellipsoids ──────────────────
+        #    (collapsed to near-zero volume — absolute threshold so
+        #     large ellipsoids are never affected by this)
+        volumes = np.prod(np.abs(radii), axis=1)
+        vol_ok = volumes > self._min_volume_abs
+        n_degenerate = int(np.count_nonzero(~vol_ok))
+
+        # Don't blow budget on degenerates alone
+        if n_degenerate > budget:
+            # Remove only the smallest ones up to budget
+            degen_idx = np.where(~vol_ok)[0]
+            degen_vols = volumes[degen_idx]
+            keep_from_degen = degen_idx[np.argsort(degen_vols)[-max(0, n_degenerate - budget):]]
+            vol_ok[keep_from_degen] = True
+
+        centers   = centers[vol_ok]
+        radii     = radii[vol_ok]
+        rotations = rotations[vol_ok]
+        n_removed = n_before - len(centers)
+        budget -= n_removed
+
+        # ── 2. Containment-based pruning ─────────────────────────────
+        #    Iterate from smallest to largest volume.  A small ellipsoid
+        #    is redundant only if:
+        #      (a) its centre is *inside* a larger ellipsoid
+        #          (normalised distance < containment_thresh), AND
+        #      (b) ALL its radii are smaller than the larger one's.
+        #    The larger ellipsoid is NEVER removed.
+        if budget > 0 and len(centers) >= 2:
+            contained = self._find_contained(centers, radii, rotations)
+            # contained is a list of indices, sorted smallest-volume first.
+            # Remove at most `budget` of them.
+            to_remove = contained[:budget]
+            if len(to_remove) > 0:
+                keep_mask = np.ones(len(centers), dtype=bool)
+                keep_mask[to_remove] = False
+                centers   = centers[keep_mask]
+                radii     = radii[keep_mask]
+                rotations = rotations[keep_mask]
+
+        n_pruned = n_before - len(centers)
+
+        # ── 3. Spawn replacements ────────────────────────────────────
+        num_to_spawn = self._num_ellipsoids - len(centers)
+        n_spawned = 0
+
+        if num_to_spawn > 0:
+            new_c, new_r, new_q = self._spawn_at_errors(
+                centers, radii, rotations, num_to_spawn,
+            )
+            centers   = np.concatenate([centers, new_c], axis=0)
+            radii     = np.concatenate([radii, new_r], axis=0)
+            rotations = np.concatenate([rotations, new_q], axis=0)
+            n_spawned = num_to_spawn
+
+        changed = n_pruned > 0 or n_spawned > 0
+        return centers, radii, rotations, changed, n_pruned, n_spawned
+
+    # ── containment check ─────────────────────────────────────────────
+
+    def _find_contained(
+        self,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        rotations: np.ndarray,
+    ) -> list[int]:
+        """Find small ellipsoids whose centre sits inside a larger one
+        and whose radii are all smaller → truly redundant.
+
+        Returns a list of indices to remove, ordered by ascending volume
+        (smallest first = safest to remove).
+        """
+        n = len(centers)
+        volumes = np.prod(np.abs(radii), axis=1)
+
+        # Process from smallest to largest — only the small one can be removed
+        order = np.argsort(volumes)  # ascending volume
+
+        # Precompute rotation matrices for each ellipsoid
+        rot_mats = np.stack([_quat_to_rot_matrix(rotations[i]) for i in range(n)])
+
+        contained_indices: list[int] = []
+        removed_set: set[int] = set()
+
+        for rank in range(n):
+            i_small = order[rank]
+            if i_small in removed_set:
+                continue
+
+            r_small = np.abs(radii[i_small])
+
+            for rank_big in range(n - 1, rank, -1):
+                i_big = order[rank_big]
+                if i_big in removed_set:
+                    continue
+
+                r_big = np.abs(radii[i_big])
+
+                # Quick reject: if any small radius >= big radius, not contained
+                if np.any(r_small >= r_big):
+                    continue
+
+                # Transform small's centre into big's local frame
+                delta = (centers[i_small] - centers[i_big]).astype(np.float64)
+                R_big = rot_mats[i_big]  # (3,3)
+                local_p = R_big.T @ delta  # inverse rotation
+
+                # Normalised ellipsoid distance: |p / r|
+                # < 1.0 means inside the ellipsoid surface
+                r_big_f64 = r_big.astype(np.float64)
+                normalised = local_p / np.maximum(r_big_f64, 1e-12)
+                norm_dist = float(np.linalg.norm(normalised))
+
+                if norm_dist < self._containment_thresh:
+                    # Centre is well inside the big ellipsoid AND
+                    # all radii are smaller → this small one is redundant
+                    contained_indices.append(int(i_small))
+                    removed_set.add(i_small)
+                    break  # i_small is gone, move on
+
+        return contained_indices
+
+    # ── spawning ──────────────────────────────────────────────────────
+
+    def _spawn_at_errors(
+        self,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        rotations: np.ndarray,
+        num_spawn: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Place new ellipsoids **inside the mesh** at high-error regions.
+
+        Strategy:
+          1. Only consider voxels where sdf_target < 0 (mesh interior).
+          2. Among those, rank by residual error.
+          3. Select spawn positions via farthest-point sampling for diversity.
+          4. Set initial radii proportional to the local interior depth
+             (|sdf_target| at that point) so the ellipsoid starts at a
+             reasonable size — not so large it overshoots, not so small
+             it has no gradient signal.
+        """
+        origin = self._origin
+        dx = self._dx
+        n = self._n
+
+        # Evaluate current ellipsoid SDF
+        ell_set = EllipsoidSet(device=device)
+        if len(centers) > 0:
+            ell_set.set_parameters(centers, radii, rotations)
+        pred_grid = ell_set.compute_sdf_grid(origin, dx, n, sdf_mode=self._sdf_mode)
+
+        target_grid = self._sdf_target_np
+        error = np.abs(
+            _soft_clamp_np(pred_grid, 0.1) - _soft_clamp_np(target_grid, 0.1)
+        )
+
+        # ── Restrict to mesh interior ─────────────────────────────────
+        flat_target = target_grid.ravel()
+        flat_error = error.ravel()
+        interior_mask = flat_target < 0.0  # inside the mesh
+
+        interior_idx = np.where(interior_mask)[0]
+        if len(interior_idx) == 0:
+            # Fallback: if no interior voxels at all, use surface-near
+            # voxels (|sdf| < 2*dx)
+            near_surface = np.abs(flat_target) < 2.0 * dx
+            interior_idx = np.where(near_surface)[0]
+
+        if len(interior_idx) == 0:
+            # Still nothing — place randomly in grid centre
+            new_centers = np.zeros((num_spawn, 3), dtype=np.float32)
+            new_radii = np.full((num_spawn, 3), float(dx) * 3.0, dtype=np.float32)
+            new_rots = np.tile(
+                np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (num_spawn, 1),
+            )
+            return new_centers, new_radii, new_rots
+
+        interior_errors = flat_error[interior_idx]
+
+        # Top-K highest-error interior voxels as candidate pool
+        pool_size = min(num_spawn * 50, len(interior_idx))
+        top_local = np.argpartition(interior_errors, -pool_size)[-pool_size:]
+        pool_flat_idx = interior_idx[top_local]
+
+        # Convert to world positions
+        iz, iy, ix = np.unravel_index(pool_flat_idx, (n, n, n))
+        pool_world = origin + (np.stack([ix, iy, iz], axis=1).astype(np.float32) + 0.5) * dx
+        pool_errors = flat_error[pool_flat_idx]
+
+        # Farthest-point sampling for spatial diversity
+        selected_idx = self._farthest_point_sample(
+            pool_world, pool_errors, num_spawn, centers,
+        )
+
+        new_centers = pool_world[selected_idx].astype(np.float32)
+
+        # ── Depth-based initial radii ─────────────────────────────────
+        # |sdf_target| at the spawn point = distance to nearest surface.
+        # Use a fraction of that as initial radius so the ellipsoid
+        # fits comfortably inside without immediately overshooting.
+        spawn_flat_idx = pool_flat_idx[selected_idx]
+        local_depth = np.abs(flat_target[spawn_flat_idx])  # (num_spawn,)
+
+        # Clamp: at least 2×dx (gradient signal), at most 80% of depth
+        min_r = float(dx) * 2.0
+        init_r = np.clip(local_depth * 0.6, min_r, None)  # (num_spawn,)
+        new_radii = np.stack([init_r, init_r, init_r], axis=1).astype(np.float32)
+
+        new_rots = np.tile(
+            np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (num_spawn, 1),
+        )
+
+        return new_centers, new_radii, new_rots
+
+    @staticmethod
+    def _farthest_point_sample(
+        candidates: np.ndarray,
+        errors: np.ndarray,
+        k: int,
+        existing_centers: np.ndarray,
+    ) -> np.ndarray:
+        n_cand = len(candidates)
+        if n_cand == 0 or k == 0:
+            return np.array([], dtype=int)
+
+        if len(existing_centers) > 0:
+            dists = np.linalg.norm(
+                candidates[:, np.newaxis, :] - existing_centers[np.newaxis, :, :],
+                axis=2,
+            )
+            min_dists = dists.min(axis=1)
+        else:
+            min_dists = np.full(n_cand, 1e6, dtype=np.float32)
+
+        selected = []
+        for _ in range(k):
+            scores = min_dists * (errors + 1e-8)
+            best = int(np.argmax(scores))
+            selected.append(best)
+            new_dists = np.linalg.norm(candidates - candidates[best], axis=1)
+            min_dists = np.minimum(min_dists, new_dists)
+
+        return np.array(selected, dtype=int)
+
+    # ══════════════════════════════════════════════════════════════════
+    # TRAINING LOOPS
+    # ══════════════════════════════════════════════════════════════════
+
+    def _maybe_maintain(self, step, pred_centers, pred_radii, pred_rot_flat):
+        if self._maintenance_every <= 0:
+            return None
+        if step == 0 or step % self._maintenance_every != 0:
+            return None
+
+        wp.synchronize_device(device)
+        c = pred_centers.numpy().copy()
+        r = pred_radii.numpy().copy()
+        q = pred_rot_flat.numpy().reshape(-1, 4).copy()
+
+        n_before = len(c)
+        c, r, q, changed, n_pruned, n_spawned = self._do_maintenance(c, r, q)
+        self.maintenance_done.emit(step, n_before, n_pruned, n_spawned)
+
+        if not changed:
+            return None
+        return c, r, q
 
     # ── naive SGD ─────────────────────────────────────────────────────
 
@@ -212,32 +723,19 @@ class OptimizationWorker(QtCore.QThread):
         dx = self._dx
         total = n * n * n
         num_e = self._num_ellipsoids
+        bs = self._batch_size
 
-        sdf_target = wp.array(
-            self._sdf_target_np.flatten(),
-            dtype=wp.float32, device=device, requires_grad=False,
-        )
+        buf = self._alloc_buffers(num_e, bs, total)
+        pred_centers  = buf['pred_centers']
+        pred_radii    = buf['pred_radii']
+        pred_rot_flat = buf['pred_rot_flat']
+        min_d_cache   = buf['min_d_cache']
+        sdf_pred      = buf['sdf_pred']
+        loss          = buf['loss']
+        sdf_target    = buf['sdf_target']
+        wp_indices    = buf['wp_indices']
 
-        pred_centers = wp.array(
-            (np.random.rand(num_e, 3).astype(np.float32) - 0.5) * 2.0 * 0.5,
-            dtype=wp.vec3, device=device, requires_grad=True,
-        )
-        pred_radii = wp.array(
-            np.ones((num_e, 3), dtype=np.float32) * 0.1,
-            dtype=wp.vec3, device=device, requires_grad=True,
-        )
-        # Use a flat float32 array for rotations (4 floats per ellipsoid)
-        # so that they are differentiable with any Warp optimizer
-        unity_quats = np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (num_e, 1))
-        pred_rot_flat = wp.array(
-            unity_quats.flatten(),
-            dtype=wp.float32, device=device, requires_grad=True,
-        )
-        min_d_cache = wp.zeros(shape=(n, n, n, num_e + 1), dtype=wp.float32, device=device, requires_grad=True)
-
-        sdf_pred = wp.empty(total, dtype=wp.float32, device=device, requires_grad=True)
-        loss = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
-
+        sampler = EpochSampler(total, bs)
         wp_origin = wp.vec3(float(origin[0]), float(origin[1]), float(origin[2]))
         lr = 0.01
 
@@ -245,37 +743,52 @@ class OptimizationWorker(QtCore.QThread):
             if self._stop_flag:
                 break
 
+            result = self._maybe_maintain(step, pred_centers, pred_radii, pred_rot_flat)
+            if result is not None:
+                c_np, r_np, q_np = result
+                num_e = len(c_np)
+                buf = self._alloc_buffers(num_e, bs, total, c_np, r_np, q_np)
+                buf['sdf_target'] = sdf_target
+                pred_centers  = buf['pred_centers']
+                pred_radii    = buf['pred_radii']
+                pred_rot_flat = buf['pred_rot_flat']
+                min_d_cache   = buf['min_d_cache']
+                sdf_pred      = buf['sdf_pred']
+                loss          = buf['loss']
+                wp_indices    = buf['wp_indices']
+
+            wp_indices.assign(sampler.next_batch())
+
             tape = wp.Tape()
             with tape:
                 min_d_cache.zero_()
                 wp.launch(
-                    _ellipsoid_union_sdf_kernel_flat,
-                    dim=total,
+                    _ellipsoid_sdf_kernel_batch,
+                    dim=bs,
                     inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
-                            num_e, wp_origin, float(dx), n, n, n, sdf_pred],
+                            num_e, wp_origin, float(dx), n, n, n,
+                            wp_indices, sdf_pred, self._sdf_mode],
                     device=device,
                 )
                 loss.zero_()
                 wp.launch(
-                    _rmse_loss_kernel,
-                    dim=total,
-                    inputs=[sdf_pred, sdf_target, loss, total],
+                    _rmse_loss_kernel_batch,
+                    dim=bs,
+                    inputs=[sdf_pred, sdf_target, wp_indices, loss, bs],
                     device=device,
                 )
 
             tape.backward(loss)
 
-            pred_centers_grad = tape.gradients[pred_centers]
-            pred_radii_grad = tape.gradients[pred_radii]
-            pred_rot_flat_grad = tape.gradients[pred_rot_flat]
-
             wp.launch(_sgd_step_vec3, dim=num_e,
-                      inputs=[pred_centers, pred_centers_grad, lr], device=device)
+                      inputs=[pred_centers, tape.gradients[pred_centers], lr],
+                      device=device)
             wp.launch(_sgd_step_vec3, dim=num_e,
-                      inputs=[pred_radii, pred_radii_grad, lr], device=device)
+                      inputs=[pred_radii, tape.gradients[pred_radii], lr],
+                      device=device)
             wp.launch(_sgd_step_f32, dim=num_e * 4,
-                      inputs=[pred_rot_flat, pred_rot_flat_grad, lr], device=device)
-            # Re-normalize quaternions after the gradient step
+                      inputs=[pred_rot_flat, tape.gradients[pred_rot_flat], lr],
+                      device=device)
             wp.launch(_normalize_flat_quats, dim=num_e,
                       inputs=[pred_rot_flat], device=device)
 
@@ -293,31 +806,19 @@ class OptimizationWorker(QtCore.QThread):
         dx = self._dx
         total = n * n * n
         num_e = self._num_ellipsoids
+        bs = self._batch_size
 
-        sdf_target = wp.array(
-            self._sdf_target_np.flatten(),
-            dtype=wp.float32, device=device, requires_grad=False,
-        )
+        buf = self._alloc_buffers(num_e, bs, total)
+        pred_centers  = buf['pred_centers']
+        pred_radii    = buf['pred_radii']
+        pred_rot_flat = buf['pred_rot_flat']
+        min_d_cache   = buf['min_d_cache']
+        sdf_pred      = buf['sdf_pred']
+        loss          = buf['loss']
+        sdf_target    = buf['sdf_target']
+        wp_indices    = buf['wp_indices']
 
-        pred_centers = wp.array(
-            (np.random.rand(num_e, 3).astype(np.float32) - 0.5) * 2.0 * 0.5,
-            dtype=wp.vec3, device=device, requires_grad=True,
-        )
-        pred_radii = wp.array(
-            np.ones((num_e, 3), dtype=np.float32) * 0.1,
-            dtype=wp.vec3, device=device, requires_grad=True,
-        )
-        # Use a flat float32 array for rotations (Adam-compatible)
-        unity_quats = np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (num_e, 1))
-        pred_rot_flat = wp.array(
-            unity_quats.flatten(),
-            dtype=wp.float32, device=device, requires_grad=True,
-        )
-        min_d_cache = wp.zeros(shape=(n, n, n, num_e + 1), dtype=wp.float32, device=device, requires_grad=True)
-
-        sdf_pred = wp.empty(total, dtype=wp.float32, device=device, requires_grad=True)
-        loss = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
-
+        sampler = EpochSampler(total, bs)
         wp_origin = wp.vec3(float(origin[0]), float(origin[1]), float(origin[2]))
         lr = 0.01
 
@@ -329,21 +830,42 @@ class OptimizationWorker(QtCore.QThread):
             if self._stop_flag:
                 break
 
+            result = self._maybe_maintain(step, pred_centers, pred_radii, pred_rot_flat)
+            if result is not None:
+                c_np, r_np, q_np = result
+                num_e = len(c_np)
+                buf = self._alloc_buffers(num_e, bs, total, c_np, r_np, q_np)
+                buf['sdf_target'] = sdf_target
+                pred_centers  = buf['pred_centers']
+                pred_radii    = buf['pred_radii']
+                pred_rot_flat = buf['pred_rot_flat']
+                min_d_cache   = buf['min_d_cache']
+                sdf_pred      = buf['sdf_pred']
+                loss          = buf['loss']
+                wp_indices    = buf['wp_indices']
+
+                params = [pred_centers, pred_radii, pred_rot_flat]
+                grads = [p.grad.flatten() for p in params]
+                optimizer = wp.optim.Adam(params, lr=lr)
+
+            wp_indices.assign(sampler.next_batch())
+
             tape = wp.Tape()
             with tape:
                 min_d_cache.zero_()
                 wp.launch(
-                    _ellipsoid_union_sdf_kernel_flat,
-                    dim=total,
+                    _ellipsoid_sdf_kernel_batch,
+                    dim=bs,
                     inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
-                            num_e, wp_origin, float(dx), n, n, n, sdf_pred],
+                            num_e, wp_origin, float(dx), n, n, n,
+                            wp_indices, sdf_pred, self._sdf_mode],
                     device=device,
                 )
                 loss.zero_()
                 wp.launch(
-                    _rmse_loss_kernel,
-                    dim=total,
-                    inputs=[sdf_pred, sdf_target, loss, total],
+                    _rmse_loss_kernel_batch,
+                    dim=bs,
+                    inputs=[sdf_pred, sdf_target, wp_indices, loss, bs],
                     device=device,
                 )
 
@@ -355,13 +877,15 @@ class OptimizationWorker(QtCore.QThread):
                 self._emit_progress(step, loss, pred_centers, pred_radii,
                                     pred_rot_flat, num_e, origin, dx, n)
 
+                wp.synchronize_device(device)
                 loss_val = float(loss.numpy()[0])
                 if loss_val < 1e-10:
                     break
 
 
-def create_demo_ellipsoids(device: str = "cpu") -> EllipsoidSet:
+# ── Demo helper ───────────────────────────────────────────────────────────────
 
+def create_demo_ellipsoids(device: str | None = None) -> EllipsoidSet:
     q_id = Ellipsoid.identity_quat()
 
     angle = np.radians(45.0)

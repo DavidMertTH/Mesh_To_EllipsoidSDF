@@ -25,7 +25,7 @@ import warp as wp
 
 from mesh_io import load_and_prepare
 from sdf_compute import SdfComputer, SdfResult
-from ellipsoid import EllipsoidSet
+from ellipsoid import EllipsoidSet, SDF_QUILEZ, SDF_METHOD_NAMES, best_device
 from viewer3d import MeshViewer3D, EllipsoidViewer3D
 from widgets import SdfSlicePanel
 from optimization import OptimizationWorker
@@ -47,7 +47,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mesh_dir.mkdir(parents=True, exist_ok=True)
 
         wp.init()
-        self._device = "cuda" if wp.is_cuda_available() else "cpu"
+        self._device = best_device()
 
         self._sdf = SdfComputer(device=self._device)
         self._ellipsoids: EllipsoidSet | None = None
@@ -69,6 +69,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._opt_worker: OptimizationWorker | None = None
         self._current_mesh_name: str = ""
+        self._current_sdf_mode: int = SDF_QUILEZ
 
     def _build_layout(self):
         central = QtWidgets.QWidget()
@@ -125,6 +126,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spin_num_ellipsoids.setValue(10)
         self._spin_num_ellipsoids.setToolTip("Number of ellipsoids to fit")
         selector_bar.addWidget(self._spin_num_ellipsoids)
+
+        selector_bar.addWidget(QtWidgets.QLabel("SDF:"))
+        self._combo_sdf_method = QtWidgets.QComboBox()
+        for mode_id in sorted(SDF_METHOD_NAMES.keys()):
+            self._combo_sdf_method.addItem(SDF_METHOD_NAMES[mode_id], mode_id)
+        self._combo_sdf_method.setCurrentIndex(0)  # Quílez default
+        self._combo_sdf_method.setToolTip("SDF approximation method for ellipsoid fitting")
+        selector_bar.addWidget(self._combo_sdf_method)
 
         self._btn_fit = QtWidgets.QPushButton("▶ Fit Ellipsoids")
         self._btn_fit.setToolTip("Start fitting ellipsoids to the loaded mesh SDF")
@@ -289,17 +298,21 @@ class MainWindow(QtWidgets.QMainWindow):
             n: int = None,
     ) -> None:
         self._ellipsoids = ellipsoid_set
+        sdf_mode = self._current_sdf_mode
+
         self._ell_viewer.show_ellipsoids(self._ellipsoids)
 
         if use_last_mesh_grid and self._last_mesh_result is not None:
             r = self._last_mesh_result
             ell_grid = self._ellipsoids.compute_sdf_grid(
                 origin=r.origin, dx=r.dx, n=r.n,
+                sdf_mode=sdf_mode,
             )
             self._ell_sdf_panel.set_sdf(ell_grid)
         elif origin is not None and dx is not None and n is not None:
             ell_grid = self._ellipsoids.compute_sdf_grid(
                 origin=origin, dx=dx, n=n,
+                sdf_mode=sdf_mode,
             )
             self._ell_sdf_panel.set_sdf(ell_grid)
 
@@ -310,11 +323,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._status.showMessage("Compute mesh SDF first (press G or Compute).")
             return
         num_e = self._spin_num_ellipsoids.value()
+        sdf_mode = self._combo_sdf_method.currentData()
         self.start_optimization(
             num_ellipsoids=num_e,
             method="adam",
             num_steps=7000,
             report_every=20,
+            sdf_mode=sdf_mode,
         )
 
     def _on_stop_clicked(self):
@@ -328,12 +343,14 @@ class MainWindow(QtWidgets.QMainWindow):
         method: str = "adam",
         num_steps: int = 2000,
         report_every: int = 20,
+        sdf_mode: int = SDF_QUILEZ,
     ) -> None:
         if self._last_mesh_result is None:
             self._status.showMessage("No mesh SDF available. Load a mesh and compute SDF first.")
             return
 
         self.stop_optimization()
+        self._current_sdf_mode = sdf_mode
 
         r = self._last_mesh_result
         self._opt_worker = OptimizationWorker(
@@ -345,6 +362,7 @@ class MainWindow(QtWidgets.QMainWindow):
             method=method,
             num_steps=num_steps,
             report_every=report_every,
+            sdf_mode=sdf_mode,
             parent=self,
         )
         self._opt_worker.step_visual.connect(self._on_opt_step_visual)
@@ -352,6 +370,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._opt_worker.finished.connect(self._on_opt_finished)
         self._opt_worker.start()
 
+        sdf_name = SDF_METHOD_NAMES.get(sdf_mode, "?")
         self._run_tracker.begin_run(
             mesh_name=self._current_mesh_name,
             method=method,
@@ -362,7 +381,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_fit.setEnabled(False)
         self._btn_stop.setEnabled(True)
         self._status.showMessage(
-            f"Optimization started ({method}, {num_ellipsoids} ellipsoids) …"
+            f"Optimization started ({method}, {num_ellipsoids} ellipsoids, SDF: {sdf_name}) …"
         )
 
     def stop_optimization(self) -> None:
@@ -400,10 +419,12 @@ class MainWindow(QtWidgets.QMainWindow):
             n: int,
     ) -> None:
         self._ellipsoids = ell_set
+        sdf_mode = self._current_sdf_mode
         if use_last_mesh_grid and self._last_mesh_result is not None:
             r = self._last_mesh_result
             ell_grid = self._ellipsoids.compute_sdf_grid(
                 origin=r.origin, dx=r.dx, n=r.n,
+                sdf_mode=sdf_mode,
             )
             self._ell_sdf_panel.set_sdf(ell_grid)
 
