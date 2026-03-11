@@ -198,18 +198,34 @@ def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5):
             methods=methods_data,
         )
 
-    # ── Angular error profile (circle in XY plane) ────────────────────
-    n_angles = 720
-    angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
-    # Sample at ~10 % outside the ellipsoid in each direction
-    R_fac = 1.1
-    xy_r = np.stack([radii[0] * np.cos(angles),
-                     radii[1] * np.sin(angles),
-                     np.zeros(n_angles)], axis=1) * R_fac
-    gt_ang = sdf_exact(xy_r, radii)
-    ang_data = dict(angles=np.degrees(angles), gt=gt_ang)
-    for name, func, short in METHODS:
-        ang_data[name] = func(xy_r, radii) - gt_ang
+    # ── Radial error profile (rays from center, XY plane) ──────────────
+    n_radial = 500
+    # Normalized distance: 0 = center, 1 = surface, 2 = far outside
+    t_norm = np.linspace(0.01, 2.0, n_radial)
+
+    # Rays along principal axes + diagonals in XY
+    ray_dirs = {
+        "x-Achse":   np.array([1.0, 0.0, 0.0]),
+        "y-Achse":   np.array([0.0, 1.0, 0.0]),
+        "45° (xy)":  np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0),
+    }
+
+    radial_data = dict(t_norm=t_norm, rays={})
+    for ray_label, direction in ray_dirs.items():
+        # Scale direction so that t_norm=1 hits the ellipsoid surface
+        # Surface point: p_i = d_i * r_i  such that |p/r| = 1
+        # For direction d: surface at t where |(t*d)/r| = 1
+        #   t_surface = 1 / |d/r|
+        d_over_r = direction / radii
+        t_surface = 1.0 / np.linalg.norm(d_over_r)
+
+        points = np.outer(t_norm * t_surface, direction)  # (n_radial, 3)
+        gt_rad = sdf_exact(points, radii)
+
+        ray_result = dict(gt=gt_rad)
+        for name, func, short in METHODS:
+            ray_result[name] = func(points, radii) - gt_rad
+        radial_data["rays"][ray_label] = ray_result
 
     # ── Timing (3-D grid, smaller) ────────────────────────────────────
     tn = 48
@@ -239,7 +255,7 @@ def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5):
         extent=extent,
         grid_n=grid_n,
         slices=slices,
-        angular=ang_data,
+        radial=radial_data,
         timing=timing,
         aspect_ratio=float(np.max(radii) / np.min(radii)),
     )
@@ -254,7 +270,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Ellipsoid SDF Benchmark")
-        self.resize(1700, 1000)
+        self.resize(1700, 1100)
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────
@@ -295,6 +311,12 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         self._btn_run.clicked.connect(self._on_run)
         bar.addWidget(self._btn_run)
 
+        self._chk_interior = QtWidgets.QCheckBox("Nur Interior (SDF < 0)")
+        self._chk_interior.setChecked(False)
+        self._chk_interior.setToolTip("Fehler nur für Punkte innerhalb des Ellipsoids berechnen")
+        self._chk_interior.toggled.connect(self._on_interior_toggled)
+        bar.addWidget(self._chk_interior)
+
         self._btn_pdf = QtWidgets.QPushButton("📄 PDF exportieren")
         self._btn_pdf.setFixedHeight(32)
         self._btn_pdf.setEnabled(False)
@@ -310,7 +332,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         root.addLayout(bar)
 
         # ── Matplotlib figure ─────────────────────────────────────────
-        self._fig = Figure(figsize=(18, 10), dpi=100, facecolor="#0d1117")
+        self._fig = Figure(figsize=(18, 12), dpi=100, facecolor="#0d1117")
         self._canvas = FigureCanvas(self._fig)
         root.addWidget(self._canvas, stretch=4)
 
@@ -371,6 +393,11 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
             self._fig.savefig(path, bbox_inches="tight", facecolor=self._fig.get_facecolor())
             self._lbl_status.setText(f"Exportiert: {path}")
 
+    def _on_interior_toggled(self, checked):
+        if hasattr(self, "_last_results"):
+            self._update_figure(self._last_results)
+            self._update_table(self._last_results)
+
     # ── Update figure ─────────────────────────────────────────────────
 
     def _update_figure(self, res):
@@ -378,11 +405,16 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
 
         n_methods = len(METHODS)
         n_cols = 1 + n_methods  # GT + methods
+        interior_only = self._chk_interior.isChecked()
 
+        # Layout: 3 rows (XY only)
+        #   Row 0: SDF maps   (GT + each method)
+        #   Row 1: Error maps (label + each method)
+        #   Row 2: bar charts / angular / timing
         gs = gridspec.GridSpec(
             3, n_cols, figure=self._fig,
             height_ratios=[1, 1, 0.85],
-            hspace=0.35, wspace=0.25,
+            hspace=0.40, wspace=0.25,
         )
 
         text_color = "#d0d0d0"
@@ -390,71 +422,108 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         extent = res["extent"]
         ar = res["aspect_ratio"]
 
-        # ── Shared error limits across all methods ────────────────────
+        # ── Shared SDF color limits ───────────────────────────────────
+        sdf_vmin = -extent * 0.3
+        sdf_vmax =  extent * 0.3
+
+        sl = res["slices"]["XY"]
+        coords = sl["coords"]
+        gt = sl["gt"]
+        ext_kw = dict(extent=[-extent, extent, -extent, extent],
+                      origin="lower", aspect="equal")
+
+        # ── Interior mask (GT < 0) ────────────────────────────────────
+        interior_mask = gt < 0.0  # True where inside
+
+        # ── Prepare masked error arrays + per-method MAE ──────────────
+        error_maps = {}
+        mae_vals = {}
         max_err = 0.0
-        for sl_key in ["XY", "XZ"]:
-            for name, _, _ in METHODS:
-                me = np.max(np.abs(res["slices"][sl_key]["methods"][name]["error"]))
-                max_err = max(max_err, me)
+        for name, _, _ in METHODS:
+            err = sl["methods"][name]["error"].copy()
+            if interior_only:
+                err[~interior_mask] = np.nan
+            error_maps[name] = err
+            abs_err = np.abs(err)
+            valid = abs_err[~np.isnan(abs_err)]
+            mae_vals[name] = float(np.mean(valid)) if len(valid) > 0 else 0.0
+            if len(valid) > 0:
+                max_err = max(max_err, float(np.max(valid)))
         if max_err < 1e-12:
             max_err = 1e-6
-        err_norm = TwoSlopeNorm(vmin=-max_err, vcenter=0, vmax=max_err)
 
-        slice_labels = {"XY": "XY-Schnitt (z = 0)", "XZ": "XZ-Schnitt (y = 0)"}
-        axis_labels  = {"XY": ("x", "y"), "XZ": ("x", "z")}
+        # ── Row 0: SDF — Ground truth in col 0 ───────────────────────
+        ax_gt = self._fig.add_subplot(gs[0, 0])
+        ax_gt.imshow(gt, cmap="RdYlBu_r",
+                     vmin=sdf_vmin, vmax=sdf_vmax, **ext_kw)
+        ax_gt.contour(coords, coords, gt, levels=[0],
+                      colors="black", linewidths=0.8)
+        ax_gt.set_title("Ground Truth\nXY-Schnitt (z = 0)",
+                        fontsize=9, color=text_color)
+        ax_gt.set_xlabel("x", fontsize=8, color=text_color)
+        ax_gt.set_ylabel("y", fontsize=8, color=text_color)
+        ax_gt.tick_params(colors=text_color, labelsize=7)
+        ax_gt.set_facecolor("#0d1117")
 
-        for row_idx, sl_key in enumerate(["XY", "XZ"]):
-            sl = res["slices"][sl_key]
-            coords = sl["coords"]
-            ext_kw = dict(extent=[-extent, extent, -extent, extent],
-                          origin="lower", aspect="equal")
-            ax_lbl = axis_labels[sl_key]
+        # ── Row 0: SDF — each method ─────────────────────────────────
+        for col_idx, (name, _, short) in enumerate(METHODS):
+            md = sl["methods"][name]
+            ax = self._fig.add_subplot(gs[0, col_idx + 1])
+            ax.imshow(md["sdf"], cmap="RdYlBu_r",
+                      vmin=sdf_vmin, vmax=sdf_vmax, **ext_kw)
+            ax.contour(coords, coords, md["sdf"], levels=[0],
+                       colors="black", linewidths=0.6)
+            ax.set_title(f"{name} — SDF",
+                         fontsize=9, color=text_color)
+            ax.set_xlabel("x", fontsize=8, color=text_color)
+            ax.tick_params(colors=text_color, labelsize=7)
+            ax.set_facecolor("#0d1117")
 
-            # Ground truth
-            ax_gt = self._fig.add_subplot(gs[row_idx, 0])
-            im = ax_gt.imshow(sl["gt"], cmap="RdYlBu_r",
-                              vmin=-extent * 0.3, vmax=extent * 0.3, **ext_kw)
-            ax_gt.contour(coords, coords, sl["gt"], levels=[0],
-                          colors="white", linewidths=0.8)
-            ax_gt.set_title(f"Ground Truth\n{slice_labels[sl_key]}",
-                            fontsize=9, color=text_color)
-            ax_gt.set_xlabel(ax_lbl[0], fontsize=8, color=text_color)
-            ax_gt.set_ylabel(ax_lbl[1], fontsize=8, color=text_color)
-            ax_gt.tick_params(colors=text_color, labelsize=7)
-            ax_gt.set_facecolor("#0d1117")
+        # ── Row 1: Error — label in col 0 ────────────────────────────
+        ax_empty = self._fig.add_subplot(gs[1, 0])
+        ax_empty.set_facecolor("#0d1117")
+        label_extra = "\n(nur Interior)" if interior_only else ""
+        ax_empty.text(0.5, 0.5, f"|Fehler|\nXY-Schnitt (z = 0){label_extra}",
+                      ha="center", va="center", fontsize=10,
+                      color=text_color, transform=ax_empty.transAxes)
+        ax_empty.set_xticks([])
+        ax_empty.set_yticks([])
+        for spine in ax_empty.spines.values():
+            spine.set_color("#333")
 
-            # Error maps
-            for col_idx, (name, _, short) in enumerate(METHODS):
-                md = sl["methods"][name]
-                ax = self._fig.add_subplot(gs[row_idx, col_idx + 1])
-                ax.imshow(md["error"], cmap="RdBu_r", norm=err_norm, **ext_kw)
-                ax.contour(coords, coords, sl["gt"], levels=[0],
-                           colors="white", linewidths=0.6)
-                mae = md["metrics"]["total"]["mae"]
-                ax.set_title(f"{name}\nMAE = {mae:.4f}", fontsize=9, color=text_color)
-                ax.set_xlabel(ax_lbl[0], fontsize=8, color=text_color)
-                ax.tick_params(colors=text_color, labelsize=7)
-                ax.set_facecolor("#0d1117")
+        # ── Row 1: Error — each method heatmap (red, absolute) ───────
+        for col_idx, (name, _, short) in enumerate(METHODS):
+            ax = self._fig.add_subplot(gs[1, col_idx + 1])
+            abs_err = np.abs(error_maps[name])
+            ax.imshow(abs_err, cmap="Reds", vmin=0, vmax=max_err, **ext_kw)
+            ax.contour(coords, coords, gt, levels=[0],
+                       colors="black", linewidths=0.6)
+            mae = mae_vals[name]
+            ax.set_title(f"{name} — |Fehler|\nMAE = {mae:.4f}",
+                         fontsize=9, color=text_color)
+            ax.set_xlabel("x", fontsize=8, color=text_color)
+            ax.tick_params(colors=text_color, labelsize=7)
+            ax.set_facecolor("#0d1117")
 
-        # ── Row 2: bar charts + angular profile ───────────────────────
+        # ── Row 2: bar charts + angular profile + timing ──────────────
 
-        # Panel 1: grouped MAE / RMSE / L∞
         ax_bar = self._fig.add_subplot(gs[2, 0:2])
         self._draw_metric_bars(ax_bar, res, text_color)
 
-        # Panel 2: angular error profile
-        ax_ang = self._fig.add_subplot(gs[2, 2:4])
-        self._draw_angular_profile(ax_ang, res, text_color)
+        ax_rad = self._fig.add_subplot(gs[2, 2:4])
+        self._draw_radial_profile(ax_rad, res, text_color)
 
-        # Panel 3: timing
-        ax_time = self._fig.add_subplot(gs[2, 4])
+        if n_cols > 4:
+            ax_time = self._fig.add_subplot(gs[2, 4])
+        else:
+            ax_time = self._fig.add_subplot(gs[2, n_cols - 1])
         self._draw_timing_bars(ax_time, res, text_color)
 
         # ── Suptitle ──────────────────────────────────────────────────
         self._fig.suptitle(
             f"Ellipsoid SDF Benchmark   —   r = ({radii[0]:.2f}, {radii[1]:.2f}, {radii[2]:.2f})"
             f"   κ = {ar:.2f}",
-            fontsize=13, color=text_color, y=0.98,
+            fontsize=13, color=text_color, y=0.99,
         )
 
         self._canvas.draw()
@@ -462,11 +531,15 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
     # ── Sub-plots ─────────────────────────────────────────────────────
 
     def _draw_metric_bars(self, ax, res, tc):
-        """Grouped bar chart: MAE, RMSE, L∞ for XY slice, total region."""
+        """Grouped bar chart: MAE, RMSE, L∞ for XY slice."""
+        interior_only = self._chk_interior.isChecked()
+        region = "interior" if interior_only else "total"
+        region_label = "Interior" if interior_only else "gesamt"
+
         sl = res["slices"]["XY"]
         names, mae, rmse, linf = [], [], [], []
         for name, _, short in METHODS:
-            m = sl["methods"][name]["metrics"]["total"]
+            m = sl["methods"][name]["metrics"][region]
             names.append(short)
             mae.append(m["mae"])
             rmse.append(m["rmse"])
@@ -482,28 +555,56 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         ax.set_xticks(x)
         ax.set_xticklabels(names, fontsize=8, color=tc)
         ax.set_ylabel("Fehler", fontsize=9, color=tc)
-        ax.set_title("Fehlermetriken (XY, gesamt)", fontsize=9, color=tc)
+        ax.set_title(f"Fehlermetriken (XY, {region_label})", fontsize=9, color=tc)
         ax.legend(fontsize=8, loc="upper left", facecolor="#1a2030",
                   edgecolor="#333", labelcolor=tc)
         ax.tick_params(colors=tc, labelsize=7)
         ax.set_facecolor("#0d1117")
         ax.spines[:].set_color("#333")
 
-    def _draw_angular_profile(self, ax, res, tc):
-        """Error vs. angle on a circle just outside the ellipsoid (XY plane)."""
-        ang = res["angular"]
-        angles = ang["angles"]
-        colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff"]
-        for i, (name, _, short) in enumerate(METHODS):
-            ax.plot(angles, np.abs(ang[name]),
-                    color=colors[i % len(colors)], linewidth=1.2, label=short)
+    def _draw_radial_profile(self, ax, res, tc):
+        """Error vs. normalized radial distance along rays from center."""
+        rad = res["radial"]
+        t_norm = rad["t_norm"]
+        method_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff"]
+        line_styles = ["-", "--", ":"]
 
-        ax.set_xlabel("Winkel (°)", fontsize=9, color=tc)
+        for i, (name, _, short) in enumerate(METHODS):
+            for j, (ray_label, ray_data) in enumerate(rad["rays"].items()):
+                label = f"{short} ({ray_label})" if j == 0 or i == 0 else None
+                # Only label method on first ray, ray on first method
+                if i == 0 and j > 0:
+                    label = ray_label
+                elif j == 0:
+                    label = short
+                else:
+                    label = None
+                ax.plot(t_norm, np.abs(ray_data[name]),
+                        color=method_colors[i % len(method_colors)],
+                        linestyle=line_styles[j % len(line_styles)],
+                        linewidth=1.0, alpha=0.85)
+
+        # Manual legend: methods as colored lines, rays as line styles
+        from matplotlib.lines import Line2D
+        handles = []
+        for i, (name, _, short) in enumerate(METHODS):
+            handles.append(Line2D([0], [0], color=method_colors[i % len(method_colors)],
+                                  linewidth=1.5, label=short))
+        for j, ray_label in enumerate(rad["rays"].keys()):
+            handles.append(Line2D([0], [0], color="#aaa",
+                                  linestyle=line_styles[j % len(line_styles)],
+                                  linewidth=1.2, label=ray_label))
+
+        ax.axvline(1.0, color="#666", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.annotate("Oberfläche", xy=(1.0, 0.95), xycoords=("data", "axes fraction"),
+                    fontsize=7, color="#888", ha="left", va="top",
+                    xytext=(4, 0), textcoords="offset points")
+
+        ax.set_xlabel("Normierter Abstand (0=Zentrum, 1=Oberfläche)", fontsize=8, color=tc)
         ax.set_ylabel("|Fehler|", fontsize=9, color=tc)
-        ax.set_title("Winkelprofil (1.1 × Oberfläche, XY)", fontsize=9, color=tc)
-        ax.set_xlim(0, 360)
-        ax.legend(fontsize=7, loc="upper right", facecolor="#1a2030",
-                  edgecolor="#333", labelcolor=tc)
+        ax.set_title("Radiales Fehlerprofil", fontsize=9, color=tc)
+        ax.legend(handles=handles, fontsize=6, loc="upper right",
+                  facecolor="#1a2030", edgecolor="#333", labelcolor=tc, ncol=2)
         ax.tick_params(colors=tc, labelsize=7)
         ax.set_facecolor("#0d1117")
         ax.spines[:].set_color("#333")
