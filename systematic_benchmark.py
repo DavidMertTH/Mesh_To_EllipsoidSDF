@@ -357,7 +357,7 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
         fig.suptitle("MAE vs. Aspektverhältnis κ",
                      fontsize=14, color=text_color, y=0.98)
 
-        method_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff"]
+        method_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff", "#ff7f50"]
         for ax_idx, region in enumerate(["total", "interior"]):
             ax = axes[ax_idx]
             ax.set_facecolor(bg_color)

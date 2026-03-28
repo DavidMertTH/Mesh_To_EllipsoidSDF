@@ -14,6 +14,7 @@ Methoden:
   - Scaled-Sphere (min r)     →  (|p/r|−1) · min(r)
   - Scaled-Sphere (mean r)    →  (|p/r|−1) · mean(r)
   - Scaled-Sphere (geom mean) →  (|p/r|−1) · ∛(r₁r₂r₃)
+  - MertStein                 →  Quílez (außen) + Sc-min (innen)
 """
 
 import sys
@@ -117,12 +118,44 @@ def sdf_scaled_gmean(points: np.ndarray, radii: np.ndarray) -> np.ndarray:
     return (k - 1.0) * np.cbrt(np.prod(r))
 
 
+def sdf_mertstein(points: np.ndarray, radii: np.ndarray) -> np.ndarray:
+    """MertStein hybrid:  Quílez outside, Scaled-Sphere (min r) inside.
+
+    Step 1: Determine inside/outside via  Σ (p_i/r_i)² < 1.
+    Step 2: Compose — exterior uses Quílez, interior uses (|p/r|−1)·min(r).
+    """
+    r = radii.astype(np.float64)
+    p = points.astype(np.float64)
+
+    # ── Step 1: inside / outside classification ───────────────────────
+    scaled = p / r
+    k0 = np.linalg.norm(scaled, axis=1)
+    inside = k0 < 1.0
+
+    result = np.empty(len(p), dtype=np.float64)
+
+    # ── Step 2a: Exterior → Quílez ────────────────────────────────────
+    if np.any(~inside):
+        scaled2 = p[~inside] / (r * r)
+        k0_ext = k0[~inside]
+        k1_ext = np.maximum(np.linalg.norm(scaled2, axis=1), 1e-15)
+        result[~inside] = k0_ext * (k0_ext - 1.0) / k1_ext
+
+    # ── Step 2b: Interior → Scaled-Sphere (min r) ────────────────────
+    if np.any(inside):
+        k0_int = k0[inside]
+        result[inside] = (k0_int - 1.0) * np.min(r)
+
+    return result
+
+
 # Method registry: (display_name, function, short_name_for_plots)
 METHODS = [
     ("Quílez",                sdf_quilez,      "Quílez"),
     ("Scaled (min r)",        sdf_scaled_min,  "Sc-min"),
     ("Scaled (mean r)",       sdf_scaled_mean, "Sc-mean"),
     ("Scaled (geom. mean r)", sdf_scaled_gmean,"Sc-gmean"),
+    ("MertStein",             sdf_mertstein,   "MertSt"),
 ]
 
 
@@ -514,7 +547,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         self._draw_radial_profile(ax_rad, res, text_color)
 
         if n_cols > 4:
-            ax_time = self._fig.add_subplot(gs[2, 4])
+            ax_time = self._fig.add_subplot(gs[2, 4:n_cols])
         else:
             ax_time = self._fig.add_subplot(gs[2, n_cols - 1])
         self._draw_timing_bars(ax_time, res, text_color)
@@ -566,7 +599,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         """Error vs. normalized radial distance along rays from center."""
         rad = res["radial"]
         t_norm = rad["t_norm"]
-        method_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff"]
+        method_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff", "#ff7f50"]
         line_styles = ["-", "--", ":"]
 
         for i, (name, _, short) in enumerate(METHODS):
@@ -616,7 +649,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         values = list(timing.values())
         short_names = ["Exakt"] + [s for _, _, s in METHODS]
 
-        colors = ["#888"] + ["#f2e641", "#4962f2", "#50c878", "#c878ff"]
+        colors = ["#888"] + ["#f2e641", "#4962f2", "#50c878", "#c878ff", "#ff7f50"]
         bars = ax.barh(range(len(names)), values, color=colors[:len(names)],
                        edgecolor="none", height=0.6)
 
