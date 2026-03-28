@@ -8,57 +8,30 @@ import trimesh
 import warp as wp
 
 
-def best_device() -> str:
-    """Return 'cuda' if available, else 'cpu'."""
-    return "cuda" if wp.is_cuda_available() else "cpu"
-
-
 # ── SDF method constants ──────────────────────────────────────────────────────
-SDF_QUILEZ   = 0
-SDF_SC_MIN   = 1
-SDF_SC_MEAN  = 2
+SDF_QUILEZ  = 0
+SDF_SC_MIN  = 1
+SDF_SC_MEAN = 2
 SDF_SC_GMEAN = 3
+SDF_MERTSTEIN = 4
 
 SDF_METHOD_NAMES = {
-    SDF_QUILEZ:   "Quílez",
-    SDF_SC_MIN:   "Scaled (min r)",
-    SDF_SC_MEAN:  "Scaled (mean r)",
-    SDF_SC_GMEAN: "Scaled (geom. mean r)",
+    SDF_QUILEZ:    "Quílez",
+    SDF_SC_MIN:    "Scaled (min r)",
+    SDF_SC_MEAN:   "Scaled (mean r)",
+    SDF_SC_GMEAN:  "Scaled (geom. mean r)",
+    SDF_MERTSTEIN: "MertStein",
 }
 
 
-@wp.func
-def _single_ellipsoid_sdf_vis(local_p: wp.vec3, r: wp.vec3, sdf_mode: int) -> float:
-    """Compute SDF for a single ellipsoid in its local frame (visualisation)."""
-    scaled = wp.vec3(
-        local_p[0] / r[0],
-        local_p[1] / r[1],
-        local_p[2] / r[2],
-    )
-    k0 = wp.length(scaled)
-
-    d = 1.0e6
-    if sdf_mode == 0:
-        # Quílez: k0*(k0-1)/k1
-        scaled2 = wp.vec3(
-            local_p[0] / (r[0] * r[0]),
-            local_p[1] / (r[1] * r[1]),
-            local_p[2] / (r[2] * r[2]),
-        )
-        k1 = wp.length(scaled2)
-        if k1 > 1.0e-12:
-            d = k0 * (k0 - 1.0) / k1
-    elif sdf_mode == 1:
-        r_scale = wp.min(wp.min(r[0], r[1]), r[2])
-        d = (k0 - 1.0) * r_scale
-    elif sdf_mode == 2:
-        r_scale = (r[0] + r[1] + r[2]) / 3.0
-        d = (k0 - 1.0) * r_scale
-    else:
-        r_scale = wp.pow(r[0] * r[1] * r[2], 1.0 / 3.0)
-        d = (k0 - 1.0) * r_scale
-
-    return d
+def best_device() -> str:
+    """Return 'cuda:0' if a CUDA device is available, otherwise 'cpu'."""
+    try:
+        if wp.is_cuda_available():
+            return "cuda:0"
+    except Exception:
+        pass
+    return "cpu"
 
 
 @wp.kernel
@@ -73,7 +46,6 @@ def _ellipsoid_union_sdf_kernel(
     ny: int,
     nz: int,
     out_sdf: wp.array(dtype=wp.float32),
-    sdf_mode: int,
 ):
     tid = wp.tid()
     ix = tid % nx
@@ -89,9 +61,37 @@ def _ellipsoid_union_sdf_kernel(
     min_d = float(1.0e6)
 
     for i in range(num_ellipsoids):
+        # Transform to ellipsoid-local frame
         local_p = wp.quat_rotate_inv(rotations[i], p - centers[i])
         r = radii[i]
-        d = _single_ellipsoid_sdf_vis(local_p, r, sdf_mode)
+
+        #  MertStein hybrid SDF:
+        #   k0 = |p / r|
+        #   inside  (k0 < 1):  sdf ≈ (k0 − 1) · min(r)
+        #   outside (k0 ≥ 1):  sdf ≈ k0 · (k0 − 1) / k1   (Quílez)
+        scaled = wp.vec3(
+            local_p[0] / r[0],
+            local_p[1] / r[1],
+            local_p[2] / r[2],
+        )
+
+        k0 = wp.length(scaled)
+
+        d = float(1.0e6)
+        if k0 < 1.0:
+            # Interior → Scaled-Sphere (min r)
+            r_min = wp.min(wp.min(r[0], r[1]), r[2])
+            d = (k0 - 1.0) * r_min
+        else:
+            # Exterior → Quílez
+            scaled2 = wp.vec3(
+                local_p[0] / (r[0] * r[0]),
+                local_p[1] / (r[1] * r[1]),
+                local_p[2] / (r[2] * r[2]),
+            )
+            k1 = wp.length(scaled2)
+            if k1 > 1.0e-12:
+                d = k0 * (k0 - 1.0) / k1
 
         if d < min_d:
             min_d = d
@@ -114,8 +114,8 @@ class Ellipsoid:
 
 class EllipsoidSet:
 
-    def __init__(self, device: str | None = None):
-        self.device = device or best_device()
+    def __init__(self, device: str = "cpu"):
+        self.device = device
         self.centers: np.ndarray = np.empty((0, 3), dtype=np.float32)
         self.radii: np.ndarray = np.empty((0, 3), dtype=np.float32)
         self.rotations: np.ndarray = np.empty((0, 4), dtype=np.float32)
@@ -123,7 +123,7 @@ class EllipsoidSet:
 
 
     @classmethod
-    def from_list(cls, ellipsoids: List[Ellipsoid], device: str | None = None) -> "EllipsoidSet":
+    def from_list(cls, ellipsoids: List[Ellipsoid], device: str = "cpu") -> "EllipsoidSet":
         es = cls(device=device)
         if not ellipsoids:
             return es
@@ -156,7 +156,7 @@ class EllipsoidSet:
         origin: np.ndarray,
         dx: float,
         n: int,
-        sdf_mode: int = SDF_QUILEZ,
+        sdf_mode: int = SDF_MERTSTEIN,
     ) -> np.ndarray:
 
         if self.count == 0:
@@ -181,7 +181,6 @@ class EllipsoidSet:
                 wp_origin, float(dx),
                 nx, ny, nz,
                 out,
-                int(sdf_mode),
             ],
             device=self.device,
         )
@@ -217,7 +216,7 @@ class EllipsoidSet:
 
 
 
-def create_demo_ellipsoids(device: str | None = None) -> EllipsoidSet:
+def create_demo_ellipsoids(device: str = "cpu") -> EllipsoidSet:
 
     q_id = Ellipsoid.identity_quat()
 

@@ -21,51 +21,10 @@ import numpy as np
 
 from PySide6 import QtCore
 
-from ellipsoid import (
-    Ellipsoid, EllipsoidSet,
-    SDF_QUILEZ, SDF_SC_MIN, SDF_SC_MEAN, SDF_SC_GMEAN, SDF_METHOD_NAMES,
-)
+from ellipsoid import Ellipsoid, EllipsoidSet, best_device
 
 
 # ── Warp kernels ──────────────────────────────────────────────────────────────
-
-
-@wp.func
-def _single_ellipsoid_sdf(local_p: wp.vec3, r: wp.vec3, sdf_mode: int) -> float:
-    """Compute SDF for a single ellipsoid in its local frame."""
-    scaled = wp.vec3(
-        local_p[0] / r[0],
-        local_p[1] / r[1],
-        local_p[2] / r[2],
-    )
-    k0 = wp.length(scaled)
-
-    d = 1.0e6
-    if sdf_mode == 0:
-        # Quílez: k0*(k0-1)/k1
-        scaled2 = wp.vec3(
-            local_p[0] / (r[0] * r[0]),
-            local_p[1] / (r[1] * r[1]),
-            local_p[2] / (r[2] * r[2]),
-        )
-        k1 = wp.length(scaled2)
-        k1_safe = wp.max(k1, 1.0e-8)
-        d = k0 * (k0 - 1.0) / k1_safe
-    elif sdf_mode == 1:
-        # Scaled-sphere (min r)
-        r_scale = wp.min(wp.min(r[0], r[1]), r[2])
-        d = (k0 - 1.0) * r_scale
-    elif sdf_mode == 2:
-        # Scaled-sphere (mean r)
-        r_scale = (r[0] + r[1] + r[2]) / 3.0
-        d = (k0 - 1.0) * r_scale
-    else:
-        # Scaled-sphere (geometric mean r)
-        r_scale = wp.pow(r[0] * r[1] * r[2], 1.0 / 3.0)
-        d = (k0 - 1.0) * r_scale
-
-    return d
-
 
 @wp.kernel
 def _ellipsoid_sdf_kernel_batch(
@@ -81,7 +40,6 @@ def _ellipsoid_sdf_kernel_batch(
     nz: int,
     indices: wp.array(dtype=wp.int32),
     out_sdf: wp.array(dtype=wp.float32),
-    sdf_mode: int,
 ):
     bid = wp.tid()
     tid = indices[bid]
@@ -109,7 +67,30 @@ def _ellipsoid_sdf_kernel_batch(
         local_p = wp.quat_rotate_inv(q, p - centers[i])
         r = radii[i]
 
-        d = _single_ellipsoid_sdf(local_p, r, sdf_mode)
+        scaled = wp.vec3(
+            local_p[0] / r[0],
+            local_p[1] / r[1],
+            local_p[2] / r[2],
+        )
+
+        k0 = wp.length(scaled)
+
+        # ── MertStein hybrid: Quílez outside, Scaled-Sphere (min r) inside ──
+        d = float(1.0e6)
+        if k0 < 1.0:
+            # Interior → (k0 − 1) · min(r)
+            r_min = wp.min(wp.min(r[0], r[1]), r[2])
+            d = (k0 - 1.0) * r_min
+        else:
+            # Exterior → Quílez: k0·(k0−1) / k1
+            scaled2 = wp.vec3(
+                local_p[0] / (r[0] * r[0]),
+                local_p[1] / (r[1] * r[1]),
+                local_p[2] / (r[2] * r[2]),
+            )
+            k1 = wp.length(scaled2)
+            k1_safe = wp.max(k1, 1.0e-8)
+            d = k0 * (k0 - 1.0) / k1_safe
 
         min_d[bid, i + 1] = wp.min(min_d[bid, i], d)
 
@@ -173,7 +154,7 @@ def _normalize_flat_quats(
     rot_flat[base + 3] = w * inv_len
 
 
-device = "cuda" if wp.is_cuda_available() else "cpu"
+device = "cpu"
 
 
 def _soft_clamp_np(x: np.ndarray, limit: float) -> np.ndarray:
@@ -266,13 +247,13 @@ class OptimizationWorker(QtCore.QThread):
         method: str = "adam",
         num_steps: int = 2000,
         report_every: int = 20,
+        sdf_mode: int = 4,
         batch_fraction: float | None = None,
         batch_size: int | None = None,
         maintenance_every: int = 200,
         containment_thresh: float = 0.8,
         max_prune_fraction: float = 0.15,
         min_volume_abs: float = 1e-8,
-        sdf_mode: int = SDF_QUILEZ,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
@@ -284,8 +265,8 @@ class OptimizationWorker(QtCore.QThread):
         self._method = method
         self._num_steps = num_steps
         self._report_every = report_every
-        self._stop_flag = False
         self._sdf_mode = sdf_mode
+        self._stop_flag = False
 
         self._maintenance_every = maintenance_every
         self._containment_thresh = containment_thresh
@@ -597,7 +578,7 @@ class OptimizationWorker(QtCore.QThread):
         ell_set = EllipsoidSet(device=device)
         if len(centers) > 0:
             ell_set.set_parameters(centers, radii, rotations)
-        pred_grid = ell_set.compute_sdf_grid(origin, dx, n, sdf_mode=self._sdf_mode)
+        pred_grid = ell_set.compute_sdf_grid(origin, dx, n)
 
         target_grid = self._sdf_target_np
         error = np.abs(
@@ -767,7 +748,7 @@ class OptimizationWorker(QtCore.QThread):
                     dim=bs,
                     inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
                             num_e, wp_origin, float(dx), n, n, n,
-                            wp_indices, sdf_pred, self._sdf_mode],
+                            wp_indices, sdf_pred],
                     device=device,
                 )
                 loss.zero_()
@@ -858,7 +839,7 @@ class OptimizationWorker(QtCore.QThread):
                     dim=bs,
                     inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
                             num_e, wp_origin, float(dx), n, n, n,
-                            wp_indices, sdf_pred, self._sdf_mode],
+                            wp_indices, sdf_pred],
                     device=device,
                 )
                 loss.zero_()
@@ -885,7 +866,7 @@ class OptimizationWorker(QtCore.QThread):
 
 # ── Demo helper ───────────────────────────────────────────────────────────────
 
-def create_demo_ellipsoids(device: str | None = None) -> EllipsoidSet:
+def create_demo_ellipsoids(device: str = "cpu") -> EllipsoidSet:
     q_id = Ellipsoid.identity_quat()
 
     angle = np.radians(45.0)
