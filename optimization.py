@@ -154,7 +154,7 @@ def _normalize_flat_quats(
     rot_flat[base + 3] = w * inv_len
 
 
-device = "cpu"
+device = "cuda"
 
 
 def _soft_clamp_np(x: np.ndarray, limit: float) -> np.ndarray:
