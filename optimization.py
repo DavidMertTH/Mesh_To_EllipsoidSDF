@@ -6,6 +6,7 @@ from PySide6 import QtCore
 
 from ellipsoid import Ellipsoid
 from ellipsoid import EllipsoidSet
+from sdf_methods import sdf_ellipsoid_wp, METHOD_QUILEZ
 
 
 @wp.kernel
@@ -20,11 +21,15 @@ def _ellipsoid_union_sdf_kernel_flat(
     nx: int,
     ny: int,
     nz: int,
+    method_id: int,
     out_sdf: wp.array(dtype=wp.float32),
 ):
     """SDF kernel that reads rotations from a flat float32 array
     (4 consecutive floats per ellipsoid: x, y, z, w) so that the
-    array is compatible with Warp's Adam optimizer."""
+    array is compatible with Warp's Adam optimizer.
+
+    Uses the central ``sdf_ellipsoid_wp`` dispatch from sdf_methods.
+    """
     tid = wp.tid()
     ix = tid % nx
     iy = (tid // nx) % ny
@@ -50,23 +55,7 @@ def _ellipsoid_union_sdf_kernel_flat(
         local_p = wp.quat_rotate_inv(q, p - centers[i])
         r = radii[i]
 
-        scaled = wp.vec3(
-            local_p[0] / r[0],
-            local_p[1] / r[1],
-            local_p[2] / r[2],
-        )
-        scaled2 = wp.vec3(
-            local_p[0] / (r[0] * r[0]),
-            local_p[1] / (r[1] * r[1]),
-            local_p[2] / (r[2] * r[2]),
-        )
-
-        k0 = wp.length(scaled)
-        k1 = wp.length(scaled2)
-
-        # Clamp to avoid division by zero (keeps autodiff stable)
-        k1_safe = wp.max(k1, 1.0e-8)
-        d = k0 * (k0 - 1.0) / k1_safe
+        d = sdf_ellipsoid_wp(local_p, r, method_id)
 
         min_d[ix, iy, iz, i + 1] = wp.min(min_d[ix, iy, iz, i], d)
 
@@ -160,6 +149,7 @@ class OptimizationWorker(QtCore.QThread):
         method: str = "adam",
         num_steps: int = 2000,
         report_every: int = 20,
+        sdf_method_id: int = METHOD_QUILEZ,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
@@ -171,6 +161,7 @@ class OptimizationWorker(QtCore.QThread):
         self._method = method
         self._num_steps = num_steps
         self._report_every = report_every
+        self._sdf_method_id = sdf_method_id
         self._stop_flag = False
 
     def request_stop(self):
@@ -252,7 +243,8 @@ class OptimizationWorker(QtCore.QThread):
                     _ellipsoid_union_sdf_kernel_flat,
                     dim=total,
                     inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
-                            num_e, wp_origin, float(dx), n, n, n, sdf_pred],
+                            num_e, wp_origin, float(dx), n, n, n,
+                            self._sdf_method_id, sdf_pred],
                     device=device,
                 )
                 loss.zero_()
@@ -336,7 +328,8 @@ class OptimizationWorker(QtCore.QThread):
                     _ellipsoid_union_sdf_kernel_flat,
                     dim=total,
                     inputs=[pred_centers, pred_radii, pred_rot_flat, min_d_cache,
-                            num_e, wp_origin, float(dx), n, n, n, sdf_pred],
+                            num_e, wp_origin, float(dx), n, n, n,
+                            self._sdf_method_id, sdf_pred],
                     device=device,
                 )
                 loss.zero_()

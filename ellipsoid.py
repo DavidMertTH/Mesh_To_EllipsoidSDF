@@ -7,6 +7,8 @@ import numpy as np
 import trimesh
 import warp as wp
 
+from sdf_methods import sdf_ellipsoid_wp, METHOD_QUILEZ
+
 
 @wp.kernel
 def _ellipsoid_union_sdf_kernel(
@@ -19,6 +21,7 @@ def _ellipsoid_union_sdf_kernel(
     nx: int,
     ny: int,
     nz: int,
+    method_id: int,
     out_sdf: wp.array(dtype=wp.float32),
 ):
     tid = wp.tid()
@@ -35,31 +38,9 @@ def _ellipsoid_union_sdf_kernel(
     min_d = float(1.0e6)
 
     for i in range(num_ellipsoids):
-        # Transform to ellipsoid-local frame
         local_p = wp.quat_rotate_inv(rotations[i], p - centers[i])
         r = radii[i]
-
-        #  Quílez ellipsoid SDF approximation (Das ist der Dude von dem ich dir erzählt habe):
-        #   k0 = |p / r|
-        #   k1 = |p / r²|
-        #   sdf ≈ k0 * (k0 - 1) / k1
-        scaled = wp.vec3(
-            local_p[0] / r[0],
-            local_p[1] / r[1],
-            local_p[2] / r[2],
-        )
-        scaled2 = wp.vec3(
-            local_p[0] / (r[0] * r[0]),
-            local_p[1] / (r[1] * r[1]),
-            local_p[2] / (r[2] * r[2]),
-        )
-
-        k0 = wp.length(scaled)
-        k1 = wp.length(scaled2)
-
-        d = float(1.0e6)
-        if k1 > 1.0e-12:
-            d = k0 * (k0 - 1.0) / k1
+        d = sdf_ellipsoid_wp(local_p, r, method_id)
 
         if d < min_d:
             min_d = d
@@ -124,6 +105,7 @@ class EllipsoidSet:
         origin: np.ndarray,
         dx: float,
         n: int,
+        method_id: int = METHOD_QUILEZ,
     ) -> np.ndarray:
 
         if self.count == 0:
@@ -147,6 +129,7 @@ class EllipsoidSet:
                 self.count,
                 wp_origin, float(dx),
                 nx, ny, nz,
+                int(method_id),
                 out,
             ],
             device=self.device,
