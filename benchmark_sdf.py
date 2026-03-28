@@ -14,7 +14,10 @@ Methoden:
   - Scaled-Sphere (min r)     →  (|p/r|−1) · min(r)
   - Scaled-Sphere (mean r)    →  (|p/r|−1) · mean(r)
   - Scaled-Sphere (geom mean) →  (|p/r|−1) · ∛(r₁r₂r₃)
-  - MertStein                 →  Quílez (außen) + Sc-min (innen)
+  - Gradient-Projektion       →  Newton-Schritt auf Closest-Point entlang ∇f
+  - k₁/k₂                    →  (k0−1) · k1/k2  (hierarchische Normen)
+  - Krümmungskorrektur        →  φ_Q / (1 + κ_n · φ_Q)
+  - Newton-Schritt            →  Ray-Ellipsoid-Schnitt entlang Normale bei q₀
 """
 
 import sys
@@ -118,44 +121,204 @@ def sdf_scaled_gmean(points: np.ndarray, radii: np.ndarray) -> np.ndarray:
     return (k - 1.0) * np.cbrt(np.prod(r))
 
 
-def sdf_mertstein(points: np.ndarray, radii: np.ndarray) -> np.ndarray:
-    """MertStein hybrid:  Quílez outside, Scaled-Sphere (min r) inside.
+# ── Idee 1: Gradientenbasierte Projektion ────────────────────────────────
+def sdf_gradient_proj(points: np.ndarray, radii: np.ndarray) -> np.ndarray:
+    """Gradient-based projection (one Newton step on closest-point).
 
-    Step 1: Determine inside/outside via  Σ (p_i/r_i)² < 1.
-    Step 2: Compose — exterior uses Quílez, interior uses (|p/r|−1)·min(r).
+    Instead of projecting radially (in normalized space) onto the surface,
+    project along the gradient direction ∇f = 2p/r².  This gives a better
+    estimate q₁ of the closest surface point, then compute the tangent-plane
+    distance at q₁.
+    """
+    r = radii.astype(np.float64)
+    r2 = r * r
+    p = points.astype(np.float64)
+    eps = 1e-15
+
+    # Gradient direction at p (unnormalized): g_i = p_i / r_i²
+    g = p / r2                                        # (N, 3)
+    g_norm = np.linalg.norm(g, axis=1, keepdims=True)
+    g_hat = g / np.maximum(g_norm, eps)               # unit gradient
+
+    # Find t such that q = p - t * g_hat lies on the ellipsoid:
+    #   Σ (p_i - t * g_hat_i)² / r_i² = 1
+    # This is a quadratic in t:  A t² - 2B t + C = 0
+    #   A = Σ g_hat_i² / r_i²
+    #   B = Σ p_i g_hat_i / r_i²
+    #   C = Σ p_i² / r_i² = k₀²
+    A = np.sum(g_hat ** 2 / r2, axis=1)               # (N,)
+    B = np.sum(p * g_hat / r2, axis=1)                 # (N,)
+    C = np.sum(p ** 2 / r2, axis=1)                    # = k₀²
+
+    disc = B ** 2 - A * (C - 1.0)
+    disc = np.maximum(disc, 0.0)
+    sqrt_disc = np.sqrt(disc)
+
+    # Two solutions: t = (B ± √disc) / A
+    # For exterior points (C > 1) take the smaller root (closer intersection)
+    # For interior points (C < 1) take the negative root
+    inside = C < 1.0
+    t = np.where(inside,
+                 (B - sqrt_disc) / np.maximum(A, eps),
+                 (B - sqrt_disc) / np.maximum(A, eps))
+
+    # Projected surface point
+    q1 = p - t[:, None] * g_hat                       # (N, 3)
+
+    # Normal at q1: n = q1/r² (unnormalized)
+    n = q1 / r2
+    n_norm = np.linalg.norm(n, axis=1, keepdims=True)
+    n_hat = n / np.maximum(n_norm, eps)
+
+    # Signed distance = (p - q1) · n_hat
+    dist = np.sum((p - q1) * n_hat, axis=1)
+    return dist
+
+
+# ── Idee 2: Hierarchische skalierte Normen (k₁/k₂) ─────────────────────
+def sdf_k1k2(points: np.ndarray, radii: np.ndarray) -> np.ndarray:
+    """Hierarchical scaled norms:  (k₀ − 1) · k₁ / k₂.
+
+    Uses k₂ = ||p/r³|| as the back-scaling factor evaluated at the
+    approximate surface point rather than at p.  For a sphere k₁/k₂ = r,
+    recovering the exact SDF.  For ellipsoids the shorter axes are weighted
+    more strongly, potentially giving better directional adaptation.
     """
     r = radii.astype(np.float64)
     p = points.astype(np.float64)
+    k0 = np.linalg.norm(p / r, axis=1)
+    k1 = np.linalg.norm(p / (r ** 2), axis=1)
+    k2 = np.linalg.norm(p / (r ** 3), axis=1)
+    k2 = np.maximum(k2, 1e-15)
+    return (k0 - 1.0) * k1 / k2
 
-    # ── Step 1: inside / outside classification ───────────────────────
+
+# ── Idee 3: Krümmungskorrektur ──────────────────────────────────────────
+def sdf_curvature_corr(points: np.ndarray, radii: np.ndarray) -> np.ndarray:
+    """Curvature-corrected Quílez:  φ_Q / (1 + κ_n · φ_Q).
+
+    The Quílez formula is a tangent-plane distance and overestimates the
+    true SDF for convex surfaces.  This correction uses the normal curvature
+    κ_n at the radially projected surface point q₀ = p/k₀ to account for
+    the surface curving away from p.
+    """
+    r = radii.astype(np.float64)
+    r2 = r * r
+    p = points.astype(np.float64)
+    eps = 1e-15
+
+    # Quílez SDF
     scaled = p / r
+    scaled2 = p / r2
     k0 = np.linalg.norm(scaled, axis=1)
-    inside = k0 < 1.0
+    k1 = np.maximum(np.linalg.norm(scaled2, axis=1), eps)
+    phi_q = k0 * (k0 - 1.0) / k1
 
-    result = np.empty(len(p), dtype=np.float64)
+    # Projected surface point: q0 = p / k0
+    k0_safe = np.maximum(k0, eps)
+    q0 = p / k0_safe[:, None]                          # (N, 3)
 
-    # ── Step 2a: Exterior → Quílez ────────────────────────────────────
-    if np.any(~inside):
-        scaled2 = p[~inside] / (r * r)
-        k0_ext = k0[~inside]
-        k1_ext = np.maximum(np.linalg.norm(scaled2, axis=1), 1e-15)
-        result[~inside] = k0_ext * (k0_ext - 1.0) / k1_ext
+    # Normal curvature at q0 in direction of (p - q0)
+    # For an ellipsoid x²/a² + y²/b² + z²/c² = 1:
+    #   Gaussian curvature K = 1/(a²b²c²) · 1/(Σ q_i²/r_i⁴)²
+    #   Mean curvature H = ... (complex)
+    # Simpler: normal curvature κ_n = II(v,v) / I(v,v)
+    # where v is the projection direction.
+    #
+    # The second fundamental form coefficient in direction v
+    # for implicit surface F(x) = Σ x_i²/r_i² - 1:
+    #   κ_n = (v^T H_F v) / |∇F| where H_F is the Hessian of F
+    # H_F = diag(2/r_i²), ∇F = 2q/r² at q0
+    #
+    # κ_n = Σ v_i² · (2/r_i²) / |∇F|   for unit v
 
-    # ── Step 2b: Interior → Scaled-Sphere (min r) ────────────────────
-    if np.any(inside):
-        k0_int = k0[inside]
-        result[inside] = (k0_int - 1.0) * np.min(r)
+    # Gradient of implicit function at q0
+    grad_F = 2.0 * q0 / r2                            # (N, 3)
+    grad_F_norm = np.maximum(np.linalg.norm(grad_F, axis=1), eps)
 
-    return result
+    # Direction from q0 to p (= radial direction in original space)
+    v = p - q0                                         # (N, 3)
+    v_norm = np.maximum(np.linalg.norm(v, axis=1, keepdims=True), eps)
+    v_hat = v / v_norm                                 # unit direction
+
+    # Hessian of F is diagonal: H_ii = 2/r_i²
+    # v^T H v = Σ 2 v_hat_i² / r_i²
+    vHv = np.sum(2.0 * v_hat ** 2 / r2, axis=1)
+
+    # Normal curvature (magnitude; always positive for convex surface
+    # when measured from outside)
+    kappa_n = vHv / grad_F_norm
+
+    # Correction: φ_corr = φ_Q / (1 + κ_n · |φ_Q|)
+    # Use |φ_Q| to ensure correction is always a reduction in magnitude
+    # but preserve sign for interior points
+    sign = np.sign(phi_q)
+    abs_phi = np.abs(phi_q)
+    phi_corr = abs_phi / (1.0 + kappa_n * abs_phi)
+    return sign * phi_corr
+
+
+# ── Idee 4: Iterative Verfeinerung (1 Newton-Schritt) ───────────────────
+def sdf_newton_step(points: np.ndarray, radii: np.ndarray) -> np.ndarray:
+    """One Newton-like refinement step.
+
+    1. Estimate surface point q₀ = p / k₀  (radial projection)
+    2. Compute outward normal n₀ at q₀
+    3. Intersect ray from p in direction −n₀ with ellipsoid → q₁
+    4. Return ||p − q₁|| as the improved distance estimate
+    """
+    r = radii.astype(np.float64)
+    r2 = r * r
+    p = points.astype(np.float64)
+    eps = 1e-15
+
+    inside = np.sum((p / r) ** 2, axis=1) < 1.0
+
+    # Step 1: radial projection q₀ = p / k₀
+    k0 = np.maximum(np.linalg.norm(p / r, axis=1), eps)
+    q0 = p / k0[:, None]
+
+    # Step 2: outward normal at q₀ (gradient of implicit F = Σ x²/r² - 1)
+    n0 = q0 / r2                                       # (N, 3)
+    n0_norm = np.maximum(np.linalg.norm(n0, axis=1, keepdims=True), eps)
+    n0_hat = n0 / n0_norm                               # unit normal
+
+    # Step 3: intersect ray  x(t) = p - t·n₀_hat  with ellipsoid
+    #   Σ (p_i - t·n_i)² / r_i² = 1
+    #   A t² - 2B t + C = 0
+    A = np.sum(n0_hat ** 2 / r2, axis=1)
+    B = np.sum(p * n0_hat / r2, axis=1)
+    C = np.sum(p ** 2 / r2, axis=1)  # = k₀² before clamping
+
+    disc = B ** 2 - A * (C - 1.0)
+    disc = np.maximum(disc, 0.0)
+    sqrt_disc = np.sqrt(disc)
+    A_safe = np.maximum(A, eps)
+
+    # Pick the root closest to the surface along the ray x(t) = p - t·n₀_hat:
+    # For exterior (C > 1): both roots positive, want smaller → (B - √disc) / A
+    # For interior (C < 1): disc > B², so t1 = (B - √disc)/A < 0.
+    #   Negative t means q1 = p + |t|·n_hat → goes outward to nearest surface point.
+    # In both cases, the (B - √disc) root gives the nearest intersection.
+    t = (B - sqrt_disc) / A_safe
+
+    q1 = p - t[:, None] * n0_hat
+
+    # Step 4: distance
+    dist = np.linalg.norm(p - q1, axis=1)
+    return np.where(inside, -dist, dist)
 
 
 # Method registry: (display_name, function, short_name_for_plots)
 METHODS = [
-    ("Quílez",                sdf_quilez,      "Quílez"),
-    ("Scaled (min r)",        sdf_scaled_min,  "Sc-min"),
-    ("Scaled (mean r)",       sdf_scaled_mean, "Sc-mean"),
-    ("Scaled (geom. mean r)", sdf_scaled_gmean,"Sc-gmean"),
-    ("MertStein",             sdf_mertstein,   "MertSt"),
+    ("Quílez",                sdf_quilez,        "Quílez"),
+    ("Scaled (min r)",        sdf_scaled_min,    "Sc-min"),
+    ("Scaled (mean r)",       sdf_scaled_mean,   "Sc-mean"),
+    ("Scaled (geom. mean r)", sdf_scaled_gmean,  "Sc-gmean"),
+    # ("Gradient-Proj.",        sdf_gradient_proj,  "Grad-P"),
+    # ("k₁/k₂",                sdf_k1k2,          "k₁/k₂"),
+    # ("Krümmungskorr.",        sdf_curvature_corr, "Krümm"),
+    # ("Newton-Schritt",        sdf_newton_step,    "Newton"),
 ]
 
 
@@ -303,7 +466,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Ellipsoid SDF Benchmark")
-        self.resize(1700, 1100)
+        self.resize(2200, 1200)
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────
@@ -365,13 +528,13 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         root.addLayout(bar)
 
         # ── Matplotlib figure ─────────────────────────────────────────
-        self._fig = Figure(figsize=(18, 12), dpi=100, facecolor="#0d1117")
+        self._fig = Figure(figsize=(24, 13), dpi=100, facecolor="#0d1117")
         self._canvas = FigureCanvas(self._fig)
         root.addWidget(self._canvas, stretch=4)
 
         # ── Metrics table ─────────────────────────────────────────────
         self._table = QtWidgets.QTableWidget()
-        self._table.setMaximumHeight(180)
+        self._table.setMaximumHeight(280)
         self._table.setAlternatingRowColors(True)
         self._table.setStyleSheet(
             "QTableWidget { font-family: monospace; font-size: 12px; }"
@@ -540,16 +703,13 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
 
         # ── Row 2: bar charts + angular profile + timing ──────────────
 
-        ax_bar = self._fig.add_subplot(gs[2, 0:2])
+        ax_bar = self._fig.add_subplot(gs[2, 0:3])
         self._draw_metric_bars(ax_bar, res, text_color)
 
-        ax_rad = self._fig.add_subplot(gs[2, 2:4])
+        ax_rad = self._fig.add_subplot(gs[2, 3:6])
         self._draw_radial_profile(ax_rad, res, text_color)
 
-        if n_cols > 4:
-            ax_time = self._fig.add_subplot(gs[2, 4:n_cols])
-        else:
-            ax_time = self._fig.add_subplot(gs[2, n_cols - 1])
+        ax_time = self._fig.add_subplot(gs[2, 6:n_cols])
         self._draw_timing_bars(ax_time, res, text_color)
 
         # ── Suptitle ──────────────────────────────────────────────────
@@ -579,14 +739,14 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
             linf.append(m["l_inf"])
 
         x = np.arange(len(names))
-        w = 0.25
+        w = 0.22
         colors = ["#f2e641", "#4962f2", "#f26450"]
         ax.bar(x - w, mae, w, label="MAE", color=colors[0], edgecolor="none")
         ax.bar(x, rmse, w, label="RMSE", color=colors[1], edgecolor="none")
         ax.bar(x + w, linf, w, label="L∞", color=colors[2], edgecolor="none")
 
         ax.set_xticks(x)
-        ax.set_xticklabels(names, fontsize=8, color=tc)
+        ax.set_xticklabels(names, fontsize=7, color=tc, rotation=35, ha="right")
         ax.set_ylabel("Fehler", fontsize=9, color=tc)
         ax.set_title(f"Fehlermetriken (XY, {region_label})", fontsize=9, color=tc)
         ax.legend(fontsize=8, loc="upper left", facecolor="#1a2030",
@@ -599,7 +759,8 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         """Error vs. normalized radial distance along rays from center."""
         rad = res["radial"]
         t_norm = rad["t_norm"]
-        method_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff", "#ff7f50"]
+        method_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff",
+                         "#ff9f43", "#1abc9c", "#e74c3c", "#3498db"]
         line_styles = ["-", "--", ":"]
 
         for i, (name, _, short) in enumerate(METHODS):
@@ -636,8 +797,8 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         ax.set_xlabel("Normierter Abstand (0=Zentrum, 1=Oberfläche)", fontsize=8, color=tc)
         ax.set_ylabel("|Fehler|", fontsize=9, color=tc)
         ax.set_title("Radiales Fehlerprofil", fontsize=9, color=tc)
-        ax.legend(handles=handles, fontsize=6, loc="upper right",
-                  facecolor="#1a2030", edgecolor="#333", labelcolor=tc, ncol=2)
+        ax.legend(handles=handles, fontsize=5, loc="upper right",
+                  facecolor="#1a2030", edgecolor="#333", labelcolor=tc, ncol=3)
         ax.tick_params(colors=tc, labelsize=7)
         ax.set_facecolor("#0d1117")
         ax.spines[:].set_color("#333")
@@ -649,12 +810,13 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         values = list(timing.values())
         short_names = ["Exakt"] + [s for _, _, s in METHODS]
 
-        colors = ["#888"] + ["#f2e641", "#4962f2", "#50c878", "#c878ff", "#ff7f50"]
+        colors = ["#888"] + ["#f2e641", "#4962f2", "#50c878", "#c878ff",
+                              "#ff9f43", "#1abc9c", "#e74c3c", "#3498db"]
         bars = ax.barh(range(len(names)), values, color=colors[:len(names)],
-                       edgecolor="none", height=0.6)
+                       edgecolor="none", height=0.55)
 
         ax.set_yticks(range(len(names)))
-        ax.set_yticklabels(short_names, fontsize=8, color=tc)
+        ax.set_yticklabels(short_names, fontsize=7, color=tc)
         ax.set_xlabel("ms (48³ Grid)", fontsize=9, color=tc)
         ax.set_title("Laufzeit", fontsize=9, color=tc)
         ax.tick_params(colors=tc, labelsize=7)

@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 
 import matplotlib
-matplotlib.use("Agg")
+# Backend set later: "Agg" for headless, or default (TkAgg/QtAgg) for --plot
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
@@ -39,33 +39,29 @@ from benchmark_sdf import run_benchmark, METHODS
 # TEST CONFIGURATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-TEST_CONFIGS = [
-    # (label, (rx, ry, rz))
-    # ── Sphärisch ─────────────────────────────────────────────────────
-    ("Kugel",                      (1.0,  1.0,  1.0)),
-    ("Kugel (klein)",              (0.3,  0.3,  0.3)),
+def _generate_configs(n_steps: int = 20):
+    """Generiere n_steps Konfigurationen von Kugel (κ=1) bis Nadel (κ≈33).
 
-    # ── Milde Aspektverhältnisse (κ ≈ 1.5–2) ─────────────────────────
-    ("Mild κ≈1.4",                 (1.0,  0.8,  0.7)),
-    ("Mild κ≈2.0",                 (1.0,  0.7,  0.5)),
+    rx bleibt 1.0, ry und rz werden log-linear von 1.0 auf 0.05 bzw. 0.03
+    interpoliert, sodass κ = max(r)/min(r) gleichmäßig in log-Stufen wächst.
+    """
+    ry_start, ry_end = 1.0, 0.05
+    rz_start, rz_end = 1.0, 0.03
 
-    # ── Moderate (κ ≈ 3–5) ────────────────────────────────────────────
-    ("Moderat κ≈3.3",              (1.0,  0.5,  0.3)),
-    ("Moderat κ≈5.0",              (1.0,  0.4,  0.2)),
+    ry_vals = np.logspace(np.log10(ry_start), np.log10(ry_end), n_steps)
+    rz_vals = np.logspace(np.log10(rz_start), np.log10(rz_end), n_steps)
 
-    # ── Hoch (κ ≈ 10) ────────────────────────────────────────────────
-    ("Hoch κ≈10",                  (1.0,  0.3,  0.1)),
-    ("Dünne Scheibe κ≈10",        (1.0,  1.0,  0.1)),
-    ("Lange Nadel κ≈10",          (1.0,  0.1,  0.1)),
+    configs = []
+    for i in range(n_steps):
+        ry = round(float(ry_vals[i]), 4)
+        rz = round(float(rz_vals[i]), 4)
+        kappa = 1.0 / min(ry, rz)
+        label = f"κ≈{kappa:.1f}"
+        configs.append((label, (1.0, ry, rz)))
+    return configs
 
-    # ── Sehr hoch (κ ≈ 20+) ──────────────────────────────────────────
-    ("Extrem κ≈20",                (1.0,  0.2,  0.05)),
-    ("Extrem Nadel κ≈33",         (1.0,  0.05, 0.03)),
 
-    # ── Verschiedene Skalen ───────────────────────────────────────────
-    ("Groß κ≈3.3",                 (5.0,  2.5,  1.5)),
-    ("Klein κ≈3.3",                (0.2,  0.1,  0.06)),
-]
+TEST_CONFIGS = _generate_configs(20)
 
 REGIONS = ["total", "interior", "exterior", "near_surface"]
 REGION_LABELS = {
@@ -357,7 +353,13 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
         fig.suptitle("MAE vs. Aspektverhältnis κ",
                      fontsize=14, color=text_color, y=0.98)
 
-        method_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff", "#ff7f50"]
+        _base_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff",
+                        "#f26450", "#ff9f43", "#a29bfe", "#00cec9"]
+        if n_methods <= len(_base_colors):
+            method_colors = _base_colors[:n_methods]
+        else:
+            cmap = plt.cm.get_cmap("tab10", n_methods)
+            method_colors = [cmap(i) for i in range(n_methods)]
         for ax_idx, region in enumerate(["total", "interior"]):
             ax = axes[ax_idx]
             ax.set_facecolor(bg_color)
@@ -393,6 +395,155 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# INTERACTIVE PLOT — Fehler vs. κ mit Metrik-Auswahl
+# ══════════════════════════════════════════════════════════════════════════════
+
+def show_interactive_plot(results: list[dict], rows: list[dict]):
+    """Interaktives Matplotlib-Fenster: Fehler vs. κ für alle Methoden.
+
+    RadioButtons erlauben die Auswahl der Fehlermetrik (MAE / RMSE / L∞)
+    und der Region (Gesamt / Interior / Exterior / Oberfläche).
+    """
+    from matplotlib.widgets import RadioButtons
+
+    method_names = [name for name, _, _ in METHODS]
+    method_shorts = [short for _, _, short in METHODS]
+    n_methods = len(method_names)
+    _base_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff",
+                    "#f26450", "#ff9f43", "#a29bfe", "#00cec9"]
+    if n_methods <= len(_base_colors):
+        method_colors = _base_colors[:n_methods]
+    else:
+        cmap = plt.cm.get_cmap("tab10", n_methods)
+        method_colors = [cmap(i) for i in range(n_methods)]
+
+    bg_color = "#0d1117"
+    text_color = "#d0d0d0"
+
+    # ── Daten vorbereiten ─────────────────────────────────────────────
+    kappas = np.array([r["aspect_ratio"] for r in results])
+    sort_idx = np.argsort(kappas)
+    kappas_sorted = kappas[sort_idx]
+
+    # Alle Werte vorberechnen: values[metric][region][method_idx] = array
+    values = {}
+    for metric in METRIC_KEYS:
+        values[metric] = {}
+        for region in REGIONS:
+            values[metric][region] = []
+            for m_idx, name in enumerate(method_names):
+                vals = []
+                for res in results:
+                    vals.append(
+                        res["slices"]["XY"]["methods"][name]["metrics"][region][metric]
+                    )
+                values[metric][region].append(np.array(vals)[sort_idx])
+
+    # ── Figure ────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(12, 7), facecolor=bg_color)
+    fig.subplots_adjust(left=0.10, right=0.78, bottom=0.12, top=0.92)
+    ax.set_facecolor(bg_color)
+
+    # ── Initiale Plots ────────────────────────────────────────────────
+    lines = []
+    scatters = []
+    init_metric = "mae"
+    init_region = "total"
+    for m_idx, name in enumerate(method_names):
+        y = values[init_metric][init_region][m_idx]
+        line, = ax.plot(kappas_sorted, y,
+                        color=method_colors[m_idx], linewidth=1.5,
+                        alpha=0.7, zorder=2)
+        sc = ax.scatter(kappas_sorted, y,
+                        color=method_colors[m_idx], s=45, alpha=0.9,
+                        label=method_shorts[m_idx], zorder=3,
+                        edgecolors="white", linewidths=0.3)
+        lines.append(line)
+        scatters.append(sc)
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Aspektverhältnis κ", fontsize=11, color=text_color)
+    ax.set_ylabel("MAE", fontsize=11, color=text_color)
+    ax.set_title("Fehler vs. Aspektverhältnis κ  —  Gesamt",
+                 fontsize=13, color=text_color)
+    ax.legend(fontsize=9, facecolor="#1a2030", edgecolor="#444",
+              labelcolor=text_color, loc="upper left")
+    ax.tick_params(colors=text_color, labelsize=9)
+    ax.spines[:].set_color("#333")
+    ax.grid(True, alpha=0.15, color="#555")
+
+    # ── RadioButtons: Metrik ──────────────────────────────────────────
+    metric_labels = ["MAE", "RMSE", "L∞"]
+    metric_keys = ["mae", "rmse", "l_inf"]
+
+    ax_radio_metric = fig.add_axes([0.82, 0.60, 0.15, 0.18], facecolor="#1a2030")
+    ax_radio_metric.set_title("Fehlermetrik", fontsize=9, color=text_color,
+                              pad=8)
+    radio_metric = RadioButtons(ax_radio_metric, metric_labels,
+                                activecolor="#4962f2")
+    for label in radio_metric.labels:
+        label.set_color(text_color)
+        label.set_fontsize(10)
+
+    # ── RadioButtons: Region ──────────────────────────────────────────
+    region_labels_list = [REGION_LABELS[r] for r in REGIONS]
+    region_keys = list(REGIONS)
+
+    ax_radio_region = fig.add_axes([0.82, 0.25, 0.15, 0.28], facecolor="#1a2030")
+    ax_radio_region.set_title("Region", fontsize=9, color=text_color, pad=8)
+    radio_region = RadioButtons(ax_radio_region, region_labels_list,
+                                activecolor="#50c878")
+    for label in radio_region.labels:
+        label.set_color(text_color)
+        label.set_fontsize(10)
+
+    # ── State ─────────────────────────────────────────────────────────
+    state = dict(metric=init_metric, region=init_region)
+
+    def _update():
+        m = state["metric"]
+        r = state["region"]
+        y_label = {"mae": "MAE", "rmse": "RMSE", "l_inf": "L∞"}[m]
+        r_label = REGION_LABELS[r]
+
+        all_y = []
+        for m_idx in range(len(method_names)):
+            y = values[m][r][m_idx]
+            lines[m_idx].set_ydata(y)
+            scatters[m_idx].set_offsets(np.column_stack([kappas_sorted, y]))
+            all_y.append(y)
+
+        # Achsenlimits anpassen
+        all_vals = np.concatenate(all_y)
+        all_vals = all_vals[all_vals > 0]  # log-safe
+        if len(all_vals) > 0:
+            y_min = all_vals.min() * 0.5
+            y_max = all_vals.max() * 2.0
+            ax.set_ylim(y_min, y_max)
+
+        ax.set_ylabel(y_label, fontsize=11, color=text_color)
+        ax.set_title(f"Fehler vs. Aspektverhältnis κ  —  {r_label}",
+                     fontsize=13, color=text_color)
+        fig.canvas.draw_idle()
+
+    def _on_metric(label):
+        idx = metric_labels.index(label)
+        state["metric"] = metric_keys[idx]
+        _update()
+
+    def _on_region(label):
+        idx = region_labels_list.index(label)
+        state["region"] = region_keys[idx]
+        _update()
+
+    radio_metric.on_clicked(_on_metric)
+    radio_region.on_clicked(_on_region)
+
+    plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -406,7 +557,13 @@ def main():
                         help="Pfad für CSV-Export")
     parser.add_argument("--pdf", type=str, default=None,
                         help="Pfad für PDF-Report")
+    parser.add_argument("--plot", action="store_true", default=False,
+                        help="Interaktives Diagramm (Fehler vs. κ) anzeigen")
     args = parser.parse_args()
+
+    # Backend: Agg für headless, sonst interaktiv
+    if not args.plot:
+        matplotlib.use("Agg")
 
     print(f"Grid-Auflösung: {args.grid}")
     print(f"Anzahl Konfigurationen: {len(TEST_CONFIGS)}")
@@ -430,8 +587,12 @@ def main():
     if args.pdf:
         export_pdf(results, rows, winners, args.pdf)
 
-    if not args.csv and not args.pdf:
-        print("\nTipp: --csv results.csv und/oder --pdf report.pdf für Export.")
+    if not args.csv and not args.pdf and not args.plot:
+        print("\nTipp: --csv results.csv und/oder --pdf report.pdf für Export,"
+              " --plot für interaktives Diagramm.")
+
+    if args.plot:
+        show_interactive_plot(results, rows)
 
 
 if __name__ == "__main__":
