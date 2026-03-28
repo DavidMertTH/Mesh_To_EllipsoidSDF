@@ -40,13 +40,14 @@ from benchmark_sdf import run_benchmark, METHODS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _generate_configs(n_steps: int = 20):
-    """Generiere n_steps Konfigurationen von Kugel (κ=1) bis Nadel (κ≈33).
+    """Generiere n_steps Konfigurationen von κ≈1.1 bis Nadel (κ≈33).
 
-    rx bleibt 1.0, ry und rz werden log-linear von 1.0 auf 0.05 bzw. 0.03
-    interpoliert, sodass κ = max(r)/min(r) gleichmäßig in log-Stufen wächst.
+    rx bleibt 1.0, ry und rz werden log-linear interpoliert,
+    sodass κ = max(r)/min(r) gleichmäßig in log-Stufen wächst.
     """
-    ry_start, ry_end = 1.0, 0.05
-    rz_start, rz_end = 1.0, 0.03
+    # κ_start = 1/rz_start = 1.1  →  rz_start = 1/1.1
+    ry_start, ry_end = 1.0 / 1.1, 0.05
+    rz_start, rz_end = 1.0 / 1.1, 0.03
 
     ry_vals = np.logspace(np.log10(ry_start), np.log10(ry_end), n_steps)
     rz_vals = np.logspace(np.log10(rz_start), np.log10(rz_end), n_steps)
@@ -65,10 +66,10 @@ TEST_CONFIGS = _generate_configs(20)
 
 REGIONS = ["total", "interior", "exterior", "near_surface"]
 REGION_LABELS = {
-    "total":        "Gesamt",
+    "total":        "Full",
     "interior":     "Interior",
     "exterior":     "Exterior",
-    "near_surface": "Oberfläche (±15%)",
+    "near_surface": "Surface (±15%)",
 }
 METRIC_KEYS = ["mae", "rmse", "l_inf"]
 
@@ -265,13 +266,13 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
     n_methods = len(method_names)
     n_configs = len(results)
 
-    bg_color = "#0d1117"
-    text_color = "#d0d0d0"
+    bg_color = "#ffffff"
+    text_color = "#1a1a1a"
 
     with PdfPages(path) as pdf:
         # ── Page 1: MAE heatmap per region ────────────────────────────
         fig, axes = plt.subplots(2, 2, figsize=(16, 12), facecolor=bg_color)
-        fig.suptitle("MAE pro Methode & Konfiguration",
+        fig.suptitle("MAE per Method & Configuration",
                      fontsize=14, color=text_color, y=0.98)
 
         config_labels = [f"{r['label']}\nκ={r['aspect_ratio']:.1f}" for r in results]
@@ -280,7 +281,6 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
             ax = axes.flat[ax_idx]
             ax.set_facecolor(bg_color)
 
-            # Build matrix: (n_configs × n_methods)
             mat = np.zeros((n_configs, n_methods))
             for i, res in enumerate(results):
                 sl = res["slices"]["XY"]
@@ -294,7 +294,6 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
             ax.set_yticklabels(config_labels, fontsize=7, color=text_color)
             ax.set_title(REGION_LABELS[region], fontsize=10, color=text_color)
 
-            # Annotate cells with values + mark winners
             for i in range(n_configs):
                 for j in range(n_methods):
                     val = mat[i, j]
@@ -312,7 +311,7 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
 
         # ── Page 2: Win rate bar chart ────────────────────────────────
         fig, axes = plt.subplots(1, 3, figsize=(16, 6), facecolor=bg_color)
-        fig.suptitle("Gewinnrate pro Methode & Metrik (alle Regionen)",
+        fig.suptitle("Win rate per Method & Metric (all regions)",
                      fontsize=14, color=text_color, y=0.98)
 
         for ax_idx, metric in enumerate(METRIC_KEYS):
@@ -322,7 +321,7 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
 
             x = np.arange(n_methods)
             bar_width = 0.18
-            region_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff"]
+            region_colors = ["#d4a017", "#4962f2", "#2e8b57", "#8b5cf6"]
 
             for r_idx, region in enumerate(REGIONS):
                 counts = []
@@ -337,12 +336,12 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
 
             ax.set_xticks(x)
             ax.set_xticklabels(method_shorts, fontsize=9, color=text_color)
-            ax.set_ylabel("Anzahl Siege", fontsize=9, color=text_color)
+            ax.set_ylabel("Wins", fontsize=9, color=text_color)
             ax.set_title(metric_label, fontsize=11, color=text_color)
-            ax.legend(fontsize=7, facecolor="#1a2030", edgecolor="#333",
+            ax.legend(fontsize=7, facecolor="#f5f5f5", edgecolor="#cccccc",
                       labelcolor=text_color)
             ax.tick_params(colors=text_color, labelsize=7)
-            ax.spines[:].set_color("#333")
+            ax.spines[:].set_color("#cccccc")
 
         fig.tight_layout(rect=[0, 0, 1, 0.93])
         pdf.savefig(fig, facecolor=bg_color)
@@ -350,11 +349,11 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
 
         # ── Page 3: MAE vs aspect ratio ───────────────────────────────
         fig, axes = plt.subplots(1, 2, figsize=(14, 6), facecolor=bg_color)
-        fig.suptitle("MAE vs. Aspektverhältnis κ",
+        fig.suptitle("MAE vs. aspect ratio κ",
                      fontsize=14, color=text_color, y=0.98)
 
-        _base_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff",
-                        "#f26450", "#ff9f43", "#a29bfe", "#00cec9"]
+        _base_colors = ["#d4a017", "#4962f2", "#2e8b57", "#8b5cf6",
+                        "#e63946", "#ff9f43", "#6366f1", "#0891b2"]
         if n_methods <= len(_base_colors):
             method_colors = _base_colors[:n_methods]
         else:
@@ -371,27 +370,26 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
                     maes.append(res["slices"]["XY"]["methods"][name]["metrics"][region]["mae"])
                 ax.scatter(kappas, maes, color=method_colors[m_idx],
                            s=40, alpha=0.8, label=method_shorts[m_idx], zorder=3)
-                # Connect with lines (sorted by kappa)
                 order = np.argsort(kappas)
                 ax.plot(np.array(kappas)[order], np.array(maes)[order],
                         color=method_colors[m_idx], linewidth=0.8, alpha=0.5)
 
-            ax.set_xlabel("Aspektverhältnis κ", fontsize=9, color=text_color)
+            ax.set_xlabel("Aspect ratio κ", fontsize=9, color=text_color)
             ax.set_ylabel("MAE", fontsize=9, color=text_color)
             ax.set_title(REGION_LABELS[region], fontsize=10, color=text_color)
             ax.set_xscale("log")
             ax.set_yscale("log")
-            ax.legend(fontsize=8, facecolor="#1a2030", edgecolor="#333",
+            ax.legend(fontsize=8, facecolor="#f5f5f5", edgecolor="#cccccc",
                       labelcolor=text_color)
             ax.tick_params(colors=text_color, labelsize=7)
-            ax.spines[:].set_color("#333")
-            ax.grid(True, alpha=0.15, color="#555")
+            ax.spines[:].set_color("#cccccc")
+            ax.grid(True, alpha=0.3, color="#dddddd")
 
         fig.tight_layout(rect=[0, 0, 1, 0.93])
         pdf.savefig(fig, facecolor=bg_color)
         plt.close(fig)
 
-    print(f"\nPDF exportiert: {path}")
+    print(f"\nPDF exported: {path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -409,16 +407,16 @@ def show_interactive_plot(results: list[dict], rows: list[dict]):
     method_names = [name for name, _, _ in METHODS]
     method_shorts = [short for _, _, short in METHODS]
     n_methods = len(method_names)
-    _base_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff",
-                    "#f26450", "#ff9f43", "#a29bfe", "#00cec9"]
+    _base_colors = ["#d4a017", "#4962f2", "#2e8b57", "#8b5cf6",
+                    "#e63946", "#ff9f43", "#6366f1", "#0891b2"]
     if n_methods <= len(_base_colors):
         method_colors = _base_colors[:n_methods]
     else:
         cmap = plt.cm.get_cmap("tab10", n_methods)
         method_colors = [cmap(i) for i in range(n_methods)]
 
-    bg_color = "#0d1117"
-    text_color = "#d0d0d0"
+    bg_color = "#ffffff"
+    text_color = "#1a1a1a"
 
     # ── Daten vorbereiten ─────────────────────────────────────────────
     kappas = np.array([r["aspect_ratio"] for r in results])
@@ -440,7 +438,7 @@ def show_interactive_plot(results: list[dict], rows: list[dict]):
                 values[metric][region].append(np.array(vals)[sort_idx])
 
     # ── Figure ────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(12, 7), facecolor=bg_color)
+    fig, ax = plt.subplots(figsize=(14, 8), facecolor=bg_color)
     fig.subplots_adjust(left=0.10, right=0.78, bottom=0.12, top=0.92)
     ax.set_facecolor(bg_color)
 
@@ -452,51 +450,51 @@ def show_interactive_plot(results: list[dict], rows: list[dict]):
     for m_idx, name in enumerate(method_names):
         y = values[init_metric][init_region][m_idx]
         line, = ax.plot(kappas_sorted, y,
-                        color=method_colors[m_idx], linewidth=1.5,
+                        color=method_colors[m_idx], linewidth=2.0,
                         alpha=0.7, zorder=2)
         sc = ax.scatter(kappas_sorted, y,
-                        color=method_colors[m_idx], s=45, alpha=0.9,
+                        color=method_colors[m_idx], s=60, alpha=0.9,
                         label=method_shorts[m_idx], zorder=3,
-                        edgecolors="white", linewidths=0.3)
+                        edgecolors="#333", linewidths=0.3)
         lines.append(line)
         scatters.append(sc)
 
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("Aspektverhältnis κ", fontsize=11, color=text_color)
-    ax.set_ylabel("MAE", fontsize=11, color=text_color)
-    ax.set_title("Fehler vs. Aspektverhältnis κ  —  Gesamt",
-                 fontsize=13, color=text_color)
-    ax.legend(fontsize=9, facecolor="#1a2030", edgecolor="#444",
+    ax.set_xlabel("Aspect ratio κ", fontsize=16, color=text_color)
+    ax.set_ylabel("MAE", fontsize=16, color=text_color)
+    ax.set_title("Error vs. aspect ratio κ  —  Total",
+                 fontsize=18, color=text_color)
+    ax.legend(fontsize=13, facecolor="#f5f5f5", edgecolor="#cccccc",
               labelcolor=text_color, loc="upper left")
-    ax.tick_params(colors=text_color, labelsize=9)
-    ax.spines[:].set_color("#333")
-    ax.grid(True, alpha=0.15, color="#555")
+    ax.tick_params(colors=text_color, labelsize=13)
+    ax.spines[:].set_color("#cccccc")
+    ax.grid(True, alpha=0.3, color="#dddddd")
 
     # ── RadioButtons: Metrik ──────────────────────────────────────────
     metric_labels = ["MAE", "RMSE", "L∞"]
     metric_keys = ["mae", "rmse", "l_inf"]
 
-    ax_radio_metric = fig.add_axes([0.82, 0.60, 0.15, 0.18], facecolor="#1a2030")
-    ax_radio_metric.set_title("Fehlermetrik", fontsize=9, color=text_color,
+    ax_radio_metric = fig.add_axes([0.82, 0.60, 0.15, 0.18], facecolor="#f5f5f5")
+    ax_radio_metric.set_title("Error metric", fontsize=13, color=text_color,
                               pad=8)
     radio_metric = RadioButtons(ax_radio_metric, metric_labels,
                                 activecolor="#4962f2")
     for label in radio_metric.labels:
         label.set_color(text_color)
-        label.set_fontsize(10)
+        label.set_fontsize(13)
 
     # ── RadioButtons: Region ──────────────────────────────────────────
     region_labels_list = [REGION_LABELS[r] for r in REGIONS]
     region_keys = list(REGIONS)
 
-    ax_radio_region = fig.add_axes([0.82, 0.25, 0.15, 0.28], facecolor="#1a2030")
-    ax_radio_region.set_title("Region", fontsize=9, color=text_color, pad=8)
+    ax_radio_region = fig.add_axes([0.82, 0.25, 0.15, 0.28], facecolor="#f5f5f5")
+    ax_radio_region.set_title("Region", fontsize=13, color=text_color, pad=8)
     radio_region = RadioButtons(ax_radio_region, region_labels_list,
                                 activecolor="#50c878")
     for label in radio_region.labels:
         label.set_color(text_color)
-        label.set_fontsize(10)
+        label.set_fontsize(13)
 
     # ── State ─────────────────────────────────────────────────────────
     state = dict(metric=init_metric, region=init_region)
@@ -514,17 +512,16 @@ def show_interactive_plot(results: list[dict], rows: list[dict]):
             scatters[m_idx].set_offsets(np.column_stack([kappas_sorted, y]))
             all_y.append(y)
 
-        # Achsenlimits anpassen
         all_vals = np.concatenate(all_y)
-        all_vals = all_vals[all_vals > 0]  # log-safe
+        all_vals = all_vals[all_vals > 0]
         if len(all_vals) > 0:
             y_min = all_vals.min() * 0.5
             y_max = all_vals.max() * 2.0
             ax.set_ylim(y_min, y_max)
 
-        ax.set_ylabel(y_label, fontsize=11, color=text_color)
-        ax.set_title(f"Fehler vs. Aspektverhältnis κ  —  {r_label}",
-                     fontsize=13, color=text_color)
+        ax.set_ylabel(y_label, fontsize=16, color=text_color)
+        ax.set_title(f"Error vs. aspect ratio κ  —  {r_label}",
+                     fontsize=18, color=text_color)
         fig.canvas.draw_idle()
 
     def _on_metric(label):
