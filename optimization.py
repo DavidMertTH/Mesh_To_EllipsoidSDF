@@ -8,6 +8,9 @@ from ellipsoid import Ellipsoid
 from ellipsoid import EllipsoidSet
 from sdf_methods import sdf_ellipsoid_wp, METHOD_QUILEZ
 
+# During Warp initialization, the default device is set to "cuda:0" if CUDA is available.
+# Otherwise, the default device is "cpu".
+device = wp.get_device()
 
 @wp.kernel
 def _ellipsoid_union_sdf_kernel(
@@ -67,12 +70,51 @@ def _mae_loss_kernel(
     diff = wp.abs(sdf_pred[tid] - sdf_target[tid])
     wp.atomic_add(loss, 0, diff / float(n))
 
+@wp.kernel
+def _clamp_loss_kernel(
+    sdf_pred: wp.array(dtype=wp.float32),
+    sdf_target: wp.array(dtype=wp.float32),
+    loss: wp.array(dtype=wp.float32),
+    n: int,
+):
+    tid = wp.tid()
+    delta = 0.1
+    diff = wp.abs(wp.clamp(sdf_pred[tid], -delta, delta) - wp.clamp(sdf_target[tid], -delta, delta))
+    wp.atomic_add(loss, 0, diff / float(n))
 
-device = "cuda"
+@wp.func
+def soft_clamp(
+    x: float,
+    delta: float
+):
+    return delta * wp.tanh(x / delta)
+
+@wp.kernel
+def _soft_clamp_loss_kernel(
+    sdf_pred: wp.array(dtype=wp.float32),
+    sdf_target: wp.array(dtype=wp.float32),
+    loss: wp.array(dtype=wp.float32),
+    n: int,
+):
+    tid = wp.tid()
+    delta = 0.1
+    diff = wp.abs(soft_clamp(sdf_pred[tid], delta) - soft_clamp(sdf_target[tid], delta))
+    wp.atomic_add(loss, 0, diff / float(n))
+
+# @wp.kernel()
+# def _eikonal_loss_kernel(
+#     sdf_pred: wp.array(dtype=wp.float32),
+#     loss: wp.array(dtype=wp.float32),
+#     n: int
+# ):
+#     tid = wp.tid()
+#     ix = tid % nx
+#     iy = (tid // nx) % ny
+#     iz = tid // (nx * ny)
 
 
 class OptimizationWorker(QtCore.QThread):
-    """Runs ellipsoid optimisation in a background thread.
+    """Runs ellipsoid optimization in a background thread.
 
     All GPU → CPU readbacks happen *inside* this thread so the main
     (UI) thread never blocks on a device sync.
