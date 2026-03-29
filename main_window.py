@@ -28,7 +28,7 @@ from sdf_compute import SdfComputer, SdfResult
 from ellipsoid import EllipsoidSet
 from viewer3d import MeshViewer3D, EllipsoidViewer3D
 from widgets import SdfSlicePanel
-from optimization import OptimizationWorker
+from optimization import OptimizationWorker, LOSS_INFO
 from run_tracker import RunTrackerPanel
 from sdf_methods import SDF_METHODS, get_method_by_name, get_default_method
 
@@ -136,6 +136,51 @@ class MainWindow(QtWidgets.QMainWindow):
         self._combo_sdf_method.setToolTip("SDF approximation used for ellipsoid display & optimisation")
         self._combo_sdf_method.setCurrentIndex(0)
         selector_bar.addWidget(self._combo_sdf_method)
+
+        # ── Loss selection ─────────────────────────────────────────────────
+        selector_bar.addSpacing(16)
+        selector_bar.addWidget(QtWidgets.QLabel("Loss:"))
+
+        self._combo_loss = QtWidgets.QComboBox()
+        for lid, name, desc in LOSS_INFO:
+            self._combo_loss.addItem(f"{name}  ({desc})", lid)
+        self._combo_loss.setToolTip("Primary loss function for optimisation")
+        self._combo_loss.setCurrentIndex(0)
+        selector_bar.addWidget(self._combo_loss)
+
+        # ── Eikonal regularisation controls ────────────────────────────────
+        selector_bar.addSpacing(16)
+
+        self._chk_eikonal = QtWidgets.QCheckBox("Eikonal")
+        self._chk_eikonal.setToolTip("Add eikonal regularisation (penalises |grad SDF| != 1)")
+        self._chk_eikonal.setChecked(False)
+        selector_bar.addWidget(self._chk_eikonal)
+
+        self._lbl_eik_weight = QtWidgets.QLabel("Weight:")
+        selector_bar.addWidget(self._lbl_eik_weight)
+
+        self._slider_eikonal = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._slider_eikonal.setRange(0, 100)
+        self._slider_eikonal.setValue(10)
+        self._slider_eikonal.setFixedWidth(100)
+        self._slider_eikonal.setToolTip("Eikonal loss weight (0.0 – 1.0)")
+        selector_bar.addWidget(self._slider_eikonal)
+
+        self._lbl_eik_val = QtWidgets.QLabel("0.10")
+        self._lbl_eik_val.setFixedWidth(32)
+        selector_bar.addWidget(self._lbl_eik_val)
+
+        self._slider_eikonal.valueChanged.connect(
+            lambda v: self._lbl_eik_val.setText(f"{v / 100:.2f}")
+        )
+
+        # Grey out weight controls when eikonal is disabled
+        self._chk_eikonal.toggled.connect(self._slider_eikonal.setEnabled)
+        self._chk_eikonal.toggled.connect(self._lbl_eik_weight.setEnabled)
+        self._chk_eikonal.toggled.connect(self._lbl_eik_val.setEnabled)
+        self._slider_eikonal.setEnabled(False)
+        self._lbl_eik_weight.setEnabled(False)
+        self._lbl_eik_val.setEnabled(False)
 
         self._btn_fit = QtWidgets.QPushButton("▶ Fit Ellipsoids")
         self._btn_fit.setToolTip("Start fitting ellipsoids to the loaded mesh SDF")
@@ -336,6 +381,9 @@ class MainWindow(QtWidgets.QMainWindow):
             num_steps=7000,
             report_every=20,
             sdf_method_id=self._selected_sdf_method.warp_id,
+            loss_id=self._combo_loss.currentData(),
+            eikonal_enabled=self._chk_eikonal.isChecked(),
+            eikonal_weight=self._slider_eikonal.value() / 100.0,
         )
 
     def _on_stop_clicked(self):
@@ -349,6 +397,9 @@ class MainWindow(QtWidgets.QMainWindow):
         num_steps: int = 2000,
         report_every: int = 20,
         sdf_method_id: int | None = None,
+        loss_id: int = 0,
+        eikonal_enabled: bool = False,
+        eikonal_weight: float = 0.1,
     ) -> None:
         if self._last_mesh_result is None:
             self._status.showMessage("No mesh SDF available. Load a mesh and compute SDF first.")
@@ -369,6 +420,9 @@ class MainWindow(QtWidgets.QMainWindow):
             num_steps=num_steps,
             report_every=report_every,
             sdf_method_id=sdf_method_id,
+            loss_id=loss_id,
+            eikonal_enabled=eikonal_enabled,
+            eikonal_weight=eikonal_weight,
             parent=self,
         )
         self._opt_worker.step_visual.connect(self._on_opt_step_visual)
@@ -388,8 +442,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         from sdf_methods import get_method_by_warp_id
         sdf_name = get_method_by_warp_id(sdf_method_id).name
+        loss_name = next((name for lid, name, _ in LOSS_INFO if lid == loss_id), "MAE")
+        eik_str = f" + Eikonal w={eikonal_weight:.2f}" if eikonal_enabled else ""
         self._status.showMessage(
-            f"Optimization started (adam, {num_ellipsoids} ellipsoids, SDF: {sdf_name}) …"
+            f"Optimization started (adam, {num_ellipsoids} ellipsoids, "
+            f"SDF: {sdf_name}, Loss: {loss_name}{eik_str}) …"
         )
 
     def stop_optimization(self) -> None:

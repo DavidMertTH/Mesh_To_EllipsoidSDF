@@ -4,9 +4,19 @@ import numpy as np
 
 from PySide6 import QtCore
 
-from ellipsoid import Ellipsoid
 from ellipsoid import EllipsoidSet
 from sdf_methods import sdf_ellipsoid_wp, METHOD_QUILEZ
+
+# ── Loss IDs ──────────────────────────────────────────────────────────────────
+LOSS_MAE = 0
+LOSS_CLAMP = 1
+LOSS_SOFT_CLAMP = 2
+
+LOSS_INFO = [
+    (LOSS_MAE,        "MAE",               "Mean absolute error"),
+    (LOSS_CLAMP,      "Clamp (±0.1)",      "Clamped absolute error"),
+    (LOSS_SOFT_CLAMP, "Soft Clamp (tanh)",  "Soft-clamped absolute error"),
+]
 
 # During Warp initialization, the default device is set to "cuda:0" if CUDA is available.
 # Otherwise, the default device is "cpu".
@@ -14,23 +24,21 @@ device = wp.get_device()
 
 @wp.kernel
 def _ellipsoid_union_sdf_kernel(
-    centers: wp.array(dtype=wp.vec3),
-    log_radii: wp.array(dtype=wp.vec3),
-    rot_flat: wp.array(dtype=wp.float32),
-    min_d: wp.array2d(dtype=wp.float32),
+    centers:        wp.array(dtype=wp.vec3),
+    log_radii:      wp.array(dtype=wp.vec3),
+    rot_flat:       wp.array(dtype=wp.float32),
+    min_d:          wp.array2d(dtype=wp.float32),
     num_ellipsoids: int,
-    origin: wp.vec3,
-    dx: float,
-    nx: int,
-    ny: int,
-    nz: int,
-    method_id: int,
-    out_sdf: wp.array(dtype=wp.float32),
+    origin:         wp.vec3,
+    dx:             float,
+    n:              int,
+    method_id:      int,
+    out_sdf:        wp.array(dtype=wp.float32),
 ):
     tid = wp.tid()
-    ix = tid % nx
-    iy = (tid // nx) % ny
-    iz = tid // (nx * ny)
+    ix = tid % n
+    iy = (tid // n) % n
+    iz = tid // (n * n)
 
     p = origin + wp.vec3(
         (float(ix) + 0.5) * dx,
@@ -61,10 +69,10 @@ def _ellipsoid_union_sdf_kernel(
 
 @wp.kernel
 def _mae_loss_kernel(
-    sdf_pred: wp.array(dtype=wp.float32),
+    sdf_pred:   wp.array(dtype=wp.float32),
     sdf_target: wp.array(dtype=wp.float32),
-    loss: wp.array(dtype=wp.float32),
-    n: int,
+    loss:       wp.array(dtype=wp.float32),
+    n:          int,
 ):
     tid = wp.tid()
     diff = wp.abs(sdf_pred[tid] - sdf_target[tid])
@@ -72,10 +80,10 @@ def _mae_loss_kernel(
 
 @wp.kernel
 def _clamp_loss_kernel(
-    sdf_pred: wp.array(dtype=wp.float32),
+    sdf_pred:   wp.array(dtype=wp.float32),
     sdf_target: wp.array(dtype=wp.float32),
-    loss: wp.array(dtype=wp.float32),
-    n: int,
+    loss:       wp.array(dtype=wp.float32),
+    n:          int,
 ):
     tid = wp.tid()
     delta = 0.1
@@ -91,26 +99,48 @@ def soft_clamp(
 
 @wp.kernel
 def _soft_clamp_loss_kernel(
-    sdf_pred: wp.array(dtype=wp.float32),
+    sdf_pred:   wp.array(dtype=wp.float32),
     sdf_target: wp.array(dtype=wp.float32),
-    loss: wp.array(dtype=wp.float32),
-    n: int,
+    loss:       wp.array(dtype=wp.float32),
+    n:          int,
 ):
     tid = wp.tid()
     delta = 0.1
     diff = wp.abs(soft_clamp(sdf_pred[tid], delta) - soft_clamp(sdf_target[tid], delta))
     wp.atomic_add(loss, 0, diff / float(n))
 
-# @wp.kernel()
-# def _eikonal_loss_kernel(
-#     sdf_pred: wp.array(dtype=wp.float32),
-#     loss: wp.array(dtype=wp.float32),
-#     n: int
-# ):
-#     tid = wp.tid()
-#     ix = tid % nx
-#     iy = (tid // nx) % ny
-#     iz = tid // (nx * ny)
+@wp.kernel
+def _eikonal_loss_kernel(
+    sdf_pred: wp.array(dtype=wp.float32),
+    loss:     wp.array(dtype=wp.float32),
+    n:        int,
+    dx:       float,
+    weight:   float,
+):
+    tid = wp.tid()
+    ix = tid % n
+    iy = (tid // n) % n
+    iz = tid // (n * n)
+
+    # Skip boundary voxels — central differences need neighbours
+    if ix == 0 or ix == n - 1:
+        return
+    if iy == 0 or iy == n - 1:
+        return
+    if iz == 0 or iz == n - 1:
+        return
+
+    inv_2dx = 1.0 / (2.0 * dx)
+
+    gx = (sdf_pred[tid + 1]     - sdf_pred[tid - 1])     * inv_2dx
+    gy = (sdf_pred[tid + n]     - sdf_pred[tid - n])     * inv_2dx
+    gz = (sdf_pred[tid + n * n] - sdf_pred[tid - n * n]) * inv_2dx
+
+    grad_mag = wp.sqrt(gx * gx + gy * gy + gz * gz)
+    eik = (grad_mag - 1.0) * (grad_mag - 1.0)
+
+    interior = float((n - 2) * (n - 2) * (n - 2))
+    wp.atomic_add(loss, 0, weight * eik / interior)
 
 
 class OptimizationWorker(QtCore.QThread):
@@ -146,6 +176,9 @@ class OptimizationWorker(QtCore.QThread):
         num_steps: int = 2000,
         report_every: int = 20,
         sdf_method_id: int = METHOD_QUILEZ,
+        loss_id: int = LOSS_MAE,
+        eikonal_enabled: bool = False,
+        eikonal_weight: float = 0.1,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
@@ -157,6 +190,9 @@ class OptimizationWorker(QtCore.QThread):
         self._num_steps = num_steps
         self._report_every = report_every
         self._sdf_method_id = sdf_method_id
+        self._loss_id = loss_id
+        self._eikonal_enabled = eikonal_enabled
+        self._eikonal_weight = eikonal_weight
         self._stop_flag = False
 
     def request_stop(self):
@@ -236,17 +272,44 @@ class OptimizationWorker(QtCore.QThread):
                     _ellipsoid_union_sdf_kernel,
                     dim=total,
                     inputs=[pred_centers, pred_log_radii, pred_rot_flat, min_d_cache,
-                            num_e, wp_origin, float(dx), n, n, n,
+                            num_e, wp_origin, float(dx), n,
                             self._sdf_method_id, sdf_pred],
                     device=device,
                 )
                 loss.zero_()
-                wp.launch(
-                    _mae_loss_kernel,
-                    dim=total,
-                    inputs=[sdf_pred, sdf_target, loss, total],
-                    device=device,
-                )
+
+                # Primary loss
+                if self._loss_id == LOSS_CLAMP:
+                    wp.launch(
+                        _clamp_loss_kernel,
+                        dim=total,
+                        inputs=[sdf_pred, sdf_target, loss, total],
+                        device=device,
+                    )
+                elif self._loss_id == LOSS_SOFT_CLAMP:
+                    wp.launch(
+                        _soft_clamp_loss_kernel,
+                        dim=total,
+                        inputs=[sdf_pred, sdf_target, loss, total],
+                        device=device,
+                    )
+                else:
+                    wp.launch(
+                        _mae_loss_kernel,
+                        dim=total,
+                        inputs=[sdf_pred, sdf_target, loss, total],
+                        device=device,
+                    )
+
+                # Eikonal regularisation (weighted additive term)
+                if self._eikonal_enabled:
+                    wp.launch(
+                        _eikonal_loss_kernel,
+                        dim=total,
+                        inputs=[sdf_pred, loss, n, float(dx),
+                                self._eikonal_weight],
+                        device=device,
+                    )
 
             tape.backward(loss)
             optimizer.step(grads)
