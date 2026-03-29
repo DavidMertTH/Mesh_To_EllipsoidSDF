@@ -333,7 +333,6 @@ class MainWindow(QtWidgets.QMainWindow):
         num_e = self._spin_num_ellipsoids.value()
         self.start_optimization(
             num_ellipsoids=num_e,
-            method="adam",
             num_steps=7000,
             report_every=20,
             sdf_method_id=self._selected_sdf_method.warp_id,
@@ -347,7 +346,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def start_optimization(
         self,
         num_ellipsoids: int = 10,
-        method: str = "adam",
         num_steps: int = 2000,
         report_every: int = 20,
         sdf_method_id: int | None = None,
@@ -368,7 +366,6 @@ class MainWindow(QtWidgets.QMainWindow):
             dx=r.dx,
             n=r.n,
             num_ellipsoids=num_ellipsoids,
-            method=method,
             num_steps=num_steps,
             report_every=report_every,
             sdf_method_id=sdf_method_id,
@@ -381,7 +378,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._run_tracker.begin_run(
             mesh_name=self._current_mesh_name,
-            method=method,
+            method="adam",
             num_ellipsoids=num_ellipsoids,
             grid_n=r.n,
         )
@@ -392,7 +389,7 @@ class MainWindow(QtWidgets.QMainWindow):
         from sdf_methods import get_method_by_warp_id
         sdf_name = get_method_by_warp_id(sdf_method_id).name
         self._status.showMessage(
-            f"Optimization started ({method}, {num_ellipsoids} ellipsoids, SDF: {sdf_name}) …"
+            f"Optimization started (adam, {num_ellipsoids} ellipsoids, SDF: {sdf_name}) …"
         )
 
     def stop_optimization(self) -> None:
