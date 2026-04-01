@@ -230,13 +230,17 @@ class OptimizationWorker(QtCore.QThread):
         total = n * n * n
         num_e = self._num_ellipsoids
 
+        # Set up a local random generator with the seed
+        rng = np.random.default_rng(42)
+
         sdf_target = wp.array(
             self._sdf_target_np.flatten(),
             dtype=wp.float32, device=device, requires_grad=False,
         )
 
         pred_centers = wp.array(
-            (np.random.rand(num_e, 3).astype(np.float32) - 0.5) * 2.0 * 0.5,
+            #(np.random.rand(num_e, 3).astype(np.float32) - 0.5) * 2.0 * 0.5,
+            (rng.random((num_e, 3)).astype(np.float32) - 0.5) * 2.0 * 0.5,
             dtype=wp.vec3, device=device, requires_grad=True,
         )
         pred_log_radii = wp.array(
