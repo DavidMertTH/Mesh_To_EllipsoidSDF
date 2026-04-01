@@ -104,12 +104,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._slider_margin = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self._slider_margin.setRange(0, 100)
-        self._slider_margin.setValue(50)
+        self._slider_margin.setValue(20)
         self._slider_margin.setFixedWidth(120)
         self._slider_margin.setToolTip("Fractional margin around the mesh bounding box (0.0–1.0)")
         selector_bar.addWidget(self._slider_margin)
 
-        self._lbl_margin = QtWidgets.QLabel("0.50")
+        self._lbl_margin = QtWidgets.QLabel("0.20")
         self._lbl_margin.setFixedWidth(32)
         selector_bar.addWidget(self._lbl_margin)
 
@@ -123,7 +123,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._spin_num_ellipsoids = QtWidgets.QSpinBox()
         self._spin_num_ellipsoids.setRange(1, 200)
-        self._spin_num_ellipsoids.setValue(10)
+        self._spin_num_ellipsoids.setValue(50)
         self._spin_num_ellipsoids.setToolTip("Number of ellipsoids to fit")
         selector_bar.addWidget(self._spin_num_ellipsoids)
 
@@ -145,7 +145,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for lid, name, desc in LOSS_INFO:
             self._combo_loss.addItem(f"{name}  ({desc})", lid)
         self._combo_loss.setToolTip("Primary loss function for optimisation")
-        self._combo_loss.setCurrentIndex(0)
+        self._combo_loss.setCurrentIndex(2)
         selector_bar.addWidget(self._combo_loss)
 
         # ── Eikonal regularisation controls ────────────────────────────────
@@ -260,6 +260,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if idx >= 1:
             self._mesh_combo.setCurrentIndex(idx)
         self._mesh_combo.blockSignals(False)
+
+        # Auto-select bunny mesh if available
+        bunny_idx = self._mesh_combo.findText("bunny.obj")
+        if bunny_idx >= 1:
+            self._mesh_combo.setCurrentIndex(bunny_idx)
+            path = self._mesh_combo.itemData(bunny_idx)
+            if path:
+                QtCore.QTimer.singleShot(0, lambda: self._load_mesh(path))
 
         count = self._mesh_combo.count() - 1
         self._status.showMessage(

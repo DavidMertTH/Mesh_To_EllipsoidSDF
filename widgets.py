@@ -105,7 +105,7 @@ class SdfSlicePanel(QtWidgets.QWidget):
 
         self.spin_n = QtWidgets.QSpinBox()
         self.spin_n.setRange(16, 512)
-        self.spin_n.setValue(128)
+        self.spin_n.setValue(64)
         self.spin_n.setSingleStep(16)
 
         self.btn_compute = QtWidgets.QPushButton("Compute (G)")
