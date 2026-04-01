@@ -1,13 +1,34 @@
 # Mesh_To_EllipsoidSDF
 
-Installation: 
+## Installation
 
-Umgebung aufsetzen: conda env create -f environment.yml
+Create the conda environment:
+```bash
+conda env create -f environment.yml
+```
 
-Umgebung aktivieren: conda activate ellipsoid-fit
+Activate the environment:
+```bash
+conda activate ellipsoid-fit
+```
 
-Fitting Tool: python main.py
+## Usage
 
-SDF Copare: python benchmark_sdf.py
+Interactive fitting tool:
+```bash
+python main.py
+```
 
-SDF (unterschiedliche k) Benchmark: python systematic_benchmark.py --plot
+SDF method comparison:
+```bash
+python benchmark_sdf.py
+```
+
+Systematic SDF benchmark across varying aspect ratios:
+```bash
+python systematic_benchmark.py --plot
+```
+
+## Project Structure
+The core optimization logic is implemented with the NVIDIA Warp framework and located in `optimization.py`.
+The implementation of different ellipsoid SDF approcimations can be found in `sdf_methods.py`.
