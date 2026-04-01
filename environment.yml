@@ -1,0 +1,25 @@
+name: ellipsoid-fit
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - matplotlib
+  - pip:
+      # GPU / Differentiable Programming
+      - warp-lang              # NVIDIA Warp (GPU kernels + autodiff)
+
+      # Qt UI
+      - PySide6                # Qt6 Python bindings
+
+      # PyQtGraph (OpenGL 3D Viewer + Plots)
+      - pyqtgraph
+      - PyOpenGL
+      - PyOpenGL-accelerate
+
+      # 3D Mesh I/O
+      - trimesh
