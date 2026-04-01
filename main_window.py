@@ -16,6 +16,7 @@ Right:      live loss plot, run selection, naming & persistence.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -145,6 +146,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_stop.setEnabled(False)
         selector_bar.addWidget(self._btn_stop)
 
+        self._btn_export = QtWidgets.QPushButton("💾 Export JSON")
+        self._btn_export.setToolTip("Export ellipsoid positions and scales to a JSON file")
+        self._btn_export.setEnabled(False)
+        selector_bar.addWidget(self._btn_export)
+
         root_layout.addLayout(selector_bar)
 
         # ── 2×2 splitter grid + evaluation panel ─────────────────────────
@@ -192,6 +198,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_open_dir.clicked.connect(self._open_mesh_dir)
         self._btn_fit.clicked.connect(self._on_fit_clicked)
         self._btn_stop.clicked.connect(self._on_stop_clicked)
+        self._btn_export.clicked.connect(self._on_export_json)
 
     # ── mesh directory scanning ───────────────────────────────────────────
 
@@ -298,6 +305,7 @@ class MainWindow(QtWidgets.QMainWindow):
             n: int = None,
     ) -> None:
         self._ellipsoids = ellipsoid_set
+        self._btn_export.setEnabled(ellipsoid_set is not None and ellipsoid_set.count > 0)
         sdf_mode = self._current_sdf_mode
 
         self._ell_viewer.show_ellipsoids(self._ellipsoids)
@@ -315,6 +323,47 @@ class MainWindow(QtWidgets.QMainWindow):
                 sdf_mode=sdf_mode,
             )
             self._ell_sdf_panel.set_sdf(ell_grid)
+
+    # ── export ─────────────────────────────────────────────────────────
+
+    def _on_export_json(self):
+        if self._ellipsoids is None or self._ellipsoids.count == 0:
+            self._status.showMessage("No ellipsoids to export.")
+            return
+
+        default_name = "ellipsoids.json"
+        if self._current_mesh_name:
+            stem = Path(self._current_mesh_name).stem
+            default_name = f"{stem}_ellipsoids.json"
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Ellipsoid-Daten exportieren",
+            str(Path.home() / default_name),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+
+        es = self._ellipsoids
+        data = {
+            "mesh": self._current_mesh_name or None,
+            "num_ellipsoids": int(es.count),
+            "ellipsoids": [],
+        }
+        for i in range(es.count):
+            data["ellipsoids"].append({
+                "center": es.centers[i].tolist(),
+                "radii": es.radii[i].tolist(),
+                "rotation_xyzw": es.rotations[i].tolist(),
+            })
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            self._status.showMessage(f"Exported {es.count} ellipsoids → {path}")
+        except Exception as e:
+            self._status.showMessage(f"Export failed: {e}")
 
     # ── fit / stop ────────────────────────────────────────────────────────
 
@@ -403,6 +452,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         print(f"Step {step}: loss = {loss:.6f}")
         self._ell_viewer.show_ellipsoids_fast(centers, radii, rotations)
+        self._btn_export.setEnabled(True)
         self._status.showMessage(f"Optimizing … step {step}  loss={loss:.6f}")
 
         # Feed loss to the run tracker

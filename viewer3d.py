@@ -117,16 +117,15 @@ def build_concatenated_mesh(
 class _BaseViewer:
     """Common setup: GL widget with grid and axis."""
 
-    BG_COLOR = (2, 11, 13, 255)
-
+    BG_COLOR = (0, 0, 0, 255)
     def __init__(self):
         self._view = DropGLView()
         self._view.setBackgroundColor(self.BG_COLOR)
         self._view.setCameraPosition(distance=3.0, elevation=15, azimuth=45)
 
-        grid = gl.GLGridItem()
-        grid.scale(1, 1, 1)
-        self._view.addItem(grid)
+        # grid = gl.GLGridItem()
+        # grid.scale(1, 1, 1)
+        # self._view.addItem(grid)
 
         axis = gl.GLAxisItem()
         axis.setSize(1, 1, 1)
