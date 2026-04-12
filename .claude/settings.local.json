@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import sys; sys.path.insert\\(0,'.'\\); from viewer3d import MeshViewer3D; print\\('OK'\\)\")",
+      "Bash(python -c \"import trimesh\")",
+      "Bash(where python:*)",
+      "Bash(\"C:\\\\Users\\\\Gregor Rehl\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python314\\\\python.exe\" -c \"from viewer3d import MeshViewer3D; print\\('OK'\\)\")",
+      "Bash(\"C:\\\\Users\\\\Gregor Rehl\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python314\\\\python.exe\" -c \"import trimesh; from viewer3d import MeshViewer3D; print\\('OK'\\)\")",
+      "Bash(pip list:*)",
+      "Bash(pip3.14 list:*)",
+      "Bash(py -3.14 -c \"import trimesh; print\\('ok'\\)\")",
+      "Bash(py -0)",
+      "Bash(py -3.14 -m pip list)",
+      "Bash(.venv/Scripts/python.exe -c \"from rig_loader import load_rigged_mesh; from viewer3d import MeshViewer3D; print\\('OK'\\)\")",
+      "WebSearch",
+      "Bash(.venv/Scripts/python.exe -c ':*)"
+    ]
+  }
+}

@@ -139,17 +139,22 @@ class _BaseViewer:
 # ── Mesh viewer ───────────────────────────────────────────────────────────────
 
 class MeshViewer3D(_BaseViewer):
-    """Shows a single triangle mesh."""
+    """Shows a single triangle mesh with optional skeleton overlay."""
 
-    MESH_FACE_COLOR = (73 / 256, 98 / 256, 242 / 256, 1.0)
-    MESH_EDGE_COLOR = (242 / 256, 230 / 256, 65 / 256, 1.0)
+    MESH_FACE_COLOR = (73 / 256, 98 / 256, 242 / 256, 0.0)
+    MESH_EDGE_COLOR = (242 / 256, 230 / 256, 65 / 256, 0.3)
+    BONE_COLOR = (1.0, 0.2, 0.2, 1.0)
+    JOINT_COLOR = (1.0, 1.0, 0.0, 1.0)
 
     def __init__(self):
         super().__init__()
         self._mesh_item: Optional[gl.GLMeshItem] = None
+        self._bone_items: List[gl.GLLinePlotItem] = []
+        self._joint_item: Optional[gl.GLScatterPlotItem] = None
 
     def show_mesh(self, verts: np.ndarray, faces: np.ndarray) -> None:
         self.clear_mesh()
+        from OpenGL import GL as _GL
         self._mesh_item = gl.GLMeshItem(
             vertexes=verts,
             faces=faces,
@@ -159,7 +164,60 @@ class MeshViewer3D(_BaseViewer):
             drawFaces=True,
             edgeColor=self.MESH_EDGE_COLOR,
         )
+        self._mesh_item.setGLOptions({
+            _GL.GL_DEPTH_TEST: True,
+            _GL.GL_BLEND: True,
+            'glBlendFuncSeparate': (
+                _GL.GL_SRC_ALPHA, _GL.GL_ONE_MINUS_SRC_ALPHA,
+                _GL.GL_ONE, _GL.GL_ONE_MINUS_SRC_ALPHA,
+            ),
+        })
         self._view.addItem(self._mesh_item)
+
+    def show_bones(self, positions: np.ndarray, parent_indices: np.ndarray) -> None:
+        """Draw skeleton bones as lines + joints as dots.
+
+        Parameters
+        ----------
+        positions : (B, 3) float32 — world-space joint positions
+        parent_indices : (B,) int — parent index per bone (-1 for roots)
+        """
+        self.clear_bones()
+
+        # Lines: one segment per bone that has a parent
+        line_pts = []
+        for i, pi in enumerate(parent_indices):
+            if pi >= 0:
+                line_pts.append(positions[pi])
+                line_pts.append(positions[i])
+
+        if line_pts:
+            pts = np.array(line_pts, dtype=np.float32)
+            line_item = gl.GLLinePlotItem(
+                pos=pts,
+                color=self.BONE_COLOR,
+                width=3.0,
+                mode='lines',
+            )
+            self._view.addItem(line_item)
+            self._bone_items.append(line_item)
+
+        # Joint dots
+        self._joint_item = gl.GLScatterPlotItem(
+            pos=positions,
+            color=self.JOINT_COLOR,
+            size=8.0,
+            pxMode=True,
+        )
+        self._view.addItem(self._joint_item)
+
+    def clear_bones(self) -> None:
+        for item in self._bone_items:
+            self._view.removeItem(item)
+        self._bone_items.clear()
+        if self._joint_item is not None:
+            self._view.removeItem(self._joint_item)
+            self._joint_item = None
 
     def clear_mesh(self) -> None:
         if self._mesh_item is not None:
