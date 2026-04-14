@@ -73,81 +73,121 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_layout(self):
         central = QtWidgets.QWidget()
-        root_layout = QtWidgets.QVBoxLayout(central)
+        root_layout = QtWidgets.QHBoxLayout(central)
         root_layout.setContentsMargins(4, 4, 4, 4)
         root_layout.setSpacing(4)
 
-        # ── Mesh selector bar ─────────────────────────────────────────────
-        selector_bar = QtWidgets.QHBoxLayout()
-        selector_bar.setSpacing(6)
+        # ══════════════════════════════════════════════════════════════
+        # LEFT: Settings panel (vertical column)
+        # ══════════════════════════════════════════════════════════════
+        settings_panel = QtWidgets.QWidget()
+        settings_panel.setFixedWidth(220)
+        settings_layout = QtWidgets.QVBoxLayout(settings_panel)
+        settings_layout.setContentsMargins(4, 4, 4, 4)
+        settings_layout.setSpacing(6)
 
-        selector_bar.addWidget(QtWidgets.QLabel("Mesh:"))
+        # ── Mesh selection ────────────────────────────────────────────
+        grp_mesh = QtWidgets.QGroupBox("Mesh")
+        mesh_lay = QtWidgets.QVBoxLayout(grp_mesh)
+        mesh_lay.setSpacing(4)
 
         self._mesh_combo = QtWidgets.QComboBox()
         self._mesh_combo.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed,
         )
-        selector_bar.addWidget(self._mesh_combo)
+        mesh_lay.addWidget(self._mesh_combo)
 
-        self._btn_refresh = QtWidgets.QPushButton("↻")
-        self._btn_refresh.setFixedWidth(32)
+        btn_row = QtWidgets.QHBoxLayout()
+        self._btn_refresh = QtWidgets.QPushButton("Rescan")
         self._btn_refresh.setToolTip("Rescan meshes/ folder")
-        selector_bar.addWidget(self._btn_refresh)
+        btn_row.addWidget(self._btn_refresh)
 
-        self._btn_open_dir = QtWidgets.QPushButton("📂 Open folder")
+        self._btn_open_dir = QtWidgets.QPushButton("Open folder")
         self._btn_open_dir.setToolTip(f"Open {self._mesh_dir}")
-        selector_bar.addWidget(self._btn_open_dir)
+        btn_row.addWidget(self._btn_open_dir)
+        mesh_lay.addLayout(btn_row)
 
-        # ── SDF margin slider ──────────────────────────────────────────────
-        selector_bar.addSpacing(16)
-        selector_bar.addWidget(QtWidgets.QLabel("SDF Margin:"))
+        settings_layout.addWidget(grp_mesh)
+
+        # ── SDF settings ─────────────────────────────────────────────
+        grp_sdf = QtWidgets.QGroupBox("SDF")
+        sdf_lay = QtWidgets.QFormLayout(grp_sdf)
+        sdf_lay.setSpacing(4)
 
         self._slider_margin = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self._slider_margin.setRange(0, 100)
         self._slider_margin.setValue(50)
-        self._slider_margin.setFixedWidth(120)
         self._slider_margin.setToolTip("Fractional margin around the mesh bounding box (0.0–1.0)")
-        selector_bar.addWidget(self._slider_margin)
-
         self._lbl_margin = QtWidgets.QLabel("0.50")
         self._lbl_margin.setFixedWidth(32)
-        selector_bar.addWidget(self._lbl_margin)
-
         self._slider_margin.valueChanged.connect(
             lambda v: self._lbl_margin.setText(f"{v / 100:.2f}")
         )
+        margin_row = QtWidgets.QHBoxLayout()
+        margin_row.addWidget(self._slider_margin, 1)
+        margin_row.addWidget(self._lbl_margin)
+        sdf_lay.addRow("Margin:", margin_row)
 
-        # ── Training controls ──────────────────────────────────────────────
-        selector_bar.addSpacing(16)
-        selector_bar.addWidget(QtWidgets.QLabel("Ellipsoids:"))
+        self._combo_sdf_method = QtWidgets.QComboBox()
+        for mode_id in sorted(SDF_METHOD_NAMES.keys()):
+            self._combo_sdf_method.addItem(SDF_METHOD_NAMES[mode_id], mode_id)
+        self._combo_sdf_method.setCurrentIndex(0)
+        self._combo_sdf_method.setToolTip("SDF approximation method for ellipsoid fitting")
+        sdf_lay.addRow("Method:", self._combo_sdf_method)
+
+        settings_layout.addWidget(grp_sdf)
+
+        # ── Training parameters ──────────────────────────────────────
+        grp_training = QtWidgets.QGroupBox("Training")
+        train_lay = QtWidgets.QFormLayout(grp_training)
+        train_lay.setSpacing(4)
 
         self._spin_num_ellipsoids = QtWidgets.QSpinBox()
         self._spin_num_ellipsoids.setRange(1, 200)
         self._spin_num_ellipsoids.setValue(10)
         self._spin_num_ellipsoids.setToolTip("Number of ellipsoids to fit")
-        selector_bar.addWidget(self._spin_num_ellipsoids)
+        train_lay.addRow("Ellipsoids:", self._spin_num_ellipsoids)
 
-        selector_bar.addWidget(QtWidgets.QLabel("SDF:"))
-        self._combo_sdf_method = QtWidgets.QComboBox()
-        for mode_id in sorted(SDF_METHOD_NAMES.keys()):
-            self._combo_sdf_method.addItem(SDF_METHOD_NAMES[mode_id], mode_id)
-        self._combo_sdf_method.setCurrentIndex(0)  # Quílez default
-        self._combo_sdf_method.setToolTip("SDF approximation method for ellipsoid fitting")
-        selector_bar.addWidget(self._combo_sdf_method)
+        self._spin_miss_penalty = QtWidgets.QDoubleSpinBox()
+        self._spin_miss_penalty.setRange(0.0, 50.0)
+        self._spin_miss_penalty.setValue(3.0)
+        self._spin_miss_penalty.setSingleStep(0.5)
+        self._spin_miss_penalty.setDecimals(1)
+        self._spin_miss_penalty.setToolTip(
+            "Extra loss weight for interior regions missed by all ellipsoids.\n"
+            "Higher = stronger pressure to cover thin structures (arms, fingers)."
+        )
+        train_lay.addRow("Miss penalty:", self._spin_miss_penalty)
 
-        self._btn_fit = QtWidgets.QPushButton("▶ Fit Ellipsoids")
+        self._spin_maintenance = QtWidgets.QSpinBox()
+        self._spin_maintenance.setRange(0, 5000)
+        self._spin_maintenance.setValue(200)
+        self._spin_maintenance.setSingleStep(50)
+        self._spin_maintenance.setToolTip(
+            "Maintenance interval (prune + spawn) in training steps.\n"
+            "0 = disabled. Lower = more frequent population management."
+        )
+        self._spin_maintenance.setSpecialValueText("off")
+        train_lay.addRow("Maintenance:", self._spin_maintenance)
+
+        settings_layout.addWidget(grp_training)
+
+        # ── Fit / Stop buttons ───────────────────────────────────────
+        self._btn_fit = QtWidgets.QPushButton("Fit Ellipsoids")
         self._btn_fit.setToolTip("Start fitting ellipsoids to the loaded mesh SDF")
         self._btn_fit.setEnabled(False)
-        selector_bar.addWidget(self._btn_fit)
+        settings_layout.addWidget(self._btn_fit)
 
-        self._btn_stop = QtWidgets.QPushButton("■ Stop")
+        self._btn_stop = QtWidgets.QPushButton("Stop")
         self._btn_stop.setToolTip("Stop the running optimisation")
         self._btn_stop.setEnabled(False)
-        selector_bar.addWidget(self._btn_stop)
+        settings_layout.addWidget(self._btn_stop)
 
-        root_layout.addLayout(selector_bar)
+        settings_layout.addStretch(1)
 
-        # ── 2×2 splitter grid + evaluation panel ─────────────────────────
+        # ══════════════════════════════════════════════════════════════
+        # CENTER: 2x2 viewer grid
+        # ══════════════════════════════════════════════════════════════
         top_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         top_splitter.addWidget(self._mesh_viewer.widget)
         top_splitter.addWidget(self._mesh_sdf_panel)
@@ -163,13 +203,17 @@ class MainWindow(QtWidgets.QMainWindow):
         grid_splitter.addWidget(bot_splitter)
         grid_splitter.setSizes([450, 450])
 
-        main_hsplitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        main_hsplitter.addWidget(grid_splitter)
-        main_hsplitter.addWidget(self._run_tracker)
-        main_hsplitter.setSizes([900, 400])
-        main_hsplitter.setCollapsible(1, False)
+        # ══════════════════════════════════════════════════════════════
+        # RIGHT: Evaluation panel (run tracker)
+        # ══════════════════════════════════════════════════════════════
+        center_right = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        center_right.addWidget(grid_splitter)
+        center_right.addWidget(self._run_tracker)
+        center_right.setSizes([900, 400])
+        center_right.setCollapsible(1, False)
 
-        root_layout.addWidget(main_hsplitter, 1)
+        root_layout.addWidget(settings_panel)
+        root_layout.addWidget(center_right, 1)
 
         self.setCentralWidget(central)
         self._scan_mesh_dir()
@@ -324,12 +368,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         num_e = self._spin_num_ellipsoids.value()
         sdf_mode = self._combo_sdf_method.currentData()
+        miss_w = self._spin_miss_penalty.value()
+        maint = self._spin_maintenance.value()
         self.start_optimization(
             num_ellipsoids=num_e,
             method="adam",
             num_steps=7000,
             report_every=20,
             sdf_mode=sdf_mode,
+            miss_penalty_weight=miss_w,
+            maintenance_every=maint,
         )
 
     def _on_stop_clicked(self):
@@ -344,6 +392,8 @@ class MainWindow(QtWidgets.QMainWindow):
         num_steps: int = 2000,
         report_every: int = 20,
         sdf_mode: int = SDF_QUILEZ,
+        miss_penalty_weight: float = 3.0,
+        maintenance_every: int = 200,
     ) -> None:
         if self._last_mesh_result is None:
             self._status.showMessage("No mesh SDF available. Load a mesh and compute SDF first.")
@@ -363,6 +413,8 @@ class MainWindow(QtWidgets.QMainWindow):
             num_steps=num_steps,
             report_every=report_every,
             sdf_mode=sdf_mode,
+            miss_penalty_weight=miss_penalty_weight,
+            maintenance_every=maintenance_every,
             parent=self,
         )
         self._opt_worker.step_visual.connect(self._on_opt_step_visual)
