@@ -39,9 +39,10 @@ from bone_ellipsoid_mapper import (
 )
 from optimization import (
     _ellipsoid_sdf_kernel_batch,
-    _rmse_loss_kernel_batch,
+    _loss_kernel_batch,
     _normalize_flat_quats,
     EpochSampler,
+    OptimizationWorker,
 )
 from bone_ellipsoid_mapper import _local_to_world_kernel
 
@@ -113,6 +114,7 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
     step_sdf = QtCore.Signal(int, float, object, bool, object, float, int)
     pose_loss = QtCore.Signal(int, str, float)
     pose_switched = QtCore.Signal(int)  # pose_index — emitted when pose changes
+    maintenance_done = QtCore.Signal(int, int, int, int)  # step, n_before, n_pruned, n_spawned
     finished = QtCore.Signal()
 
     def __init__(
@@ -135,6 +137,7 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
         margin: float = 0.5,
         batch_fraction: float = 0.125,
         lr: float = 0.005,
+        maintenance_every: int = 200,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
@@ -154,6 +157,7 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
         self._margin = margin
         self._batch_fraction = batch_fraction
         self._lr = lr
+        self._maintenance_every = maintenance_every
 
         self._stop_flag = False
 
@@ -298,6 +302,13 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
         spp = self._steps_per_pose if self._steps_per_pose else 10
         prev_pi = -1
 
+        # Helper to create a temporary OptimizationWorker for maintenance
+        def _make_maintenance_worker(sdf_np, origin, dx, grid_n):
+            return OptimizationWorker(
+                sdf_target_np=sdf_np, origin=origin, dx=dx, n=grid_n,
+                num_ellipsoids=N, num_steps=0,
+            )
+
         for step in range(self._num_steps):
             if self._stop_flag:
                 break
@@ -306,9 +317,127 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
             pi = (step // spp) % n_poses
             pd = pose_data[pi]
 
-            if pi != prev_pi:
+            # ── Mutex: only ONE special event per step ────────────────
+            #    Either a pose switch (+ reassignment) OR a maintenance
+            #    step can happen, never both in the same iteration.
+            wants_pose_switch = (pi != prev_pi)
+            wants_maintenance = (
+                self._maintenance_every > 0
+                and step > 0
+                and step % self._maintenance_every == 0
+            )
+
+            if wants_pose_switch:
+                # ── Pose switch + reassignment ────────────────────────
+                if prev_pi >= 0 and pd.deformed_verts is not None:
+                    wp.synchronize_device(device)
+                    current_bl = BoneLocalEllipsoids(
+                        local_centers=pred_local_centers.numpy().copy(),
+                        local_radii=pred_local_radii.numpy().copy(),
+                        local_rotations=pred_local_rot_flat.numpy()
+                            .reshape(-1, 4).copy(),
+                        bone_assignments=bl.bone_assignments.copy(),
+                    )
+                    new_bl, n_reassigned = self._mapper.check_and_reassign(
+                        current_bl, pd.pose, pd.deformed_verts,
+                        self._skin_joints, self._skin_weights,
+                    )
+                    if n_reassigned > 0:
+                        bl = new_bl
+                        pred_local_centers.assign(wp.array(
+                            new_bl.local_centers.astype(np.float32),
+                            dtype=wp.vec3, device=device,
+                        ))
+                        pred_local_radii.assign(wp.array(
+                            new_bl.local_radii.astype(np.float32),
+                            dtype=wp.vec3, device=device,
+                        ))
+                        pred_local_rot_flat.assign(wp.array(
+                            new_bl.local_rotations.astype(np.float32).flatten(),
+                            dtype=wp.float32, device=device,
+                        ))
+                        wp_bone_assign = wp.array(
+                            new_bl.bone_assignments.astype(np.int32),
+                            dtype=wp.int32, device=device,
+                        )
+                        params = [pred_local_centers, pred_local_radii,
+                                  pred_local_rot_flat]
+                        grads = [p.grad.flatten() for p in params]
+                        optimizer = wp.optim.Adam(params, lr=self._lr)
+
                 self.pose_switched.emit(pi)
                 prev_pi = pi
+
+            elif wants_maintenance:
+                # ── Maintenance (prune + spawn) ───────────────────────
+                #    Runs in world space for the current pose, then
+                #    converts back to bone-local.
+                wp.synchronize_device(device)
+                lc = pred_local_centers.numpy().copy()
+                lr_np = pred_local_radii.numpy().copy()
+                lq = pred_local_rot_flat.numpy().reshape(-1, 4).copy()
+
+                current_bl = BoneLocalEllipsoids(
+                    local_centers=lc, local_radii=lr_np,
+                    local_rotations=lq,
+                    bone_assignments=bl.bone_assignments.copy(),
+                )
+                # Transform to world for maintenance analysis
+                wc, wr, wq = self._mapper.local_to_world_np(current_bl, pd.pose)
+
+                worker = _make_maintenance_worker(
+                    pd.sdf_grid, pd.origin, pd.dx, n,
+                )
+                wc, wr, wq, changed, n_pruned, n_spawned = \
+                    worker._do_maintenance(wc, wr, wq)
+                self.maintenance_done.emit(step, N, n_pruned, n_spawned)
+
+                if changed:
+                    # Re-assign to bones and convert back to bone-local
+                    new_bl = self._mapper.assign_to_bones(
+                        wc, wr, wq,
+                        pd.deformed_verts if pd.deformed_verts is not None
+                            else self._rest_verts,
+                        self._skin_joints, self._skin_weights,
+                        pose=pd.pose,
+                    )
+                    N = new_bl.num_ellipsoids
+                    bl = new_bl
+
+                    pred_local_centers = wp.array(
+                        new_bl.local_centers.astype(np.float32),
+                        dtype=wp.vec3, device=device, requires_grad=True,
+                    )
+                    pred_local_radii = wp.array(
+                        new_bl.local_radii.astype(np.float32),
+                        dtype=wp.vec3, device=device, requires_grad=True,
+                    )
+                    pred_local_rot_flat = wp.array(
+                        new_bl.local_rotations.astype(np.float32).flatten(),
+                        dtype=wp.float32, device=device, requires_grad=True,
+                    )
+                    wp_bone_assign = wp.array(
+                        new_bl.bone_assignments.astype(np.int32),
+                        dtype=wp.int32, device=device,
+                    )
+                    # Reallocate working buffers for potentially changed N
+                    world_centers = wp.empty(N, dtype=wp.vec3, device=device,
+                                             requires_grad=True)
+                    world_radii = wp.empty(N, dtype=wp.vec3, device=device,
+                                           requires_grad=True)
+                    world_rot_flat = wp.empty(N * 4, dtype=wp.float32,
+                                              device=device, requires_grad=True)
+                    min_d_cache = wp.zeros((bs, N + 1), dtype=wp.float32,
+                                           device=device, requires_grad=True)
+                    sdf_pred = wp.empty(bs, dtype=wp.float32, device=device,
+                                        requires_grad=True)
+                    loss = wp.zeros(1, dtype=wp.float32, device=device,
+                                    requires_grad=True)
+
+                    params = [pred_local_centers, pred_local_radii,
+                              pred_local_rot_flat]
+                    grads = [p.grad.flatten() for p in params]
+                    optimizer = wp.optim.Adam(params, lr=self._lr)
 
             # ── Forward pass ──
             tape = wp.Tape()
@@ -353,10 +482,10 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
                 # 4. Loss against mesh SDF
                 loss.zero_()
                 wp.launch(
-                    _rmse_loss_kernel_batch,
+                    _loss_kernel_batch,
                     dim=bs,
                     inputs=[sdf_pred, pd.wp_sdf_target, wp_indices,
-                            loss, bs],
+                            loss, bs, float(0.0)],
                     device=device,
                 )
 
@@ -536,9 +665,36 @@ def run_multipose_pipeline(
     samplers = [EpochSampler(total, bs) for _ in pose_data_list]
 
     n_poses = len(pose_data_list)
+    prev_pi = -1
     for step in range(num_steps):
         pi = step % n_poses
         pd = pose_data_list[pi]
+
+        # ── Reassign ellipsoids on pose switch ──
+        if pi != prev_pi:
+            if prev_pi >= 0 and pd.deformed_verts is not None:
+                wp.synchronize_device(device)
+                cur_bl = BoneLocalEllipsoids(
+                    local_centers=pred_lc.numpy().copy(),
+                    local_radii=pred_lr.numpy().copy(),
+                    local_rotations=pred_lrot.numpy().reshape(-1, 4).copy(),
+                    bone_assignments=bone_local.bone_assignments.copy(),
+                )
+                new_bl, n_re = mapper.check_and_reassign(
+                    cur_bl, pd.pose, pd.deformed_verts,
+                    rigged_mesh.skin_joints, rigged_mesh.skin_weights,
+                )
+                if n_re > 0:
+                    bone_local = new_bl
+                    pred_lc.assign(wp.array(new_bl.local_centers, dtype=wp.vec3, device=device))
+                    pred_lr.assign(wp.array(new_bl.local_radii, dtype=wp.vec3, device=device))
+                    pred_lrot.assign(wp.array(new_bl.local_rotations.flatten(), dtype=wp.float32, device=device))
+                    wp_ba = wp.array(new_bl.bone_assignments, dtype=wp.int32, device=device)
+                    params = [pred_lc, pred_lr, pred_lrot]
+                    grads = [p.grad.flatten() for p in params]
+                    optimizer = wp.optim.Adam(params, lr=lr)
+                    print(f"  [Reassign] step {step}: {n_re} ellipsoid(s) re-assigned")
+            prev_pi = pi
 
         tape = wp.Tape()
         with tape:
@@ -556,9 +712,9 @@ def run_multipose_pipeline(
                               wp_o, float(pd.dx), n, n, n, wp_idx, sdf_pred],
                       device=device)
             loss_buf.zero_()
-            wp.launch(_rmse_loss_kernel_batch, dim=bs,
+            wp.launch(_loss_kernel_batch, dim=bs,
                       inputs=[sdf_pred, pd.wp_sdf_target, wp_idx,
-                              loss_buf, bs], device=device)
+                              loss_buf, bs, float(0.0)], device=device)
 
         tape.backward(loss_buf)
         optimizer.step(grads)
