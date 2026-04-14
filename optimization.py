@@ -109,12 +109,20 @@ def _rmse_loss_kernel_batch(
     indices: wp.array(dtype=wp.int32),
     loss: wp.array(dtype=wp.float32),
     batch_size: int,
+    miss_weight: float,
 ):
     bid = wp.tid()
     tid = indices[bid]
-    limit = 0.1
+    limit = float(0.1)
+
+    # Base SDF reconstruction loss
     diff = wp.abs(soft_clamp(sdf_pred[bid], limit) - soft_clamp(sdf_target[tid], limit))
     wp.atomic_add(loss, 0, diff / float(batch_size))
+
+    # Miss penalty: target inside mesh but ellipsoid says outside
+    if sdf_target[tid] < float(0.0) and sdf_pred[bid] > float(0.0):
+        miss = sdf_pred[bid] - sdf_target[tid]
+        wp.atomic_add(loss, 0, miss_weight * miss / float(batch_size))
 
 
 @wp.kernel
@@ -251,9 +259,10 @@ class OptimizationWorker(QtCore.QThread):
         batch_fraction: float | None = None,
         batch_size: int | None = None,
         maintenance_every: int = 200,
-        containment_thresh: float = 0.8,
+        miss_penalty_weight: float = 3.0,
         max_prune_fraction: float = 0.15,
         min_volume_abs: float = 1e-8,
+        coverage_sample_size: int = 20000,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
@@ -269,9 +278,10 @@ class OptimizationWorker(QtCore.QThread):
         self._stop_flag = False
 
         self._maintenance_every = maintenance_every
-        self._containment_thresh = containment_thresh
+        self._miss_penalty_weight = miss_penalty_weight
         self._max_prune_fraction = max_prune_fraction
         self._min_volume_abs = min_volume_abs
+        self._coverage_sample_size = coverage_sample_size
 
         total = n * n * n
         if batch_size is not None:
@@ -421,7 +431,7 @@ class OptimizationWorker(QtCore.QThread):
         radii: np.ndarray,
         rotations: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, int, int]:
-        """Conservative prune + spawn.
+        """Coverage-based prune + proactive spawn.
 
         Returns (centers, radii, rotations, changed, n_pruned, n_spawned).
         """
@@ -429,15 +439,11 @@ class OptimizationWorker(QtCore.QThread):
         budget = max(1, int(n_before * self._max_prune_fraction))
 
         # ── 1. Remove clearly degenerate ellipsoids ──────────────────
-        #    (collapsed to near-zero volume — absolute threshold so
-        #     large ellipsoids are never affected by this)
         volumes = np.prod(np.abs(radii), axis=1)
         vol_ok = volumes > self._min_volume_abs
         n_degenerate = int(np.count_nonzero(~vol_ok))
 
-        # Don't blow budget on degenerates alone
         if n_degenerate > budget:
-            # Remove only the smallest ones up to budget
             degen_idx = np.where(~vol_ok)[0]
             degen_vols = volumes[degen_idx]
             keep_from_degen = degen_idx[np.argsort(degen_vols)[-max(0, n_degenerate - budget):]]
@@ -449,28 +455,48 @@ class OptimizationWorker(QtCore.QThread):
         n_removed = n_before - len(centers)
         budget -= n_removed
 
-        # ── 2. Containment-based pruning ─────────────────────────────
-        #    Iterate from smallest to largest volume.  A small ellipsoid
-        #    is redundant only if:
-        #      (a) its centre is *inside* a larger ellipsoid
-        #          (normalised distance < containment_thresh), AND
-        #      (b) ALL its radii are smaller than the larger one's.
-        #    The larger ellipsoid is NEVER removed.
-        if budget > 0 and len(centers) >= 2:
-            contained = self._find_contained(centers, radii, rotations)
-            # contained is a list of indices, sorted smallest-volume first.
-            # Remove at most `budget` of them.
-            to_remove = contained[:budget]
-            if len(to_remove) > 0:
+        # ── 2. Coverage-based pruning ─────────────────────────────────
+        cov = self._compute_coverage_info(centers, radii, rotations)
+
+        n_pruned = n_removed
+        if budget > 0 and len(centers) >= 2 and cov['valid']:
+            to_remove = self._select_prune_candidates(cov, budget)
+            if to_remove:
                 keep_mask = np.ones(len(centers), dtype=bool)
                 keep_mask[to_remove] = False
                 centers   = centers[keep_mask]
                 radii     = radii[keep_mask]
                 rotations = rotations[keep_mask]
+                budget   -= len(to_remove)
+                n_pruned += len(to_remove)
+                cov = self._filter_coverage_info(cov, np.where(keep_mask)[0])
 
-        n_pruned = n_before - len(centers)
+        # ── 3. Proactively replace low-coverage ellipsoids ────────────
+        if cov['valid'] and budget > 0:
+            n_uncov = cov['n_uncovered']
+            n_sample = len(cov['pts'])
+            uncov_frac = n_uncov / max(n_sample, 1)
 
-        # ── 3. Spawn replacements ────────────────────────────────────
+            if n_uncov >= 50 and uncov_frac >= 0.05:
+                extra_slots = min(budget, max(1, int(round(uncov_frac * self._num_ellipsoids * 0.5))))
+                already_free = self._num_ellipsoids - len(centers)
+                extra_prune = max(0, extra_slots - already_free)
+
+                if extra_prune > 0 and len(centers) > 1:
+                    total_cov  = cov['total_coverage']
+                    unique_cov = cov['unique_coverage']
+                    zero_unique_mask = unique_cov == 0
+                    order = np.argsort(np.where(zero_unique_mask, total_cov, total_cov + 1e9))
+                    swap_candidates = order[:extra_prune].tolist()
+
+                    keep_mask = np.ones(len(centers), dtype=bool)
+                    keep_mask[swap_candidates] = False
+                    centers   = centers[keep_mask]
+                    radii     = radii[keep_mask]
+                    rotations = rotations[keep_mask]
+                    n_pruned += len(swap_candidates)
+
+        # ── 4. Spawn ─────────────────────────────────────────────────
         num_to_spawn = self._num_ellipsoids - len(centers)
         n_spawned = 0
 
@@ -486,69 +512,75 @@ class OptimizationWorker(QtCore.QThread):
         changed = n_pruned > 0 or n_spawned > 0
         return centers, radii, rotations, changed, n_pruned, n_spawned
 
-    # ── containment check ─────────────────────────────────────────────
+    # ── SDF helper (numpy, single ellipsoid) ──────────────────────────
 
-    def _find_contained(
-        self,
-        centers: np.ndarray,
-        radii: np.ndarray,
-        rotations: np.ndarray,
-    ) -> list[int]:
-        """Find small ellipsoids whose centre sits inside a larger one
-        and whose radii are all smaller → truly redundant.
+    @staticmethod
+    def _ellipsoid_sdf_np(center, radii, rotation_quat, points):
+        """MertStein hybrid SDF for one ellipsoid at (N,3) points."""
+        R = _quat_to_rot_matrix(rotation_quat)
+        delta = points.astype(np.float64) - center.astype(np.float64)
+        local_p = (R.T @ delta.T).T
+        r = np.abs(radii).astype(np.float64)
+        r_safe = np.maximum(r, 1e-12)
+        scaled = local_p / r_safe[np.newaxis, :]
+        k0 = np.linalg.norm(scaled, axis=1)
+        r_min = float(r.min())
+        scaled2 = local_p / np.maximum(r_safe ** 2, 1e-24)[np.newaxis, :]
+        k1 = np.maximum(np.linalg.norm(scaled2, axis=1), 1e-8)
+        inside  = (k0 - 1.0) * r_min
+        outside = k0 * (k0 - 1.0) / k1
+        return np.where(k0 < 1.0, inside, outside).astype(np.float32)
 
-        Returns a list of indices to remove, ordered by ascending volume
-        (smallest first = safest to remove).
-        """
-        n = len(centers)
-        volumes = np.prod(np.abs(radii), axis=1)
+    # ── coverage computation (shared by pruning + spawn) ──────────────
 
-        # Process from smallest to largest — only the small one can be removed
-        order = np.argsort(volumes)  # ascending volume
+    def _compute_coverage_info(self, centers, radii, rotations):
+        n, dx, origin = self._n, self._dx, self._origin
+        flat_target = self._sdf_target_np.ravel()
+        interior_idx = np.where(flat_target < 0.0)[0]
+        if len(interior_idx) == 0 or len(centers) == 0:
+            return {'valid': False}
 
-        # Precompute rotation matrices for each ellipsoid
-        rot_mats = np.stack([_quat_to_rot_matrix(rotations[i]) for i in range(n)])
+        sample_size = min(self._coverage_sample_size, len(interior_idx))
+        sample_flat_idx = np.random.default_rng(0).choice(interior_idx, size=sample_size, replace=False)
+        iz, iy, ix = np.unravel_index(sample_flat_idx, (n, n, n))
+        pts = origin + (np.stack([ix, iy, iz], axis=1).astype(np.float32) + 0.5) * dx
 
-        contained_indices: list[int] = []
-        removed_set: set[int] = set()
+        num_e = len(centers)
+        per_sdf = np.stack([
+            self._ellipsoid_sdf_np(centers[i], radii[i], rotations[i], pts)
+            for i in range(num_e)
+        ])
+        is_inside    = per_sdf < 0.0
+        cover_count  = is_inside.sum(axis=0)
+        unique_cov   = np.array([int(np.sum(is_inside[i] & (cover_count == 1))) for i in range(num_e)])
+        total_cov    = is_inside.sum(axis=1).astype(int)
+        uncov_mask   = cover_count == 0
+        return {
+            'valid': True, 'pts': pts, 'sample_flat_idx': sample_flat_idx,
+            'is_inside': is_inside, 'cover_count': cover_count,
+            'unique_coverage': unique_cov, 'total_coverage': total_cov,
+            'uncovered_mask': uncov_mask, 'n_uncovered': int(uncov_mask.sum()),
+        }
 
-        for rank in range(n):
-            i_small = order[rank]
-            if i_small in removed_set:
-                continue
+    @staticmethod
+    def _filter_coverage_info(cov, keep_indices):
+        if not cov['valid']:
+            return cov
+        is_inside   = cov['is_inside'][keep_indices]
+        cover_count = is_inside.sum(axis=0)
+        unique_cov  = np.array([int(np.sum(is_inside[i] & (cover_count == 1))) for i in range(len(keep_indices))])
+        uncov_mask  = cover_count == 0
+        return {**cov, 'is_inside': is_inside, 'cover_count': cover_count,
+                'unique_coverage': unique_cov, 'total_coverage': is_inside.sum(axis=1).astype(int),
+                'uncovered_mask': uncov_mask, 'n_uncovered': int(uncov_mask.sum())}
 
-            r_small = np.abs(radii[i_small])
-
-            for rank_big in range(n - 1, rank, -1):
-                i_big = order[rank_big]
-                if i_big in removed_set:
-                    continue
-
-                r_big = np.abs(radii[i_big])
-
-                # Quick reject: if any small radius >= big radius, not contained
-                if np.any(r_small >= r_big):
-                    continue
-
-                # Transform small's centre into big's local frame
-                delta = (centers[i_small] - centers[i_big]).astype(np.float64)
-                R_big = rot_mats[i_big]  # (3,3)
-                local_p = R_big.T @ delta  # inverse rotation
-
-                # Normalised ellipsoid distance: |p / r|
-                # < 1.0 means inside the ellipsoid surface
-                r_big_f64 = r_big.astype(np.float64)
-                normalised = local_p / np.maximum(r_big_f64, 1e-12)
-                norm_dist = float(np.linalg.norm(normalised))
-
-                if norm_dist < self._containment_thresh:
-                    # Centre is well inside the big ellipsoid AND
-                    # all radii are smaller → this small one is redundant
-                    contained_indices.append(int(i_small))
-                    removed_set.add(i_small)
-                    break  # i_small is gone, move on
-
-        return contained_indices
+    @staticmethod
+    def _select_prune_candidates(cov, budget):
+        zero_unique = np.where(cov['unique_coverage'] == 0)[0]
+        if len(zero_unique) == 0:
+            return []
+        order = np.argsort(cov['total_coverage'][zero_unique])
+        return zero_unique[order].tolist()[:budget]
 
     # ── spawning ──────────────────────────────────────────────────────
 
@@ -559,88 +591,67 @@ class OptimizationWorker(QtCore.QThread):
         rotations: np.ndarray,
         num_spawn: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Place new ellipsoids **inside the mesh** at high-error regions.
+        """Place new ellipsoids inside the mesh, prioritising missed regions."""
+        origin, dx, n = self._origin, self._dx, self._n
 
-        Strategy:
-          1. Only consider voxels where sdf_target < 0 (mesh interior).
-          2. Among those, rank by residual error.
-          3. Select spawn positions via farthest-point sampling for diversity.
-          4. Set initial radii proportional to the local interior depth
-             (|sdf_target| at that point) so the ellipsoid starts at a
-             reasonable size — not so large it overshoots, not so small
-             it has no gradient signal.
-        """
-        origin = self._origin
-        dx = self._dx
-        n = self._n
-
-        # Evaluate current ellipsoid SDF
         ell_set = EllipsoidSet(device=device)
         if len(centers) > 0:
             ell_set.set_parameters(centers, radii, rotations)
         pred_grid = ell_set.compute_sdf_grid(origin, dx, n)
 
         target_grid = self._sdf_target_np
-        error = np.abs(
-            _soft_clamp_np(pred_grid, 0.1) - _soft_clamp_np(target_grid, 0.1)
-        )
+        error = np.abs(_soft_clamp_np(pred_grid, 0.1) - _soft_clamp_np(target_grid, 0.1))
 
-        # ── Restrict to mesh interior ─────────────────────────────────
         flat_target = target_grid.ravel()
-        flat_error = error.ravel()
-        interior_mask = flat_target < 0.0  # inside the mesh
-
-        interior_idx = np.where(interior_mask)[0]
-        if len(interior_idx) == 0:
-            # Fallback: if no interior voxels at all, use surface-near
-            # voxels (|sdf| < 2*dx)
-            near_surface = np.abs(flat_target) < 2.0 * dx
-            interior_idx = np.where(near_surface)[0]
+        flat_pred   = pred_grid.ravel()
+        flat_error  = error.ravel()
+        interior_mask = flat_target < 0.0
+        interior_idx  = np.where(interior_mask)[0]
 
         if len(interior_idx) == 0:
-            # Still nothing — place randomly in grid centre
-            new_centers = np.zeros((num_spawn, 3), dtype=np.float32)
-            new_radii = np.full((num_spawn, 3), float(dx) * 3.0, dtype=np.float32)
-            new_rots = np.tile(
-                np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (num_spawn, 1),
-            )
-            return new_centers, new_radii, new_rots
+            interior_idx = np.where(np.abs(flat_target) < 2.0 * dx)[0]
+        if len(interior_idx) == 0:
+            return (np.zeros((num_spawn, 3), dtype=np.float32),
+                    np.full((num_spawn, 3), float(dx) * 3.0, dtype=np.float32),
+                    np.tile(np.array([0., 0., 0., 1.], dtype=np.float32), (num_spawn, 1)))
 
-        interior_errors = flat_error[interior_idx]
+        all_centers_list: list[np.ndarray] = []
+        all_flat_idx_list: list[np.ndarray] = []
+        spawned_so_far = 0
 
-        # Top-K highest-error interior voxels as candidate pool
-        pool_size = min(num_spawn * 50, len(interior_idx))
-        top_local = np.argpartition(interior_errors, -pool_size)[-pool_size:]
-        pool_flat_idx = interior_idx[top_local]
+        # Priority tier: missed interior voxels (sdf_target<0, sdf_pred>0)
+        missed_idx = np.where(interior_mask & (flat_pred > 0.0))[0]
+        if len(missed_idx) > 0:
+            n_prio    = min(num_spawn, len(missed_idx))
+            pool_size = min(n_prio * 50, len(missed_idx))
+            top_local = np.argpartition(flat_error[missed_idx], -pool_size)[-pool_size:]
+            pool_idx  = missed_idx[top_local]
+            iz, iy, ix = np.unravel_index(pool_idx, (n, n, n))
+            pool_world = origin + (np.stack([ix, iy, iz], axis=1).astype(np.float32) + 0.5) * dx
+            selected = self._farthest_point_sample(pool_world, flat_error[pool_idx], n_prio, centers)
+            all_centers_list.append(pool_world[selected].astype(np.float32))
+            all_flat_idx_list.append(pool_idx[selected])
+            spawned_so_far = len(selected)
 
-        # Convert to world positions
-        iz, iy, ix = np.unravel_index(pool_flat_idx, (n, n, n))
-        pool_world = origin + (np.stack([ix, iy, iz], axis=1).astype(np.float32) + 0.5) * dx
-        pool_errors = flat_error[pool_flat_idx]
+        # Fill tier: remaining slots from high-error interior voxels
+        n_fill = num_spawn - spawned_so_far
+        if n_fill > 0:
+            pool_size = min(n_fill * 50, len(interior_idx))
+            top_local = np.argpartition(flat_error[interior_idx], -pool_size)[-pool_size:]
+            pool_flat = interior_idx[top_local]
+            iz, iy, ix = np.unravel_index(pool_flat, (n, n, n))
+            pool_world = origin + (np.stack([ix, iy, iz], axis=1).astype(np.float32) + 0.5) * dx
+            existing = np.concatenate([centers] + all_centers_list, axis=0) if all_centers_list else centers
+            selected = self._farthest_point_sample(pool_world, flat_error[pool_flat], n_fill, existing)
+            all_centers_list.append(pool_world[selected].astype(np.float32))
+            all_flat_idx_list.append(pool_flat[selected])
 
-        # Farthest-point sampling for spatial diversity
-        selected_idx = self._farthest_point_sample(
-            pool_world, pool_errors, num_spawn, centers,
-        )
-
-        new_centers = pool_world[selected_idx].astype(np.float32)
-
-        # ── Depth-based initial radii ─────────────────────────────────
-        # |sdf_target| at the spawn point = distance to nearest surface.
-        # Use a fraction of that as initial radius so the ellipsoid
-        # fits comfortably inside without immediately overshooting.
-        spawn_flat_idx = pool_flat_idx[selected_idx]
-        local_depth = np.abs(flat_target[spawn_flat_idx])  # (num_spawn,)
-
-        # Clamp: at least 2×dx (gradient signal), at most 80% of depth
-        min_r = float(dx) * 2.0
-        init_r = np.clip(local_depth * 0.6, min_r, None)  # (num_spawn,)
+        new_centers    = np.concatenate(all_centers_list, axis=0)
+        spawn_flat_idx = np.concatenate(all_flat_idx_list, axis=0)
+        local_depth    = np.abs(flat_target[spawn_flat_idx])
+        init_r = np.clip(local_depth * 0.6, float(dx) * 2.0, None)
         new_radii = np.stack([init_r, init_r, init_r], axis=1).astype(np.float32)
-
-        new_rots = np.tile(
-            np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (num_spawn, 1),
-        )
-
+        new_rots  = np.tile(np.array([0., 0., 0., 1.], dtype=np.float32), (len(new_centers), 1))
         return new_centers, new_radii, new_rots
 
     @staticmethod
@@ -755,7 +766,8 @@ class OptimizationWorker(QtCore.QThread):
                 wp.launch(
                     _rmse_loss_kernel_batch,
                     dim=bs,
-                    inputs=[sdf_pred, sdf_target, wp_indices, loss, bs],
+                    inputs=[sdf_pred, sdf_target, wp_indices, loss, bs,
+                            float(self._miss_penalty_weight)],
                     device=device,
                 )
 
@@ -846,7 +858,8 @@ class OptimizationWorker(QtCore.QThread):
                 wp.launch(
                     _rmse_loss_kernel_batch,
                     dim=bs,
-                    inputs=[sdf_pred, sdf_target, wp_indices, loss, bs],
+                    inputs=[sdf_pred, sdf_target, wp_indices, loss, bs,
+                            float(self._miss_penalty_weight)],
                     device=device,
                 )
 

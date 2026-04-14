@@ -346,6 +346,72 @@ class BoneEllipsoidMapper:
 
         return world_centers, world_radii, world_rot_flat
 
+    # ── Reassignment check ───────────────────────────────────────────
+
+    def check_and_reassign(
+        self,
+        bone_local: BoneLocalEllipsoids,
+        pose: Pose,
+        deformed_verts: np.ndarray,
+        skin_joints: np.ndarray,
+        skin_weights: np.ndarray,
+    ) -> tuple[BoneLocalEllipsoids, int]:
+        """Re-evaluate bone assignments for drifted ellipsoids.
+
+        Gradient updates during training can shift ellipsoid centres into a
+        different bone's region.  This method detects such drift and
+        re-expresses the affected ellipsoids in the new bone's local frame
+        so that subsequent pose transforms remain correct.
+
+        Returns (updated_bone_local, n_reassigned).
+        """
+        wc, wr, wq = self.local_to_world_np(bone_local, pose)
+        N = len(wc)
+        old_assignments = bone_local.bone_assignments.copy()
+        new_assignments = np.empty(N, dtype=np.int32)
+
+        for i in range(N):
+            c = wc[i].astype(np.float64)
+            dists = np.linalg.norm(
+                deformed_verts.astype(np.float64) - c[np.newaxis, :], axis=1,
+            )
+            K = min(20, len(dists))
+            nearest_idx = np.argpartition(dists, K)[:K] if K < len(dists) else np.arange(len(dists))
+            inv_dists = 1.0 / np.maximum(dists[nearest_idx], 1e-8)
+            bone_scores = np.zeros(self.skeleton.num_bones, dtype=np.float64)
+            for ni in range(K):
+                vi = nearest_idx[ni]
+                w_dist = inv_dists[ni]
+                for k in range(skin_joints.shape[1]):
+                    bone_scores[skin_joints[vi, k]] += w_dist * skin_weights[vi, k]
+            new_assignments[i] = int(np.argmax(bone_scores))
+
+        changed_mask = new_assignments != old_assignments
+        n_reassigned = int(changed_mask.sum())
+        if n_reassigned == 0:
+            return bone_local, 0
+
+        world_transforms = self.skeleton.compute_world_transforms(pose)
+        new_local_centers    = bone_local.local_centers.copy()
+        new_local_rotations  = bone_local.local_rotations.copy()
+
+        for i in np.where(changed_mask)[0]:
+            bi_new = new_assignments[i]
+            t_bone, q_bone, _ = mat4_decompose(world_transforms[bi_new])
+            q_inv = quat_inverse(q_bone)
+            new_local_centers[i] = quat_rotate(q_inv, wc[i].astype(np.float64) - t_bone).astype(np.float32)
+            q_local = quat_multiply(q_inv, wq[i].astype(np.float64))
+            new_local_rotations[i] = (q_local / np.linalg.norm(q_local)).astype(np.float32)
+
+        updated = BoneLocalEllipsoids(
+            local_centers=new_local_centers,
+            local_radii=bone_local.local_radii.copy(),
+            local_rotations=new_local_rotations,
+            bone_assignments=new_assignments,
+        )
+        self._bone_local = updated
+        return updated, n_reassigned
+
     # ── Utility ──────────────────────────────────────────────────────
 
     def get_bone_name(self, ellipsoid_index: int) -> str:
