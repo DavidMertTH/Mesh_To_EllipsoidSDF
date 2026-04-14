@@ -1,18 +1,21 @@
 ﻿"""
 optimization.py — Ellipsoid fitting via differentiable SDF.
 
-MINI-BATCH + CONSERVATIVE POPULATION MANAGEMENT:
+MINI-BATCH + COVERAGE-BASED POPULATION MANAGEMENT:
   - Epoch-based mini-batch sampling (index indirection).
+  - Asymmetric loss: extra penalty when the mesh interior is missed
+    (voxel SDF < 0 but ellipsoid SDF > 0), controlled by
+    `miss_penalty_weight`.
   - Periodic maintenance (every `maintenance_every` iterations):
-      1. PRUNE (conservative) — only remove ellipsoids that are truly
-         redundant: either (a) degenerate (collapsed to near-zero volume)
-         or (b) *contained* inside a larger ellipsoid (center is inside
-         the larger one AND all radii are smaller).
-         → Large ellipsoids are never removed in favour of small ones.
+      1. PRUNE (coverage-based) — only remove ellipsoids that are truly
+         redundant in SDF space: they have no interior voxels where they
+         are the sole provider of coverage.  This correctly preserves
+         thin structures (arms, fingers) even when their centre lies
+         inside a larger ellipsoid.
          → A budget cap limits removals to `max_prune_fraction` of the
            population per round so training stays stable.
       2. SPAWN — fill vacancies at high-error regions via farthest-point
-         sampling (same as before).
+         sampling, biased toward missed interior regions.
 """
 
 import warp as wp
@@ -103,18 +106,28 @@ def soft_clamp(x: float, limit: float) -> float:
 
 
 @wp.kernel
-def _rmse_loss_kernel_batch(
+def _loss_kernel_batch(
     sdf_pred: wp.array(dtype=wp.float32),
     sdf_target: wp.array(dtype=wp.float32),
     indices: wp.array(dtype=wp.int32),
     loss: wp.array(dtype=wp.float32),
     batch_size: int,
+    miss_weight: float,
 ):
     bid = wp.tid()
     tid = indices[bid]
-    limit = 0.1
+    limit = float(0.1)
+
+    # Base SDF reconstruction loss
     diff = wp.abs(soft_clamp(sdf_pred[bid], limit) - soft_clamp(sdf_target[tid], limit))
     wp.atomic_add(loss, 0, diff / float(batch_size))
+
+    # Miss penalty: target is inside the mesh but ellipsoid says outside.
+    # sdf_target < 0  →  inside mesh
+    # sdf_pred   > 0  →  outside all ellipsoids  (missed region)
+    if sdf_target[tid] < float(0.0) and sdf_pred[bid] > float(0.0):
+        miss = sdf_pred[bid] - sdf_target[tid]  # both terms push miss > 0
+        wp.atomic_add(loss, 0, miss_weight * miss / float(batch_size))
 
 
 @wp.kernel
@@ -201,33 +214,40 @@ def _quat_to_rot_matrix(quat_xyzw: np.ndarray) -> np.ndarray:
 # ── Worker ────────────────────────────────────────────────────────────────────
 
 class OptimizationWorker(QtCore.QThread):
-    """Ellipsoid fitting with mini-batch sampling + conservative population mgmt.
+    """Ellipsoid fitting with mini-batch sampling + coverage-based population mgmt.
 
     Pruning philosophy
     ------------------
-    Large ellipsoids are the backbone of the approximation and are
-    *never* removed in favour of smaller ones.  A small ellipsoid is
-    only pruned when it is **contained** inside a larger one — meaning
-    its centre lies inside the larger ellipsoid (normalised distance
-    < containment_thresh) and all its radii are smaller.
+    An ellipsoid is pruned only when it is truly redundant in SDF space —
+    i.e., it has no interior voxels where it alone provides negative SDF.
+    This correctly preserves thin structures (arms, fingers) even when
+    their centre lies geometrically inside a larger body ellipsoid.
 
     Per maintenance round at most ``max_prune_fraction`` of the current
     population is removed so training stays stable.
+
+    Loss
+    ----
+    In addition to the base reconstruction loss, a ``miss_penalty_weight``
+    amplifies the gradient for voxels that are inside the mesh
+    (sdf_target < 0) but outside all ellipsoids (sdf_pred > 0).  This
+    directs optimisation toward uncovered thin regions.
 
     Parameters
     ----------
     maintenance_every : int
         Prune/spawn cycle frequency (default 200 — frequent but gentle).
-    containment_thresh : float
-        Normalised-distance threshold for considering a point "inside"
-        the larger ellipsoid.  1.0 = exactly on the surface.
-        Default 0.8 (well inside).
+    miss_penalty_weight : float
+        Extra loss multiplier for missed interior regions (default 3.0).
     max_prune_fraction : float
         At most this fraction of the population may be pruned per round
         (default 0.15 = 15 %).
     min_volume_abs : float
         Absolute volume floor — ellipsoids with prod(radii) below this
         are considered degenerate (default 1e-8).
+    coverage_sample_size : int
+        Number of interior voxels sampled for coverage computation during
+        maintenance (default 20000).  Lower = faster but noisier.
     """
 
     step_visual      = QtCore.Signal(int, float, object, object, object)
@@ -251,9 +271,10 @@ class OptimizationWorker(QtCore.QThread):
         batch_fraction: float | None = None,
         batch_size: int | None = None,
         maintenance_every: int = 200,
-        containment_thresh: float = 0.8,
+        miss_penalty_weight: float = 3.0,
         max_prune_fraction: float = 0.15,
         min_volume_abs: float = 1e-8,
+        coverage_sample_size: int = 20000,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
@@ -269,9 +290,10 @@ class OptimizationWorker(QtCore.QThread):
         self._stop_flag = False
 
         self._maintenance_every = maintenance_every
-        self._containment_thresh = containment_thresh
+        self._miss_penalty_weight = miss_penalty_weight
         self._max_prune_fraction = max_prune_fraction
         self._min_volume_abs = min_volume_abs
+        self._coverage_sample_size = coverage_sample_size
 
         total = n * n * n
         if batch_size is not None:
@@ -412,7 +434,7 @@ class OptimizationWorker(QtCore.QThread):
         )
 
     # ══════════════════════════════════════════════════════════════════
-    # CONSERVATIVE POPULATION MANAGEMENT
+    # COVERAGE-BASED POPULATION MANAGEMENT
     # ══════════════════════════════════════════════════════════════════
 
     def _do_maintenance(
@@ -421,7 +443,7 @@ class OptimizationWorker(QtCore.QThread):
         radii: np.ndarray,
         rotations: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, int, int]:
-        """Conservative prune + spawn.
+        """Coverage-based prune + spawn.
 
         Returns (centers, radii, rotations, changed, n_pruned, n_spawned).
         """
@@ -429,15 +451,11 @@ class OptimizationWorker(QtCore.QThread):
         budget = max(1, int(n_before * self._max_prune_fraction))
 
         # ── 1. Remove clearly degenerate ellipsoids ──────────────────
-        #    (collapsed to near-zero volume — absolute threshold so
-        #     large ellipsoids are never affected by this)
         volumes = np.prod(np.abs(radii), axis=1)
         vol_ok = volumes > self._min_volume_abs
         n_degenerate = int(np.count_nonzero(~vol_ok))
 
-        # Don't blow budget on degenerates alone
         if n_degenerate > budget:
-            # Remove only the smallest ones up to budget
             degen_idx = np.where(~vol_ok)[0]
             degen_vols = volumes[degen_idx]
             keep_from_degen = degen_idx[np.argsort(degen_vols)[-max(0, n_degenerate - budget):]]
@@ -449,18 +467,13 @@ class OptimizationWorker(QtCore.QThread):
         n_removed = n_before - len(centers)
         budget -= n_removed
 
-        # ── 2. Containment-based pruning ─────────────────────────────
-        #    Iterate from smallest to largest volume.  A small ellipsoid
-        #    is redundant only if:
-        #      (a) its centre is *inside* a larger ellipsoid
-        #          (normalised distance < containment_thresh), AND
-        #      (b) ALL its radii are smaller than the larger one's.
-        #    The larger ellipsoid is NEVER removed.
+        # ── 2. Coverage-based pruning ─────────────────────────────────
+        #    An ellipsoid is redundant only if it has ZERO unique coverage:
+        #    no interior voxel where it is the sole provider of negative SDF.
+        #    This correctly preserves thin structures (arms, fingers) even
+        #    when their centre sits inside a larger body ellipsoid.
         if budget > 0 and len(centers) >= 2:
-            contained = self._find_contained(centers, radii, rotations)
-            # contained is a list of indices, sorted smallest-volume first.
-            # Remove at most `budget` of them.
-            to_remove = contained[:budget]
+            to_remove = self._coverage_based_pruning(centers, radii, rotations, budget)
             if len(to_remove) > 0:
                 keep_mask = np.ones(len(centers), dtype=bool)
                 keep_mask[to_remove] = False
@@ -486,69 +499,100 @@ class OptimizationWorker(QtCore.QThread):
         changed = n_pruned > 0 or n_spawned > 0
         return centers, radii, rotations, changed, n_pruned, n_spawned
 
-    # ── containment check ─────────────────────────────────────────────
+    # ── SDF helper (numpy, single ellipsoid) ──────────────────────────
 
-    def _find_contained(
+    @staticmethod
+    def _ellipsoid_sdf_np(
+        center: np.ndarray,
+        radii: np.ndarray,
+        rotation_quat: np.ndarray,
+        points: np.ndarray,
+    ) -> np.ndarray:
+        """MertStein hybrid SDF for one ellipsoid at (N, 3) points (numpy)."""
+        R = _quat_to_rot_matrix(rotation_quat)
+        delta = points.astype(np.float64) - center.astype(np.float64)
+        local_p = (R.T @ delta.T).T          # (N, 3)
+        r = np.abs(radii).astype(np.float64)
+        r_safe = np.maximum(r, 1e-12)
+
+        scaled = local_p / r_safe[np.newaxis, :]
+        k0 = np.linalg.norm(scaled, axis=1)  # (N,)
+
+        r_min = float(r.min())
+        scaled2 = local_p / np.maximum(r_safe ** 2, 1e-24)[np.newaxis, :]
+        k1 = np.maximum(np.linalg.norm(scaled2, axis=1), 1e-8)
+
+        inside  = (k0 - 1.0) * r_min
+        outside = k0 * (k0 - 1.0) / k1
+        return np.where(k0 < 1.0, inside, outside).astype(np.float32)
+
+    # ── coverage-based pruning ────────────────────────────────────────
+
+    def _coverage_based_pruning(
         self,
         centers: np.ndarray,
         radii: np.ndarray,
         rotations: np.ndarray,
+        budget: int,
     ) -> list[int]:
-        """Find small ellipsoids whose centre sits inside a larger one
-        and whose radii are all smaller → truly redundant.
+        """Find ellipsoids with zero unique SDF coverage of mesh interior.
 
-        Returns a list of indices to remove, ordered by ascending volume
-        (smallest first = safest to remove).
+        For each sampled interior voxel we count how many ellipsoids have
+        negative SDF (i.e., the voxel is inside them).  An ellipsoid has
+        *unique* coverage if at least one voxel is covered by it alone.
+        Ellipsoids with zero unique coverage are purely redundant — removing
+        them does not uncover any interior region.
+
+        Returns a list of indices to remove (at most `budget`), sorted by
+        ascending total coverage so the least-contributing ones go first.
         """
-        n = len(centers)
-        volumes = np.prod(np.abs(radii), axis=1)
+        n = self._n
+        dx = self._dx
+        origin = self._origin
+        flat_target = self._sdf_target_np.ravel()
 
-        # Process from smallest to largest — only the small one can be removed
-        order = np.argsort(volumes)  # ascending volume
+        interior_idx = np.where(flat_target < 0.0)[0]
+        if len(interior_idx) == 0 or len(centers) < 2:
+            return []
 
-        # Precompute rotation matrices for each ellipsoid
-        rot_mats = np.stack([_quat_to_rot_matrix(rotations[i]) for i in range(n)])
+        # Sample interior voxels for efficiency
+        sample_size = min(self._coverage_sample_size, len(interior_idx))
+        rng = np.random.default_rng(0)
+        sample_idx = rng.choice(interior_idx, size=sample_size, replace=False)
 
-        contained_indices: list[int] = []
-        removed_set: set[int] = set()
+        iz, iy, ix = np.unravel_index(sample_idx, (n, n, n))
+        pts = (
+            origin
+            + (np.stack([ix, iy, iz], axis=1).astype(np.float32) + 0.5) * dx
+        )
 
-        for rank in range(n):
-            i_small = order[rank]
-            if i_small in removed_set:
-                continue
+        num_e = len(centers)
 
-            r_small = np.abs(radii[i_small])
+        # per_sdf[i, j] = SDF of ellipsoid i at sampled point j
+        per_sdf = np.stack([
+            self._ellipsoid_sdf_np(centers[i], radii[i], rotations[i], pts)
+            for i in range(num_e)
+        ])  # (num_e, sample_size)
 
-            for rank_big in range(n - 1, rank, -1):
-                i_big = order[rank_big]
-                if i_big in removed_set:
-                    continue
+        is_inside = per_sdf < 0.0            # (num_e, sample_size)
+        cover_count = is_inside.sum(axis=0)  # how many ellipsoids cover each voxel
 
-                r_big = np.abs(radii[i_big])
+        # Unique coverage: voxels where THIS ellipsoid is the only one inside
+        unique_coverage = np.array([
+            int(np.sum(is_inside[i] & (cover_count == 1)))
+            for i in range(num_e)
+        ])
+        total_coverage = is_inside.sum(axis=1).astype(int)
 
-                # Quick reject: if any small radius >= big radius, not contained
-                if np.any(r_small >= r_big):
-                    continue
+        # Candidates: zero unique coverage (truly redundant)
+        zero_unique = np.where(unique_coverage == 0)[0]
+        if len(zero_unique) == 0:
+            return []
 
-                # Transform small's centre into big's local frame
-                delta = (centers[i_small] - centers[i_big]).astype(np.float64)
-                R_big = rot_mats[i_big]  # (3,3)
-                local_p = R_big.T @ delta  # inverse rotation
-
-                # Normalised ellipsoid distance: |p / r|
-                # < 1.0 means inside the ellipsoid surface
-                r_big_f64 = r_big.astype(np.float64)
-                normalised = local_p / np.maximum(r_big_f64, 1e-12)
-                norm_dist = float(np.linalg.norm(normalised))
-
-                if norm_dist < self._containment_thresh:
-                    # Centre is well inside the big ellipsoid AND
-                    # all radii are smaller → this small one is redundant
-                    contained_indices.append(int(i_small))
-                    removed_set.add(i_small)
-                    break  # i_small is gone, move on
-
-        return contained_indices
+        # Sort by total coverage ascending (remove most redundant first)
+        sort_order = np.argsort(total_coverage[zero_unique])
+        sorted_candidates = zero_unique[sort_order].tolist()
+        return sorted_candidates[:budget]
 
     # ── spawning ──────────────────────────────────────────────────────
 
@@ -753,9 +797,10 @@ class OptimizationWorker(QtCore.QThread):
                 )
                 loss.zero_()
                 wp.launch(
-                    _rmse_loss_kernel_batch,
+                    _loss_kernel_batch,
                     dim=bs,
-                    inputs=[sdf_pred, sdf_target, wp_indices, loss, bs],
+                    inputs=[sdf_pred, sdf_target, wp_indices, loss, bs,
+                            float(self._miss_penalty_weight)],
                     device=device,
                 )
 
@@ -844,9 +889,10 @@ class OptimizationWorker(QtCore.QThread):
                 )
                 loss.zero_()
                 wp.launch(
-                    _rmse_loss_kernel_batch,
+                    _loss_kernel_batch,
                     dim=bs,
-                    inputs=[sdf_pred, sdf_target, wp_indices, loss, bs],
+                    inputs=[sdf_pred, sdf_target, wp_indices, loss, bs,
+                            float(self._miss_penalty_weight)],
                     device=device,
                 )
 
