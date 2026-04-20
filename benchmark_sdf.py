@@ -27,6 +27,23 @@ import numpy as np
 
 from PySide6 import QtCore, QtWidgets, QtGui
 
+# ── Warp GPU-Beschleunigung (optional) ───────────────────────────────────────
+try:
+    import warp as wp
+    from warp_sdf import WarpSdfEvaluator, KERNELS as _WARP_KERNELS
+    _WARP_AVAILABLE = bool(wp.is_cuda_available())
+except Exception:
+    _WARP_AVAILABLE = False
+
+_warp_eval: "WarpSdfEvaluator | None" = None
+
+
+def _get_warp_eval() -> "WarpSdfEvaluator":
+    global _warp_eval
+    if _warp_eval is None:
+        _warp_eval = WarpSdfEvaluator(device="cuda:0")
+    return _warp_eval
+
 import matplotlib
 matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -309,6 +326,51 @@ def sdf_newton_step(points: np.ndarray, radii: np.ndarray) -> np.ndarray:
     return np.where(inside, -dist, dist)
 
 
+# ── Neural SDF wrapper ───────────────────────────────────────────────────────
+
+_NEURAL_NET    = None   # EllipsoidSDFNet, gesetzt über die UI
+_NEURAL_DEVICE = "cpu"
+
+
+def sdf_neural(points: np.ndarray, radii: np.ndarray) -> np.ndarray:
+    """Neural-Network SDF Approximation (benötigt geladenes Modell)."""
+    return _NEURAL_NET.predict_np(
+        radii.astype(np.float32),
+        points.astype(np.float32),
+        device=_NEURAL_DEVICE,
+    ).astype(np.float64)
+
+
+def _load_neural_model(path: str) -> str:
+    """
+    Lädt ein EllipsoidSDFNet aus *path* und hängt es in METHODS ein.
+    Gibt eine Status-Meldung zurück.
+    """
+    global _NEURAL_NET, _NEURAL_DEVICE
+    try:
+        from neural_sdf import EllipsoidSDFTrainer
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        trainer = EllipsoidSDFTrainer.load(path, device=device)
+        _NEURAL_NET    = trainer.net
+        _NEURAL_DEVICE = device
+        if not any(m[0] == "Neural" for m in METHODS):
+            METHODS.append(("Neural", sdf_neural, "Neural"))
+        return f"✓  {path}  [{device.upper()}]"
+    except Exception as exc:
+        return f"Fehler: {exc}"
+
+
+def _unload_neural_model():
+    """Entfernt das Neural-Modell und nimmt es aus METHODS heraus."""
+    global _NEURAL_NET
+    _NEURAL_NET = None
+    for i, m in enumerate(METHODS):
+        if m[0] == "Neural":
+            METHODS.pop(i)
+            break
+
+
 # Method registry: (display_name, function, short_name_for_plots)
 METHODS = [
     ("Quílez",                sdf_quilez,        "Quílez"),
@@ -361,13 +423,38 @@ def _compute_metrics(error, gt, radii):
     )
 
 
-def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5):
+def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5, use_gpu=False):
     """Run the full benchmark for a given set of radii.
+
+    Args:
+        radii_tuple:     (rx, ry, rz)
+        grid_n:          Aufloesung der 2-D-Schnitte
+        timing_repeats:  Wiederholungen fuer Median-Timing
+        use_gpu:         True → GPU-parallele Warp-Kernel statt NumPy (CUDA noetig)
 
     Returns a dict with everything needed for plotting.
     """
     radii = np.array(radii_tuple, dtype=np.float64)
     extent = np.max(radii) * 2.0
+
+    # GPU-Dispatch vorbereiten
+    use_warp = use_gpu and _WARP_AVAILABLE
+    if use_warp:
+        ev = _get_warp_eval()
+        _gpu_dispatch = {
+            "Quílez":                ev.quilez,
+            "Scaled (min r)":        ev.scaled_min,
+            "Scaled (mean r)":       ev.scaled_mean,
+            "Scaled (geom. mean r)": ev.scaled_gmean,
+        }
+    else:
+        _gpu_dispatch = {}
+
+    def _eval(name, func, points):
+        """Dispatch: GPU-Kernel wenn verfuegbar, sonst NumPy."""
+        if use_warp and name in _gpu_dispatch:
+            return _gpu_dispatch[name](points, radii)
+        return func(points, radii)
 
     # ── 2-D slices ────────────────────────────────────────────────────
     slices = {}
@@ -378,7 +465,7 @@ def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5):
 
         methods_data = {}
         for name, func, short in METHODS:
-            sdf = func(points, radii)
+            sdf = _eval(name, func, points)
             error = sdf - gt
             metrics = _compute_metrics(error, gt, radii)
             methods_data[name] = dict(
@@ -396,10 +483,8 @@ def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5):
 
     # ── Radial error profile (rays from center, XY plane) ──────────────
     n_radial = 500
-    # Normalized distance: 0 = center, 1 = surface, 2 = far outside
     t_norm = np.linspace(0.01, 2.0, n_radial)
 
-    # Rays along principal axes + diagonals in XY
     ray_dirs = {
         "x-Achse":   np.array([1.0, 0.0, 0.0]),
         "y-Achse":   np.array([0.0, 1.0, 0.0]),
@@ -408,10 +493,6 @@ def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5):
 
     radial_data = dict(t_norm=t_norm, rays={})
     for ray_label, direction in ray_dirs.items():
-        # Scale direction so that t_norm=1 hits the ellipsoid surface
-        # Surface point: p_i = d_i * r_i  such that |p/r| = 1
-        # For direction d: surface at t where |(t*d)/r| = 1
-        #   t_surface = 1 / |d/r|
         d_over_r = direction / radii
         t_surface = 1.0 / np.linalg.norm(d_over_r)
 
@@ -420,17 +501,18 @@ def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5):
 
         ray_result = dict(gt=gt_rad)
         for name, func, short in METHODS:
-            ray_result[name] = func(points, radii) - gt_rad
+            ray_result[name] = _eval(name, func, points) - gt_rad
         radial_data["rays"][ray_label] = ray_result
 
-    # ── Timing (3-D grid, smaller) ────────────────────────────────────
+    # ── Timing (3-D grid, kleiner) ────────────────────────────────────
     tn = 48
     tc = np.linspace(-extent, extent, tn)
     xx, yy, zz = np.meshgrid(tc, tc, tc, indexing="ij")
     pts3d = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
 
     timing = {}
-    # Ground truth
+
+    # Ground truth immer per CPU (kein GPU-Pendant)
     times = []
     for _ in range(timing_repeats):
         t0 = time.perf_counter()
@@ -438,13 +520,48 @@ def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5):
         times.append(time.perf_counter() - t0)
     timing["Ground Truth"] = float(np.median(times)) * 1000.0
 
-    for name, func, short in METHODS:
-        times = []
-        for _ in range(timing_repeats):
-            t0 = time.perf_counter()
-            func(pts3d, radii)
-            times.append(time.perf_counter() - t0)
-        timing[name] = float(np.median(times)) * 1000.0
+    if use_warp:
+        # Punkte einmalig hochladen + Kernels aufwaermen (JIT)
+        ev.upload_points(pts3d)
+        ev.warmup(radii)
+
+        for name, func, short in METHODS:
+            if name in _WARP_KERNELS:
+                kernel = _WARP_KERNELS[name]
+                times = []
+                for _ in range(timing_repeats):
+                    t0 = time.perf_counter()
+                    ev.run_kernel(kernel, radii)
+                    wp.synchronize()
+                    times.append(time.perf_counter() - t0)
+            elif name == "Neural" and _NEURAL_NET is not None \
+                    and str(_NEURAL_DEVICE).startswith("cuda"):
+                # Neural laeuft bereits auf CUDA via PyTorch —
+                # torch.cuda.synchronize() fuer genaues Timing noetig
+                import torch
+                func(pts3d, radii)           # Warmup
+                torch.cuda.synchronize()
+                times = []
+                for _ in range(timing_repeats):
+                    t0 = time.perf_counter()
+                    func(pts3d, radii)
+                    torch.cuda.synchronize()
+                    times.append(time.perf_counter() - t0)
+            else:
+                times = []
+                for _ in range(timing_repeats):
+                    t0 = time.perf_counter()
+                    func(pts3d, radii)
+                    times.append(time.perf_counter() - t0)
+            timing[name] = float(np.median(times)) * 1000.0
+    else:
+        for name, func, short in METHODS:
+            times = []
+            for _ in range(timing_repeats):
+                t0 = time.perf_counter()
+                func(pts3d, radii)
+                times.append(time.perf_counter() - t0)
+            timing[name] = float(np.median(times)) * 1000.0
 
     return dict(
         radii=radii,
@@ -454,6 +571,7 @@ def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5):
         radial=radial_data,
         timing=timing,
         aspect_ratio=float(np.max(radii) / np.min(radii)),
+        methods_used=list(METHODS),   # Snapshot – bleibt konsistent bei Modell-Wechsel
     )
 
 
@@ -507,6 +625,18 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         self._btn_run.clicked.connect(self._on_run)
         bar.addWidget(self._btn_run)
 
+        self._chk_gpu = QtWidgets.QCheckBox("GPU  (Warp)")
+        self._chk_gpu.setChecked(False)
+        self._chk_gpu.setEnabled(_WARP_AVAILABLE)
+        self._chk_gpu.setToolTip(
+            "Parallele Warp-CUDA-Kernel statt NumPy"
+            if _WARP_AVAILABLE else
+            "Nicht verfuegbar  (Warp / CUDA fehlt)"
+        )
+        bar.addWidget(self._chk_gpu)
+
+        bar.addSpacing(10)
+
         self._chk_interior = QtWidgets.QCheckBox("Nur Interior (SDF < 0)")
         self._chk_interior.setChecked(False)
         self._chk_interior.setToolTip("Fehler nur für Punkte innerhalb des Ellipsoids berechnen")
@@ -527,6 +657,35 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
 
         root.addLayout(bar)
 
+        # ── Neural model loader ───────────────────────────────────────
+        neural_bar = QtWidgets.QHBoxLayout()
+        neural_bar.setSpacing(8)
+
+        neural_bar.addWidget(QtWidgets.QLabel("Neural SDF Modell:"))
+
+        self._edit_model_path = QtWidgets.QLineEdit()
+        self._edit_model_path.setReadOnly(True)
+        self._edit_model_path.setPlaceholderText("Kein Modell geladen")
+        self._edit_model_path.setFixedWidth(380)
+        neural_bar.addWidget(self._edit_model_path)
+
+        btn_load = QtWidgets.QPushButton("Laden …")
+        btn_load.setFixedHeight(26)
+        btn_load.clicked.connect(self._on_load_model)
+        neural_bar.addWidget(btn_load)
+
+        btn_unload = QtWidgets.QPushButton("Entfernen")
+        btn_unload.setFixedHeight(26)
+        btn_unload.clicked.connect(self._on_unload_model)
+        neural_bar.addWidget(btn_unload)
+
+        self._lbl_model_status = QtWidgets.QLabel("–")
+        self._lbl_model_status.setStyleSheet("color: #888; font-style: italic;")
+        neural_bar.addWidget(self._lbl_model_status)
+
+        neural_bar.addStretch()
+        root.addLayout(neural_bar)
+
         # ── Matplotlib figure ─────────────────────────────────────────
         self._fig = Figure(figsize=(24, 13), dpi=100, facecolor="#0d1117")
         self._canvas = FigureCanvas(self._fig)
@@ -542,6 +701,32 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         root.addWidget(self._table, stretch=1)
 
         self.setCentralWidget(central)
+
+    # ── Neural model loader ───────────────────────────────────────────
+
+    def _on_load_model(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Neural SDF Modell laden",
+            "", "PyTorch Modell (*.pt);;Alle Dateien (*)"
+        )
+        if not path:
+            return
+        self._edit_model_path.setText(path)
+        self._lbl_model_status.setText("Lade …")
+        QtWidgets.QApplication.processEvents()
+
+        status = _load_neural_model(path)
+        ok = status.startswith("✓")
+        self._lbl_model_status.setText(status)
+        self._lbl_model_status.setStyleSheet(
+            "color: #4ade80;" if ok else "color: #f87171;"
+        )
+
+    def _on_unload_model(self):
+        _unload_neural_model()
+        self._edit_model_path.clear()
+        self._lbl_model_status.setText("–")
+        self._lbl_model_status.setStyleSheet("color: #888; font-style: italic;")
 
     @staticmethod
     def _make_spin(val, lo, hi):
@@ -564,8 +749,9 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         self._btn_run.setEnabled(False)
         QtWidgets.QApplication.processEvents()
 
+        use_gpu = self._chk_gpu.isChecked() and _WARP_AVAILABLE
         t0 = time.perf_counter()
-        results = run_benchmark((rx, ry, rz), grid_n=n)
+        results = run_benchmark((rx, ry, rz), grid_n=n, use_gpu=use_gpu)
         elapsed = time.perf_counter() - t0
 
         self._last_results = results
@@ -599,7 +785,8 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
     def _update_figure(self, res):
         self._fig.clear()
 
-        n_methods = len(METHODS)
+        methods = res["methods_used"]
+        n_methods = len(methods)
         n_cols = 1 + n_methods  # GT + methods
         interior_only = self._chk_interior.isChecked()
 
@@ -635,7 +822,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         error_maps = {}
         mae_vals = {}
         max_err = 0.0
-        for name, _, _ in METHODS:
+        for name, _, _ in methods:
             err = sl["methods"][name]["error"].copy()
             if interior_only:
                 err[~interior_mask] = np.nan
@@ -662,7 +849,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         ax_gt.set_facecolor("#0d1117")
 
         # ── Row 0: SDF — each method ─────────────────────────────────
-        for col_idx, (name, _, short) in enumerate(METHODS):
+        for col_idx, (name, _, short) in enumerate(methods):
             md = sl["methods"][name]
             ax = self._fig.add_subplot(gs[0, col_idx + 1])
             ax.imshow(md["sdf"], cmap="RdYlBu_r",
@@ -688,7 +875,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
             spine.set_color("#333")
 
         # ── Row 1: Error — each method heatmap (red, absolute) ───────
-        for col_idx, (name, _, short) in enumerate(METHODS):
+        for col_idx, (name, _, short) in enumerate(methods):
             ax = self._fig.add_subplot(gs[1, col_idx + 1])
             abs_err = np.abs(error_maps[name])
             ax.imshow(abs_err, cmap="Reds", vmin=0, vmax=max_err, **ext_kw)
@@ -702,14 +889,18 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
             ax.set_facecolor("#0d1117")
 
         # ── Row 2: bar charts + angular profile + timing ──────────────
+        # Spalten proportional aufteilen: ~40 % | ~40 % | ~20 %
+        c1 = max(2, int(round(0.4 * n_cols)))
+        c2 = max(c1 + 1, int(round(0.8 * n_cols)))
+        c2 = min(c2, n_cols - 1)          # timing braucht mind. 1 Spalte
 
-        ax_bar = self._fig.add_subplot(gs[2, 0:3])
+        ax_bar = self._fig.add_subplot(gs[2, 0:c1])
         self._draw_metric_bars(ax_bar, res, text_color)
 
-        ax_rad = self._fig.add_subplot(gs[2, 3:6])
+        ax_rad = self._fig.add_subplot(gs[2, c1:c2])
         self._draw_radial_profile(ax_rad, res, text_color)
 
-        ax_time = self._fig.add_subplot(gs[2, 6:n_cols])
+        ax_time = self._fig.add_subplot(gs[2, c2:n_cols])
         self._draw_timing_bars(ax_time, res, text_color)
 
         # ── Suptitle ──────────────────────────────────────────────────
@@ -731,7 +922,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
 
         sl = res["slices"]["XY"]
         names, mae, rmse, linf = [], [], [], []
-        for name, _, short in METHODS:
+        for name, _, short in res["methods_used"]:
             m = sl["methods"][name]["metrics"][region]
             names.append(short)
             mae.append(m["mae"])
@@ -763,7 +954,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
                          "#ff9f43", "#1abc9c", "#e74c3c", "#3498db"]
         line_styles = ["-", "--", ":"]
 
-        for i, (name, _, short) in enumerate(METHODS):
+        for i, (name, _, short) in enumerate(res["methods_used"]):
             for j, (ray_label, ray_data) in enumerate(rad["rays"].items()):
                 label = f"{short} ({ray_label})" if j == 0 or i == 0 else None
                 # Only label method on first ray, ray on first method
@@ -781,7 +972,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         # Manual legend: methods as colored lines, rays as line styles
         from matplotlib.lines import Line2D
         handles = []
-        for i, (name, _, short) in enumerate(METHODS):
+        for i, (name, _, short) in enumerate(res["methods_used"]):
             handles.append(Line2D([0], [0], color=method_colors[i % len(method_colors)],
                                   linewidth=1.5, label=short))
         for j, ray_label in enumerate(rad["rays"].keys()):
@@ -808,7 +999,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         timing = res["timing"]
         names = list(timing.keys())
         values = list(timing.values())
-        short_names = ["Exakt"] + [s for _, _, s in METHODS]
+        short_names = ["Exakt"] + [s for _, _, s in res["methods_used"]]
 
         colors = ["#888"] + ["#f2e641", "#4962f2", "#50c878", "#c878ff",
                               "#ff9f43", "#1abc9c", "#e74c3c", "#3498db"]
@@ -844,12 +1035,13 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         t = self._table
         t.clear()
         t.setColumnCount(len(headers))
-        t.setRowCount(len(METHODS))
+        methods_used = res["methods_used"]
+        t.setRowCount(len(methods_used))
         t.setHorizontalHeaderLabels(headers)
 
         timing = res["timing"]
 
-        for row, (name, _, short) in enumerate(METHODS):
+        for row, (name, _, short) in enumerate(methods_used):
             md = sl["methods"][name]
             t.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
 
