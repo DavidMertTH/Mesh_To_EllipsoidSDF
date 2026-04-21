@@ -9,11 +9,12 @@ import warp as wp
 
 
 # ── SDF method constants ──────────────────────────────────────────────────────
-SDF_QUILEZ  = 0
-SDF_SC_MIN  = 1
-SDF_SC_MEAN = 2
-SDF_SC_GMEAN = 3
+SDF_QUILEZ    = 0
+SDF_SC_MIN    = 1
+SDF_SC_MEAN   = 2
+SDF_SC_GMEAN  = 3
 SDF_MERTSTEIN = 4
+SDF_NEURAL    = 5
 
 SDF_METHOD_NAMES = {
     SDF_QUILEZ:    "Quílez",
@@ -21,7 +22,50 @@ SDF_METHOD_NAMES = {
     SDF_SC_MEAN:   "Scaled (mean r)",
     SDF_SC_GMEAN:  "Scaled (geom. mean r)",
     SDF_MERTSTEIN: "MertStein",
+    SDF_NEURAL:    "Neural",
 }
+
+
+def _sdf_per_ellipsoid_np(local_p: np.ndarray,
+                           r: np.ndarray,
+                           method: int) -> float:
+    """
+    Analytischer SDF eines einzelnen Ellipsoids am Ursprung (numpy, CPU).
+
+    Args:
+        local_p: (3,) Punkt im lokalen Ellipsoidrahmen
+        r:       (3,) Halbachsen
+        method:  SDF_QUILEZ | SDF_SC_MIN | SDF_SC_MEAN |
+                 SDF_SC_GMEAN | SDF_MERTSTEIN
+
+    Returns:
+        signed distance (float)
+    """
+    scaled = local_p / r
+    k0 = float(np.linalg.norm(scaled))
+
+    if method == SDF_QUILEZ:
+        scaled2 = local_p / (r * r)
+        k1 = max(float(np.linalg.norm(scaled2)), 1e-15)
+        return k0 * (k0 - 1.0) / k1
+
+    if method == SDF_SC_MIN:
+        return (k0 - 1.0) * float(r.min())
+
+    if method == SDF_SC_MEAN:
+        return (k0 - 1.0) * float(r.mean())
+
+    if method == SDF_SC_GMEAN:
+        return (k0 - 1.0) * float((r[0] * r[1] * r[2]) ** (1.0 / 3.0))
+
+    if method == SDF_MERTSTEIN:
+        if k0 < 1.0:
+            return (k0 - 1.0) * float(r.min())
+        scaled2 = local_p / (r * r)
+        k1 = max(float(np.linalg.norm(scaled2)), 1e-15)
+        return k0 * (k0 - 1.0) / k1
+
+    raise ValueError(f"Unbekannte SDF-Methode: {method}")
 
 
 def best_device() -> str:
@@ -120,6 +164,7 @@ class EllipsoidSet:
         self.radii: np.ndarray = np.empty((0, 3), dtype=np.float32)
         self.rotations: np.ndarray = np.empty((0, 4), dtype=np.float32)
         self.colors: list = None
+        self._neural_net = None  # EllipsoidSDFNet, gesetzt via set_neural_model()
 
 
     @classmethod
@@ -162,6 +207,9 @@ class EllipsoidSet:
         if self.count == 0:
             return np.full((n, n, n), 1e6, dtype=np.float32)
 
+        if sdf_mode == SDF_NEURAL:
+            return self._compute_sdf_grid_neural(origin, dx, n)
+
         wp_centers = wp.array(self.centers, dtype=wp.vec3, device=self.device)
         wp_radii = wp.array(self.radii, dtype=wp.vec3, device=self.device)
         wp_rotations = wp.array(self.rotations, dtype=wp.quat, device=self.device)
@@ -187,6 +235,127 @@ class EllipsoidSet:
 
         return out.numpy().reshape((nz, ny, nx)).astype(np.float32, copy=False)
 
+
+    # ── Neuronales Netz ───────────────────────────────────────────────────
+
+    def set_neural_model(self, net) -> None:
+        """
+        Lade ein trainiertes :class:`neural_sdf.EllipsoidSDFNet` für diese
+        EllipsoidSet-Instanz.  Danach kann ``sdf_mode=SDF_NEURAL`` in
+        :meth:`compute_sdf_grid` und :meth:`query_point` verwendet werden.
+
+        Args:
+            net: EllipsoidSDFNet-Instanz (oder None zum Entfernen)
+
+        Beispiel::
+
+            from neural_sdf import EllipsoidSDFTrainer
+            trainer = EllipsoidSDFTrainer.load("ellipsoid_sdf.pt")
+            es.set_neural_model(trainer.net)
+        """
+        self._neural_net = net
+
+    # ── Einzelpunkt-Abfrage ───────────────────────────────────────────────
+
+    def query_point(self,
+                    p_world,
+                    method: int = SDF_MERTSTEIN) -> float:
+        """
+        SDF an einem einzelnen Weltkoordinatenpunkt.
+
+        Funktioniert für alle analytischen Methoden sowie SDF_NEURAL
+        (wenn vorher :meth:`set_neural_model` aufgerufen wurde).
+
+        Args:
+            p_world: (3,) Punkt in Weltkoordinaten
+            method:  SDF_QUILEZ | SDF_SC_MIN | SDF_SC_MEAN |
+                     SDF_SC_GMEAN | SDF_MERTSTEIN | SDF_NEURAL
+
+        Returns:
+            signed distance (float)
+        """
+        if self.count == 0:
+            return 1.0e6
+
+        from neural_sdf import quat_rotate_inv_np
+
+        p = np.asarray(p_world, dtype=np.float32)
+        min_d = 1.0e6
+
+        if method == SDF_NEURAL:
+            if self._neural_net is None:
+                raise RuntimeError(
+                    "Kein neuronales Modell geladen. "
+                    "Bitte zuerst set_neural_model() aufrufen."
+                )
+            import torch
+            from neural_sdf import eval_union_cuda
+
+            net = self._neural_net
+            dev = next(net.parameters()).device
+            pts_t     = torch.as_tensor(p[np.newaxis],    dtype=torch.float32, device=dev)
+            centers_t = torch.as_tensor(self.centers,     dtype=torch.float32, device=dev)
+            radii_t   = torch.as_tensor(self.radii,       dtype=torch.float32, device=dev)
+            rots_t    = torch.as_tensor(self.rotations,   dtype=torch.float32, device=dev)
+            return float(eval_union_cuda(net, pts_t, centers_t, radii_t, rots_t)[0])
+        else:
+            for i in range(self.count):
+                local_p = quat_rotate_inv_np(
+                    self.rotations[i], (p - self.centers[i]).astype(np.float64)
+                ).astype(np.float32)
+                d = _sdf_per_ellipsoid_np(local_p, self.radii[i], method)
+                if d < min_d:
+                    min_d = d
+
+        return float(min_d)
+
+    # ── Neuronales SDF-Gitter ─────────────────────────────────────────────
+
+    def _compute_sdf_grid_neural(self,
+                                  origin: np.ndarray,
+                                  dx: float,
+                                  n: int) -> np.ndarray:
+        """
+        Berechne das SDF-Gitter mit dem neuronalen Netz (PyTorch-Pfad).
+
+        Alle Ellipsoide werden in einem einzigen gebatchten Vorwärtspass
+        ausgewertet (via eval_union_cuda), ohne Python-Schleife über
+        Ellipsoide.
+
+        Args:
+            origin: (3,) Weltkoordinaten der unteren Gitterecke
+            dx:     Voxelgröße
+            n:      Auflösung (n³ Voxel)
+
+        Returns:
+            (n, n, n) float32 SDF-Gitter
+        """
+        import torch
+        from neural_sdf import eval_union_cuda
+
+        if self._neural_net is None:
+            raise RuntimeError(
+                "Kein neuronales Modell geladen. "
+                "Bitte zuerst set_neural_model() aufrufen."
+            )
+
+        net = self._neural_net
+        dev = next(net.parameters()).device
+
+        # Gitterpunkte in Weltkoordinaten (n³, 3)
+        idx    = np.arange(n, dtype=np.float32)
+        coords = origin.astype(np.float32) + (idx + 0.5) * float(dx)
+        zg, yg, xg = np.meshgrid(coords, coords, coords, indexing="ij")
+        pts_np = np.stack([xg, yg, zg], axis=-1).reshape(-1, 3)
+
+        pts_t      = torch.as_tensor(pts_np,         dtype=torch.float32, device=dev)
+        centers_t  = torch.as_tensor(self.centers,   dtype=torch.float32, device=dev)
+        radii_t    = torch.as_tensor(self.radii,     dtype=torch.float32, device=dev)
+        rots_t     = torch.as_tensor(self.rotations, dtype=torch.float32, device=dev)
+
+        min_sdf = eval_union_cuda(net, pts_t, centers_t, radii_t, rots_t)
+
+        return min_sdf.cpu().numpy().reshape(n, n, n).astype(np.float32)
 
     def generate_meshes(self, subdivisions: int = 3) -> List[trimesh.Trimesh]:
 
