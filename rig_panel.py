@@ -48,6 +48,8 @@ class RigModePanel(QtWidgets.QGroupBox):
     poseChanged = QtCore.Signal(int)
     multiPoseRequested = QtCore.Signal()
     rigModeToggled = QtCore.Signal(bool)
+    autoPipelineRequested = QtCore.Signal()
+    exportUnityRequested = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__("Rig Mode", parent)
@@ -174,6 +176,20 @@ class RigModePanel(QtWidgets.QGroupBox):
 
         layout.addLayout(train_form)
 
+        # ── One-click auto pipeline ──
+        self._btn_auto = QtWidgets.QPushButton("▶ Auto Fit All Poses")
+        self._btn_auto.setToolTip(
+            "Automatically: fit T-pose ellipsoids → assign to bones → train all poses"
+        )
+        self._btn_auto.setEnabled(False)
+        self._btn_auto.setStyleSheet(
+            "font-weight: bold; background-color: #2d7d32; color: white; padding: 4px;"
+        )
+        self._btn_auto.clicked.connect(lambda: self.autoPipelineRequested.emit())
+        layout.addWidget(self._btn_auto)
+
+        layout.addWidget(QtWidgets.QLabel("— or step-by-step —"))
+
         btn_row = QtWidgets.QHBoxLayout()
 
         self._btn_assign = QtWidgets.QPushButton("1. Assign to Bones")
@@ -193,6 +209,15 @@ class RigModePanel(QtWidgets.QGroupBox):
         btn_row.addWidget(self._btn_multipose)
 
         layout.addLayout(btn_row)
+
+        # ── Unity export ──
+        self._btn_export = QtWidgets.QPushButton("⬆ Export for Unity (.json)")
+        self._btn_export.setToolTip(
+            "Export bone-local ellipsoids to JSON for import into Unity"
+        )
+        self._btn_export.setEnabled(False)
+        self._btn_export.clicked.connect(lambda: self.exportUnityRequested.emit())
+        layout.addWidget(self._btn_export)
 
         # ── Progress ──
         self._progress = QtWidgets.QProgressBar()
@@ -224,6 +249,7 @@ class RigModePanel(QtWidgets.QGroupBox):
         )
         self._lbl_status.setStyleSheet("color: green; font-size: 11px;")
         self._btn_assign.setEnabled(True)
+        self._btn_auto.setEnabled(True)
         self._on_pose_changed(0)
 
         self.rigLoaded.emit(rigged_mesh)
@@ -232,6 +258,7 @@ class RigModePanel(QtWidgets.QGroupBox):
         """Update bone-local params (after assignment or training)."""
         self._bone_local = bone_local
         self._btn_multipose.setEnabled(True)
+        self._btn_export.setEnabled(True)
 
         # Show bone assignment summary
         if self._mapper:
@@ -242,6 +269,14 @@ class RigModePanel(QtWidgets.QGroupBox):
             summary = ", ".join(f"{n}:{c}" for n, c in
                                 sorted(bone_counts.items(), key=lambda x: -x[1]))
             self._lbl_bones.setText(f"Bone assignment: {summary}")
+
+    def set_auto_pipeline_running(self, running: bool):
+        """Enable/disable the auto pipeline button during training."""
+        self._btn_auto.setEnabled(not running and self._rigged_mesh is not None)
+        if running:
+            self._btn_auto.setText("⏳ Running…")
+        else:
+            self._btn_auto.setText("▶ Auto Fit All Poses")
 
     def set_progress(self, value: int, maximum: int = 100):
         """Update progress bar."""

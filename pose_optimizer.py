@@ -137,7 +137,7 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
         margin: float = 0.5,
         batch_fraction: float = 0.125,
         lr: float = 0.005,
-        maintenance_every: int = 200,
+        maintenance_every: int = 0,
         miss_penalty_weight: float = 3.0,
         parent: QtCore.QObject | None = None,
     ):

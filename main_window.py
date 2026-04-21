@@ -230,6 +230,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rig_panel.poseChanged.connect(self._on_rig_pose_changed)
         self._rig_panel.multiPoseRequested.connect(self._on_multipose_fit_clicked)
         self._rig_panel._btn_assign.clicked.connect(self._on_rig_assign_clicked)
+        self._rig_panel.autoPipelineRequested.connect(self._on_auto_pipeline_clicked)
+        self._rig_panel.exportUnityRequested.connect(self._on_export_unity_clicked)
 
     # ── mesh directory scanning ───────────────────────────────────────────
 
@@ -391,6 +393,42 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Pose {pose_index}: {rm.poses[pose_index].name if pose_index < len(rm.poses) else 'T-Pose'}"
         )
 
+    # ── Rig-mode: one-click auto pipeline ───────────────────────────
+
+    def _on_auto_pipeline_clicked(self):
+        """One-click: initialize ellipsoids from bone structure → multi-pose train."""
+        if not self._rig_panel.is_active:
+            return
+        rm = self._rig_panel.rigged_mesh
+        if rm is None:
+            self._status.showMessage("No rigged mesh loaded.")
+            return
+
+        self.stop_optimization()
+        self._stop_multipose()
+
+        from bone_ellipsoid_mapper import initialize_ellipsoids_from_bones
+
+        n_ellipsoids = self._spin_num_ellipsoids.value()
+        self._status.showMessage("Auto pipeline: initializing ellipsoids from bone structure…")
+        QtWidgets.QApplication.processEvents()
+
+        bone_local = initialize_ellipsoids_from_bones(
+            skeleton=rm.skeleton,
+            vertices=rm.vertices,
+            skin_joints=rm.skin_joints,
+            skin_weights=rm.skin_weights,
+            n_ellipsoids=n_ellipsoids,
+        )
+
+        self._rig_panel.set_bone_local(bone_local)
+        self._rig_panel.set_auto_pipeline_running(True)
+        self._status.showMessage(
+            f"Auto pipeline: training {bone_local.num_ellipsoids} ellipsoids "
+            f"across {len(rm.poses)} poses…"
+        )
+        self._on_multipose_fit_clicked()
+
     # ── Rig-mode: assign to bones ────────────────────────────────────
 
     def _on_rig_assign_clicked(self):
@@ -550,6 +588,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pass  # Could add per-pose loss tracking in the future
 
     def _on_multipose_finished(self):
+        self._rig_panel.set_auto_pipeline_running(False)
         self._status.showMessage("Multi-pose training finished.")
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._btn_stop.setEnabled(False)
@@ -563,6 +602,32 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Update ellipsoid view for current pose
         self._on_rig_pose_changed(self._rig_panel.current_pose_index)
+
+    # ── Unity export ─────────────────────────────────────────────────────────
+
+    def _on_export_unity_clicked(self):
+        """Export bone-local ellipsoids to JSON for Unity."""
+        if not self._rig_panel.is_active:
+            return
+        bl = self._rig_panel.bone_local
+        rm = self._rig_panel.rigged_mesh
+        if bl is None or rm is None:
+            self._status.showMessage("No fitted ellipsoids to export. Run the pipeline first.")
+            return
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Ellipsoids for Unity",
+            str(Path(self._current_mesh_name).stem) + "_ellipsoids.json"
+            if self._current_mesh_name else "ellipsoids.json",
+            "JSON files (*.json)",
+        )
+        if not path:
+            return
+
+        from ellipsoid_exporter import export_ellipsoids
+        n = export_ellipsoids(bl, rm.skeleton, path)
+        self._status.showMessage(f"Exported {n} ellipsoids → {path}")
 
     # ── Original methods (unchanged below) ────────────────────────────────
 
@@ -638,6 +703,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _on_stop_clicked(self):
+        self._rig_panel.set_auto_pipeline_running(False)
         self.stop_optimization()
         self._stop_multipose()
 

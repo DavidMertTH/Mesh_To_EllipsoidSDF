@@ -20,7 +20,8 @@
       "Bash(nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader)",
       "Bash(.venv/Scripts/pip install:*)",
       "Bash(.venv/Scripts/python -c \"import torch; print\\('Version:', torch.__version__\\); print\\('CUDA verfuegbar:', torch.cuda.is_available\\(\\)\\); print\\('GPU:', torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else 'keine'\\)\")",
-      "Bash(.venv/Scripts/python -c ':*)"
+      "Bash(.venv/Scripts/python -c ':*)",
+      "Bash(grep -E \"\\\\.py$|^d\")"
     ]
   }
 }

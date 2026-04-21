@@ -420,3 +420,180 @@ class BoneEllipsoidMapper:
             return "?"
         bi = self._bone_local.bone_assignments[ellipsoid_index]
         return self.skeleton.bones[bi].name
+
+
+# ── Bone-based initialization (no T-pose fit needed) ────────────────────────
+
+def initialize_ellipsoids_from_bones(
+    skeleton: Skeleton,
+    vertices: np.ndarray,
+    skin_joints: np.ndarray,
+    skin_weights: np.ndarray,
+    n_ellipsoids: int = 10,
+    padding: float = 1.2,
+    min_radius: float = 0.02,
+    random_seed: int = 42,
+) -> BoneLocalEllipsoids:
+    """Create BoneLocalEllipsoids directly from the skeleton structure.
+
+    Skips the T-pose fit + assign-to-bones workflow entirely.
+    For each bone, ellipsoids are placed based on the local vertex distribution.
+    Budget is allocated proportionally to vertex count per bone.
+
+    Parameters
+    ----------
+    skeleton       : Skeleton — bone hierarchy
+    vertices       : (V, 3) rest-pose mesh vertices
+    skin_joints    : (V, K) bone indices per vertex
+    skin_weights   : (V, K) blend weights per vertex
+    n_ellipsoids   : total number of ellipsoids to create
+    padding        : radii scale factor applied to the half-range of the point cloud
+    min_radius     : minimum semi-axis length to avoid degenerate ellipsoids
+    random_seed    : for k-means reproducibility
+    """
+    rng = np.random.default_rng(random_seed)
+    n_bones = skeleton.num_bones
+    V = len(vertices)
+
+    # ── 1. Dominant bone per vertex (argmax of skin weights) ──
+    dominant_bone = skin_joints[np.arange(V), np.argmax(skin_weights, axis=1)]
+
+    # ── 2. Budget: how many ellipsoids per bone ──
+    counts = np.bincount(dominant_bone, minlength=n_bones)
+    budget = _allocate_ellipsoid_budget(counts, n_ellipsoids)
+
+    # ── 3. Bone world transforms in T-pose ──
+    world_transforms = skeleton.compute_world_transforms(None)
+
+    all_centers:     list[np.ndarray] = []
+    all_radii:       list[np.ndarray] = []
+    all_rotations:   list[np.ndarray] = []
+    all_assignments: list[int]        = []
+
+    for bi in range(n_bones):
+        k = int(budget[bi])
+        if k == 0:
+            continue
+
+        t_bone, q_bone, _ = mat4_decompose(world_transforms[bi])
+        q_inv = quat_inverse(q_bone)
+
+        # Vertices dominated by this bone → bone-local space
+        bone_verts_world = vertices[dominant_bone == bi]
+        if len(bone_verts_world) == 0:
+            continue
+
+        local_verts = np.array([
+            quat_rotate(q_inv, v.astype(np.float64) - t_bone)
+            for v in bone_verts_world
+        ], dtype=np.float32)
+
+        # Split into k clusters and fit one ellipsoid per cluster
+        clusters = [local_verts] if k == 1 else _kmeans_clusters(local_verts, k, rng)
+
+        for pts in clusters:
+            center, radii = _ellipsoid_from_points(pts, padding, min_radius)
+            all_centers.append(center)
+            all_radii.append(radii)
+            all_rotations.append(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32))
+            all_assignments.append(bi)
+
+    return BoneLocalEllipsoids(
+        local_centers=np.array(all_centers,     dtype=np.float32),
+        local_radii=np.array(all_radii,         dtype=np.float32),
+        local_rotations=np.array(all_rotations, dtype=np.float32),
+        bone_assignments=np.array(all_assignments, dtype=np.int32),
+    )
+
+
+def _allocate_ellipsoid_budget(
+    vertex_counts: np.ndarray,
+    total: int,
+) -> np.ndarray:
+    """Distribute `total` ellipsoids proportionally to per-bone vertex count."""
+    active = vertex_counts > 0
+    n_active = int(active.sum())
+    budget = np.zeros(len(vertex_counts), dtype=np.int32)
+
+    if n_active == 0 or total == 0:
+        return budget
+
+    if n_active >= total:
+        # Give 1 to each of the top-`total` bones by vertex count
+        top = np.argsort(-vertex_counts)[:total]
+        budget[top] = 1
+        return budget
+
+    # Give every active bone at least 1, distribute the remainder proportionally
+    budget[active] = 1
+    remaining = total - n_active
+
+    counts_f = vertex_counts.astype(float)
+    counts_f[~active] = 0.0
+    total_count = counts_f.sum()
+
+    if remaining > 0 and total_count > 0:
+        extra_f = counts_f / total_count * remaining
+        extra_floor = np.floor(extra_f).astype(np.int32)
+        budget += extra_floor
+        leftover = remaining - int(extra_floor.sum())
+        fracs = extra_f - extra_floor
+        fracs[~active] = -1.0
+        top_frac = np.argsort(-fracs)[:leftover]
+        budget[top_frac] += 1
+
+    return budget
+
+
+def _kmeans_clusters(
+    points: np.ndarray,
+    k: int,
+    rng: np.random.Generator,
+    n_iter: int = 30,
+) -> list[np.ndarray]:
+    """K-means++ clustering; returns list of point arrays (one per cluster)."""
+    k = min(k, len(points))
+
+    # K-means++ seeding: spread initial centroids
+    seed_idx = [int(rng.integers(len(points)))]
+    for _ in range(k - 1):
+        dists = np.min(
+            np.linalg.norm(points[:, None] - points[seed_idx][None], axis=2),
+            axis=1,
+        ) ** 2
+        total = dists.sum()
+        probs = dists / total if total > 0 else np.ones(len(points)) / len(points)
+        seed_idx.append(int(rng.choice(len(points), p=probs)))
+
+    centroids = points[seed_idx].copy()
+
+    labels = np.zeros(len(points), dtype=np.int32)
+    for _ in range(n_iter):
+        dists = np.linalg.norm(
+            points[:, None, :] - centroids[None, :, :], axis=2,
+        )  # (N, k)
+        labels = np.argmin(dists, axis=1)
+        new_centroids = np.array([
+            points[labels == ki].mean(axis=0)
+            if np.any(labels == ki) else centroids[ki]
+            for ki in range(k)
+        ])
+        if np.allclose(centroids, new_centroids, atol=1e-6):
+            break
+        centroids = new_centroids
+
+    return [points[labels == ki] for ki in range(k) if np.any(labels == ki)]
+
+
+def _ellipsoid_from_points(
+    points: np.ndarray,
+    padding: float = 1.2,
+    min_r: float = 0.02,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit an axis-aligned ellipsoid (center + radii) to a point cloud."""
+    center = points.mean(axis=0).astype(np.float32)
+    if len(points) < 2:
+        return center, np.full(3, min_r, dtype=np.float32)
+    half_range = (points.max(axis=0) - points.min(axis=0)) / 2.0
+    radii = np.maximum(half_range * padding, min_r).astype(np.float32)
+    return center, radii
