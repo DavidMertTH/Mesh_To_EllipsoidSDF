@@ -71,6 +71,9 @@ class PoseSdfData:
         self.origin = origin
         self.dx = dx
         self.n = n
+        # Per-axis voxel counts (grid may be anisotropic; each pose's deformed
+        # mesh has its own AABB → its own shape).  ``grid.shape == (nz, ny, nx)``.
+        self.nz, self.ny, self.nx = (int(s) for s in sdf_grid.shape)
         self.bone_positions = bone_positions
         self.bone_rotations = bone_rotations
         self.deformed_verts = deformed_verts
@@ -219,7 +222,7 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
             # Compute SDF
             sdf_computer.set_mesh(deformed_verts, self._faces)
             result = sdf_computer.compute_voxel_grid(
-                n=self._grid_n, margin=self._margin,
+                n=self._grid_n, margin=self._margin, compute_thickness=False,
             )
 
             # Get bone transforms for this pose
@@ -252,7 +255,11 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
         bl = self._bone_local
         N = bl.num_ellipsoids
         n = self._grid_n
-        total = n * n * n
+        # Per-pose grids may be anisotropic with differing voxel counts (each
+        # pose's deformed mesh has its own AABB).  Size the shared batch from the
+        # SMALLEST pose grid so every per-pose sampler has enough flat indices.
+        pose_totals = [int(pd.sdf_grid.size) for pd in pose_data]
+        total = min(pose_totals) if pose_totals else n * n * n
 
         # ── Upload bone-local params (trainable) ──
         pred_local_centers = wp.array(
@@ -297,7 +304,7 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
         grads = [p.grad.flatten() for p in params]
 
         # ── Per-pose sampler ──
-        samplers = [EpochSampler(total, bs) for _ in pose_data]
+        samplers = [EpochSampler(t, bs) for t in pose_totals]
 
         n_poses = len(pose_data)
 
@@ -475,7 +482,7 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
                     inputs=[
                         world_centers, world_radii, world_rot_flat,
                         min_d_cache, N, wp_origin,
-                        float(pd.dx), n, n, n,
+                        float(pd.dx), pd.nx, pd.ny, pd.nz,
                         wp_indices, sdf_pred,
                     ],
                     device=device,
@@ -487,7 +494,9 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
                     _rmse_loss_kernel_batch,
                     dim=bs,
                     inputs=[sdf_pred, pd.wp_sdf_target, wp_indices,
-                            loss, bs, float(self._miss_penalty_weight)],
+                            loss, bs, float(self._miss_penalty_weight),
+                            float(0.0), float(1.0), float(0.0),
+                            pd.wp_sdf_target, float(1.0), float(0.0), float(1.0)],
                     device=device,
                 )
 
@@ -622,7 +631,7 @@ def run_multipose_pipeline(
             rigged_mesh.skin_weights, skin_mats,
         )
         sdf_computer.set_mesh(deformed_verts, rigged_mesh.faces)
-        result = sdf_computer.compute_voxel_grid(n=grid_n, margin=0.5)
+        result = sdf_computer.compute_voxel_grid(n=grid_n, margin=0.5, compute_thickness=False)
 
         world_transforms = skeleton.compute_world_transforms(pose)
         bone_pos = np.zeros((skeleton.num_bones, 3), dtype=np.float32)
@@ -643,7 +652,10 @@ def run_multipose_pipeline(
     # Step 3: Training
     N = bone_local.num_ellipsoids
     n = grid_n
-    total = n ** 3
+    # Per-pose grids may be anisotropic with differing voxel counts; size the
+    # shared batch from the smallest so every per-pose sampler has enough indices.
+    pose_totals = [int(pd.sdf_grid.size) for pd in pose_data_list]
+    total = min(pose_totals) if pose_totals else n ** 3
     bs = max(1024, int(total * 0.125))
 
     pred_lc = wp.array(bone_local.local_centers, dtype=wp.vec3,
@@ -664,7 +676,7 @@ def run_multipose_pipeline(
 
     optimizer = wp.optim.Adam([pred_lc, pred_lr, pred_lrot], lr=lr)
     grads = [p.grad.flatten() for p in [pred_lc, pred_lr, pred_lrot]]
-    samplers = [EpochSampler(total, bs) for _ in pose_data_list]
+    samplers = [EpochSampler(t, bs) for t in pose_totals]
 
     n_poses = len(pose_data_list)
     for step in range(num_steps):
@@ -684,12 +696,14 @@ def run_multipose_pipeline(
             min_d.zero_()
             wp.launch(_ellipsoid_sdf_kernel_batch, dim=bs,
                       inputs=[world_c, world_r, world_rf, min_d, N,
-                              wp_o, float(pd.dx), n, n, n, wp_idx, sdf_pred],
+                              wp_o, float(pd.dx), pd.nx, pd.ny, pd.nz, wp_idx, sdf_pred],
                       device=device)
             loss_buf.zero_()
             wp.launch(_rmse_loss_kernel_batch, dim=bs,
                       inputs=[sdf_pred, pd.wp_sdf_target, wp_idx,
-                              loss_buf, bs, float(0.0)], device=device)
+                              loss_buf, bs, float(0.0),
+                              float(0.0), float(1.0), float(0.0),
+                              pd.wp_sdf_target, float(1.0), float(0.0), float(1.0)], device=device)
 
         tape.backward(loss_buf)
         optimizer.step(grads)

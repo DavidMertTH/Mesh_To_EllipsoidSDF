@@ -262,8 +262,8 @@ class EllipsoidGradientTrainer:
 
             if step % log_every == 0:
                 lr_now = scheduler.get_last_lr()[0]
-                print(f"  Schritt {step:6d}/{n_steps}  "
-                      f"Verlust={loss.item():.6f}  "
+                print(f"  Step {step:6d}/{n_steps}  "
+                      f"loss={loss.item():.6f}  "
                       f"lr={lr_now:.2e}")
 
         self.net.eval()
@@ -280,7 +280,7 @@ class EllipsoidGradientTrainer:
             "depth":      self.net.depth,
             "state_dict": self.net.state_dict(),
         }, path)
-        print(f"Modell gespeichert: {path}")
+        print(f"Model saved: {path}")
 
     @classmethod
     def load(cls, path: str, device: Optional[str] = None

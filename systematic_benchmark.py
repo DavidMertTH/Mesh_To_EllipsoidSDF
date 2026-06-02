@@ -65,10 +65,10 @@ TEST_CONFIGS = _generate_configs(20)
 
 REGIONS = ["total", "interior", "exterior", "near_surface"]
 REGION_LABELS = {
-    "total":        "Gesamt",
+    "total":        "Total",
     "interior":     "Interior",
     "exterior":     "Exterior",
-    "near_surface": "Oberfläche (±15%)",
+    "near_surface": "Surface (±15%)",
 }
 METRIC_KEYS = ["mae", "rmse", "l_inf"]
 
@@ -149,7 +149,7 @@ def find_best_methods(rows: list[dict]) -> dict:
 def print_console_report(results: list[dict], rows: list[dict], winners: dict):
     """Print a structured console report."""
     print("\n" + "═" * 100)
-    print("  SYSTEMATISCHER SDF-BENCHMARK — ERGEBNISSE")
+    print("  SYSTEMATIC SDF BENCHMARK — RESULTS")
     print("═" * 100)
 
     # ── Per-config summary ────────────────────────────────────────────
@@ -166,7 +166,7 @@ def print_console_report(results: list[dict], rows: list[dict], winners: dict):
         for region in REGIONS:
             region_label = REGION_LABELS[region]
             print(f"\n    {region_label}:")
-            print(f"    {'Methode':<25s}  {'MAE':>10s}  {'RMSE':>10s}  {'L∞':>10s}")
+            print(f"    {'Method':<25s}  {'MAE':>10s}  {'RMSE':>10s}  {'L∞':>10s}")
             print(f"    {'─' * 60}")
 
             for name, _, short in METHODS:
@@ -182,7 +182,7 @@ def print_console_report(results: list[dict], rows: list[dict], winners: dict):
 
     # ── Global win counts ─────────────────────────────────────────────
     print(f"\n\n{'═' * 100}")
-    print("  GEWINN-ZUSAMMENFASSUNG (★ = Beste Methode pro Konfiguration)")
+    print("  WIN SUMMARY (★ = best method per configuration)")
     print(f"{'═' * 100}\n")
 
     for region in REGIONS:
@@ -203,7 +203,7 @@ def print_console_report(results: list[dict], rows: list[dict], winners: dict):
 
     # ── Recommendations ───────────────────────────────────────────────
     print(f"{'═' * 100}")
-    print("  EMPFEHLUNGEN")
+    print("  RECOMMENDATIONS")
     print(f"{'═' * 100}\n")
 
     # Group configs by aspect ratio ranges
@@ -213,10 +213,10 @@ def print_console_report(results: list[dict], rows: list[dict], winners: dict):
     ext_kappa  = [r for r in results if r["aspect_ratio"] > 15.0]
 
     for group_label, group in [
-        ("Niedrig (κ ≤ 2)", low_kappa),
-        ("Moderat (2 < κ ≤ 5)", mid_kappa),
-        ("Hoch (5 < κ ≤ 15)", high_kappa),
-        ("Extrem (κ > 15)", ext_kappa),
+        ("Low (κ ≤ 2)", low_kappa),
+        ("Moderate (2 < κ ≤ 5)", mid_kappa),
+        ("High (5 < κ ≤ 15)", high_kappa),
+        ("Extreme (κ > 15)", ext_kappa),
     ]:
         if not group:
             continue
@@ -234,7 +234,7 @@ def print_console_report(results: list[dict], rows: list[dict], winners: dict):
             avg_mae = np.mean(mae_counts[best_method])
             win_rate = len(mae_counts[best_method]) / len(group) * 100
             print(f"    {region_label:<20s} → {best_method:<25s}"
-                  f"  (Gewinnrate {win_rate:.0f}%, Ø MAE = {avg_mae:.6f})")
+                  f"  (win rate {win_rate:.0f}%, Ø MAE = {avg_mae:.6f})")
         print()
 
 
@@ -251,7 +251,7 @@ def export_csv(rows: list[dict], path: str):
         writer.writeheader()
         for r in rows:
             writer.writerow({k: r[k] for k in fieldnames})
-    print(f"\nCSV exportiert: {path}")
+    print(f"\nCSV exported: {path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -271,7 +271,7 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
     with PdfPages(path) as pdf:
         # ── Page 1: MAE heatmap per region ────────────────────────────
         fig, axes = plt.subplots(2, 2, figsize=(16, 12), facecolor=bg_color)
-        fig.suptitle("MAE pro Methode & Konfiguration",
+        fig.suptitle("MAE per method & configuration",
                      fontsize=14, color=text_color, y=0.98)
 
         config_labels = [f"{r['label']}\nκ={r['aspect_ratio']:.1f}" for r in results]
@@ -312,7 +312,7 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
 
         # ── Page 2: Win rate bar chart ────────────────────────────────
         fig, axes = plt.subplots(1, 3, figsize=(16, 6), facecolor=bg_color)
-        fig.suptitle("Gewinnrate pro Methode & Metrik (alle Regionen)",
+        fig.suptitle("Win rate per method & metric (all regions)",
                      fontsize=14, color=text_color, y=0.98)
 
         for ax_idx, metric in enumerate(METRIC_KEYS):
@@ -337,7 +337,7 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
 
             ax.set_xticks(x)
             ax.set_xticklabels(method_shorts, fontsize=9, color=text_color)
-            ax.set_ylabel("Anzahl Siege", fontsize=9, color=text_color)
+            ax.set_ylabel("Number of wins", fontsize=9, color=text_color)
             ax.set_title(metric_label, fontsize=11, color=text_color)
             ax.legend(fontsize=7, facecolor="#1a2030", edgecolor="#333",
                       labelcolor=text_color)
@@ -350,7 +350,7 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
 
         # ── Page 3: MAE vs aspect ratio ───────────────────────────────
         fig, axes = plt.subplots(1, 2, figsize=(14, 6), facecolor=bg_color)
-        fig.suptitle("MAE vs. Aspektverhältnis κ",
+        fig.suptitle("MAE vs. aspect ratio κ",
                      fontsize=14, color=text_color, y=0.98)
 
         _base_colors = ["#f2e641", "#4962f2", "#50c878", "#c878ff",
@@ -376,7 +376,7 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
                 ax.plot(np.array(kappas)[order], np.array(maes)[order],
                         color=method_colors[m_idx], linewidth=0.8, alpha=0.5)
 
-            ax.set_xlabel("Aspektverhältnis κ", fontsize=9, color=text_color)
+            ax.set_xlabel("Aspect ratio κ", fontsize=9, color=text_color)
             ax.set_ylabel("MAE", fontsize=9, color=text_color)
             ax.set_title(REGION_LABELS[region], fontsize=10, color=text_color)
             ax.set_xscale("log")
@@ -391,7 +391,7 @@ def export_pdf(results: list[dict], rows: list[dict], winners: dict, path: str):
         pdf.savefig(fig, facecolor=bg_color)
         plt.close(fig)
 
-    print(f"\nPDF exportiert: {path}")
+    print(f"\nPDF exported: {path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -463,9 +463,9 @@ def show_interactive_plot(results: list[dict], rows: list[dict]):
 
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("Aspektverhältnis κ", fontsize=11, color=text_color)
+    ax.set_xlabel("Aspect ratio κ", fontsize=11, color=text_color)
     ax.set_ylabel("MAE", fontsize=11, color=text_color)
-    ax.set_title("Fehler vs. Aspektverhältnis κ  —  Gesamt",
+    ax.set_title("Error vs. aspect ratio κ  —  Total",
                  fontsize=13, color=text_color)
     ax.legend(fontsize=9, facecolor="#1a2030", edgecolor="#444",
               labelcolor=text_color, loc="upper left")
@@ -478,7 +478,7 @@ def show_interactive_plot(results: list[dict], rows: list[dict]):
     metric_keys = ["mae", "rmse", "l_inf"]
 
     ax_radio_metric = fig.add_axes([0.82, 0.60, 0.15, 0.18], facecolor="#1a2030")
-    ax_radio_metric.set_title("Fehlermetrik", fontsize=9, color=text_color,
+    ax_radio_metric.set_title("Error metric", fontsize=9, color=text_color,
                               pad=8)
     radio_metric = RadioButtons(ax_radio_metric, metric_labels,
                                 activecolor="#4962f2")
@@ -523,7 +523,7 @@ def show_interactive_plot(results: list[dict], rows: list[dict]):
             ax.set_ylim(y_min, y_max)
 
         ax.set_ylabel(y_label, fontsize=11, color=text_color)
-        ax.set_title(f"Fehler vs. Aspektverhältnis κ  —  {r_label}",
+        ax.set_title(f"Error vs. aspect ratio κ  —  {r_label}",
                      fontsize=13, color=text_color)
         fig.canvas.draw_idle()
 
@@ -549,25 +549,25 @@ def show_interactive_plot(results: list[dict], rows: list[dict]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Systematischer Vergleich der Ellipsoid-SDF-Approximationen"
+        description="Systematic comparison of ellipsoid SDF approximations"
     )
     parser.add_argument("--grid", type=int, default=128,
-                        help="Grid-Auflösung N (default: 128)")
+                        help="Grid resolution N (default: 128)")
     parser.add_argument("--csv", type=str, default=None,
-                        help="Pfad für CSV-Export")
+                        help="Path for CSV export")
     parser.add_argument("--pdf", type=str, default=None,
-                        help="Pfad für PDF-Report")
+                        help="Path for PDF report")
     parser.add_argument("--plot", action="store_true", default=False,
-                        help="Interaktives Diagramm (Fehler vs. κ) anzeigen")
+                        help="Show interactive plot (error vs. κ)")
     args = parser.parse_args()
 
     # Backend: Agg für headless, sonst interaktiv
     if not args.plot:
         matplotlib.use("Agg")
 
-    print(f"Grid-Auflösung: {args.grid}")
-    print(f"Anzahl Konfigurationen: {len(TEST_CONFIGS)}")
-    print(f"Methoden: {', '.join(n for n, _, _ in METHODS)}")
+    print(f"Grid resolution: {args.grid}")
+    print(f"Number of configurations: {len(TEST_CONFIGS)}")
+    print(f"Methods: {', '.join(n for n, _, _ in METHODS)}")
     print()
 
     t0 = time.perf_counter()
@@ -579,7 +579,7 @@ def main():
 
     print_console_report(results, rows, winners)
 
-    print(f"\nGesamtlaufzeit: {total_time:.1f}s")
+    print(f"\nTotal runtime: {total_time:.1f}s")
 
     if args.csv:
         export_csv(rows, args.csv)
@@ -588,8 +588,8 @@ def main():
         export_pdf(results, rows, winners, args.pdf)
 
     if not args.csv and not args.pdf and not args.plot:
-        print("\nTipp: --csv results.csv und/oder --pdf report.pdf für Export,"
-              " --plot für interaktives Diagramm.")
+        print("\nTip: --csv results.csv and/or --pdf report.pdf for export,"
+              " --plot for an interactive chart.")
 
     if args.plot:
         show_interactive_plot(results, rows)

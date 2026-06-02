@@ -19,6 +19,8 @@ from pathlib import Path
 from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
+import theme
+
 
 # ── Persistence directory ─────────────────────────────────────────────────────
 
@@ -74,7 +76,7 @@ class RunRecord:
     @property
     def display_name(self) -> str:
         label = self.name if self.name else self.run_id
-        status = "" if self.finished else " [laufend]"
+        status = "" if self.finished else " [running]"
         return f"{label}{status}"
 
     @property
@@ -88,16 +90,18 @@ class RunRecord:
 
 # ── Colour cycle for plot lines ───────────────────────────────────────────────
 
-_PLOT_COLORS = [
-    (242, 230, 65),
-    (73, 98, 242),
-    (242, 100, 80),
-    (80, 220, 140),
-    (200, 120, 255),
-    (255, 180, 60),
-    (100, 200, 255),
-    (220, 220, 100),
-]
+def _plot_colors() -> list:
+    """Plot-line colour cycle — brand secondary/primary first (read live)."""
+    return [
+        theme.YELLOW,        # brand colours first (see theme.py)
+        theme.BLUE,
+        (242, 100, 80),
+        (80, 220, 140),
+        (200, 120, 255),
+        (255, 180, 60),
+        (100, 200, 255),
+        (220, 220, 100),
+    ]
 
 
 # ── Widget ────────────────────────────────────────────────────────────────────
@@ -172,8 +176,9 @@ class RunTrackerPanel(QtWidgets.QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
-        title = QtWidgets.QLabel("Auswertung")
-        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        title = QtWidgets.QLabel("Analysis")
+        title.setStyleSheet(
+            "font-weight: bold; font-size: 14px; color: palette(window-text);")
         layout.addWidget(title)
 
         # ── Run selector ──────────────────────────────────────────────
@@ -189,15 +194,14 @@ class RunTrackerPanel(QtWidgets.QWidget):
 
         # ── Plot ──────────────────────────────────────────────────────
         self._plot = pg.PlotWidget(title="Loss")
-        self._plot.setLabel("bottom", "Schritt")
+        self._plot.setLabel("bottom", "Step")
         self._plot.setLabel("left", "Loss")
         self._plot.showGrid(x=True, y=True, alpha=0.3)
-        self._plot.setBackground((2, 11, 13))
         self._plot.addLegend(offset=(10, 10))
         layout.addWidget(self._plot, stretch=3)
 
         # ── Show-all checkbox ─────────────────────────────────────────
-        self._chk_show_all = QtWidgets.QCheckBox("Alle Runs anzeigen")
+        self._chk_show_all = QtWidgets.QCheckBox("Show all runs")
         self._chk_show_all.setChecked(False)
         self._chk_show_all.toggled.connect(self._refresh_plot_visibility)
         layout.addWidget(self._chk_show_all)
@@ -206,20 +210,19 @@ class RunTrackerPanel(QtWidgets.QWidget):
         self._info_text = QtWidgets.QTextEdit()
         self._info_text.setReadOnly(True)
         self._info_text.setMaximumHeight(150)
-        self._info_text.setStyleSheet(
-            "background-color: #0a1520; color: #ccc; "
-            "font-family: monospace; font-size: 12px;"
-        )
         layout.addWidget(self._info_text, stretch=1)
+
+        # Background / foreground colours follow light/dark mode.
+        self.apply_theme()
 
         # ── Name + rename ─────────────────────────────────────────────
         row_name = QtWidgets.QHBoxLayout()
         row_name.addWidget(QtWidgets.QLabel("Name:"))
         self._edit_name = QtWidgets.QLineEdit()
-        self._edit_name.setPlaceholderText("Run benennen …")
+        self._edit_name.setPlaceholderText("Name run …")
         self._edit_name.returnPressed.connect(self._on_rename)
         row_name.addWidget(self._edit_name)
-        self._btn_rename = QtWidgets.QPushButton("Umbenennen")
+        self._btn_rename = QtWidgets.QPushButton("Rename")
         self._btn_rename.clicked.connect(self._on_rename)
         row_name.addWidget(self._btn_rename)
         layout.addLayout(row_name)
@@ -227,23 +230,48 @@ class RunTrackerPanel(QtWidgets.QWidget):
         # ── Action buttons ────────────────────────────────────────────
         row_actions = QtWidgets.QHBoxLayout()
 
-        self._btn_save = QtWidgets.QPushButton("💾 Speichern")
-        self._btn_save.setToolTip("Run dauerhaft als JSON speichern")
+        self._btn_save = QtWidgets.QPushButton("💾 Save")
+        self._btn_save.setToolTip("Save run permanently as JSON")
         self._btn_save.clicked.connect(self._on_save)
         row_actions.addWidget(self._btn_save)
 
-        self._btn_delete = QtWidgets.QPushButton("🗑 Löschen")
-        self._btn_delete.setToolTip("Run löschen")
+        self._btn_delete = QtWidgets.QPushButton("🗑 Delete")
+        self._btn_delete.setToolTip("Delete run")
         self._btn_delete.clicked.connect(self._on_delete)
         row_actions.addWidget(self._btn_delete)
 
-        self._btn_export = QtWidgets.QPushButton("📋 CSV kopieren")
-        self._btn_export.setToolTip("Loss-Daten in die Zwischenablage kopieren")
+        self._btn_export = QtWidgets.QPushButton("📋 Copy CSV")
+        self._btn_export.setToolTip("Copy loss data to clipboard")
         self._btn_export.clicked.connect(self._on_copy_csv)
         row_actions.addWidget(self._btn_export)
 
         row_actions.addStretch()
         layout.addLayout(row_actions)
+
+    def apply_theme(self):
+        """Re-colour the loss plot + info box for the current light/dark mode."""
+        fg = theme.pg_fg()
+        self._plot.setBackground(theme.bg((2, 11, 13)))
+        for ax_name in ("left", "bottom"):
+            axis = self._plot.getAxis(ax_name)
+            axis.setPen(fg)
+            axis.setTextPen(fg)
+        self._plot.setTitle("Loss", color=fg)
+        legend = self._plot.plotItem.legend
+        if legend is not None:
+            for _sample, label in legend.items:
+                try:
+                    label.setText(label.text, color=fg)
+                except Exception:
+                    pass
+        if theme.is_dark_mode():
+            self._info_text.setStyleSheet(
+                "background-color: #0a1520; color: #ccc; "
+                "font-family: monospace; font-size: 12px;")
+        else:
+            self._info_text.setStyleSheet(
+                "background-color: #f3f5f8; color: #222; "
+                "font-family: monospace; font-size: 12px;")
 
     # ══════════════════════════════════════════════════════════════════
     # RUN COMBO / SELECTION
@@ -278,8 +306,8 @@ class RunTrackerPanel(QtWidgets.QWidget):
 
     def _get_run_color(self, rec: RunRecord) -> tuple:
         if rec.run_id not in self._run_colors:
-            idx = len(self._run_colors) % len(_PLOT_COLORS)
-            self._run_colors[rec.run_id] = _PLOT_COLORS[idx]
+            palette = _plot_colors()
+            self._run_colors[rec.run_id] = palette[len(self._run_colors) % len(palette)]
         return self._run_colors[rec.run_id]
 
     def _ensure_plot_curve(self, rec: RunRecord) -> pg.PlotDataItem:
@@ -316,30 +344,30 @@ class RunTrackerPanel(QtWidgets.QWidget):
     def _update_info(self):
         rec = self._selected_run()
         if rec is None:
-            self._info_text.setPlainText("Kein Run ausgewählt.")
+            self._info_text.setPlainText("No run selected.")
             self._edit_name.clear()
             return
 
         self._edit_name.setText(rec.name)
 
-        status = "Abgeschlossen" if rec.finished else "Laufend …"
+        status = "Completed" if rec.finished else "Running …"
         lines = [
             f"ID:             {rec.run_id}",
-            f"Name:           {rec.name or '(unbenannt)'}",
+            f"Name:           {rec.name or '(unnamed)'}",
             f"Status:         {status}",
             f"Mesh:           {rec.mesh_name or '—'}",
-            f"Methode:        {rec.method}",
-            f"Ellipsoide:     {rec.num_ellipsoids}",
+            f"Method:         {rec.method}",
+            f"Ellipsoids:     {rec.num_ellipsoids}",
             f"Grid N:         {rec.grid_n}",
-            f"Gestartet:      {rec.started}",
-            f"Schritte:       {len(rec.steps)}",
+            f"Started:        {rec.started}",
+            f"Steps:          {len(rec.steps)}",
         ]
         if rec.final_loss is not None:
-            lines.append(f"Letzter Loss:   {rec.final_loss:.6f}")
+            lines.append(f"Last loss:      {rec.final_loss:.6f}")
         if rec.best_loss is not None:
-            lines.append(f"Bester Loss:    {rec.best_loss:.6f}")
+            lines.append(f"Best loss:      {rec.best_loss:.6f}")
         if rec.saved:
-            lines.append("Gespeichert:    ✓")
+            lines.append("Saved:          ✓")
 
         self._info_text.setPlainText("\n".join(lines))
 
@@ -375,18 +403,18 @@ class RunTrackerPanel(QtWidgets.QWidget):
             fp = rec.save(self._runs_dir)
             self._update_info()
             QtWidgets.QMessageBox.information(
-                self, "Gespeichert", f"Run gespeichert:\n{fp}")
+                self, "Saved", f"Run saved:\n{fp}")
         except Exception as e:
             QtWidgets.QMessageBox.warning(
-                self, "Fehler", f"Speichern fehlgeschlagen:\n{e}")
+                self, "Error", f"Save failed:\n{e}")
 
     def _on_delete(self):
         rec = self._selected_run()
         if rec is None:
             return
         reply = QtWidgets.QMessageBox.question(
-            self, "Löschen",
-            f"Run '{rec.display_name}' wirklich löschen?",
+            self, "Delete",
+            f"Really delete run '{rec.display_name}'?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
         )
         if reply != QtWidgets.QMessageBox.Yes:
@@ -437,4 +465,4 @@ class RunTrackerPanel(QtWidgets.QWidget):
                     curve.setData(rec.steps, rec.losses)
                     curve.setVisible(False)
             except Exception as e:
-                print(f"[RunTracker] Konnte {fp.name} nicht laden: {e}")
+                print(f"[RunTracker] Could not load {fp.name}: {e}")

@@ -178,8 +178,8 @@ class TrainingApp:
         # ── Loss-Kurve ────────────────────────────────────────────────────
         self.ax_loss = self.fig.add_subplot(gs[1, 0])
         self.ax_loss.set_facecolor(PANEL)
-        self.ax_loss.set_xlabel("Schritt",    color=SUBTLE, fontsize=9)
-        self.ax_loss.set_ylabel("L1-Verlust", color=SUBTLE, fontsize=9)
+        self.ax_loss.set_xlabel("Step",       color=SUBTLE, fontsize=9)
+        self.ax_loss.set_ylabel("L1 loss",    color=SUBTLE, fontsize=9)
         self.ax_loss.tick_params(colors=SUBTLE, labelsize=8)
         for sp in self.ax_loss.spines.values():
             sp.set_edgecolor("#374151")
@@ -188,7 +188,7 @@ class TrainingApp:
         self._loss_line,   = self.ax_loss.plot(
             [], [], color=ACCENT, lw=1.5, alpha=0.9)
         self._loss_smooth, = self.ax_loss.plot(
-            [], [], color="#fcd34d", lw=1.0, alpha=0.6, label="geglaettet")
+            [], [], color="#fcd34d", lw=1.0, alpha=0.6, label="smoothed")
         self.ax_loss.legend(fontsize=8, labelcolor=TEXT,
                             facecolor=PANEL, edgecolor="none")
         self._steps_hist: list[int]   = []
@@ -198,7 +198,7 @@ class TrainingApp:
         self.ax_v = self.fig.add_subplot(gs[1, 1])
         self.ax_v.set_facecolor(PANEL)
         self.ax_v.set_aspect("equal")
-        self.ax_v.set_title("Tiefster Punkt  (z=0-Schnitt)",
+        self.ax_v.set_title("Deepest point  (z=0 slice)",
                              color=TEXT, fontsize=9, pad=4)
         self.ax_v.tick_params(colors=SUBTLE, labelsize=7)
         for sp in self.ax_v.spines.values():
@@ -248,7 +248,7 @@ class TrainingApp:
         self._pred_scatter = self.ax_v.scatter(
             [], [],
             s=80, c="#f97316", marker="o",
-            zorder=7, label="Vorhersage",
+            zorder=7, label="Prediction",
         )
 
         # Legende
@@ -282,9 +282,9 @@ class TrainingApp:
 
     def _info_str(self, step: int, loss: float) -> str:
         return (
-            f"Geraet: {str(self.device).upper()}   "
+            f"Device: {str(self.device).upper()}   "
             f"Batch: {self.batch_size:,}   "
-            f"Schritte: {step:,} / {self.n_steps:,}"
+            f"Steps: {step:,} / {self.n_steps:,}"
         )
 
     def _bary_str(self, label: str, u: float, v: float, w: float,
@@ -312,7 +312,7 @@ class TrainingApp:
 
     def _on_key(self, event):
         if event.key in ("q", "Q", "escape"):
-            print("\nAbbruch -- speichere und beende...")
+            print("\nInterrupted -- saving and exiting...")
             self._stop.set()
 
     def _on_close(self, event):
@@ -406,12 +406,12 @@ class TrainingApp:
                                self._sdf_at(self._gt_point))
                 + "\n\n"
                 + self._bary_str(
-                    f"Vorhersage  (Schritt {self._last_viz_step:,})",
+                    f"Prediction  (step {self._last_viz_step:,})",
                     u, v, w, sdf_val)
             )
 
             self.ax_v.set_title(
-                f"Tiefster Punkt  (z=0,  Schritt {self._last_viz_step:,})",
+                f"Deepest point  (z=0,  step {self._last_viz_step:,})",
                 color="#e5e7eb", fontsize=9, pad=4,
             )
 
@@ -427,16 +427,16 @@ class TrainingApp:
         print("=" * 58)
         print("  Ellipsoid Triangle -- Neural Network Training")
         print("=" * 58)
-        print(f"  Schritte : {self.n_steps:,}")
+        print(f"  Steps    : {self.n_steps:,}")
         print(f"  Batch    : {self.batch_size:,}")
         print(f"  Grid G   : {self.grid_G}  "
-              f"({(self.grid_G+1)*(self.grid_G+2)//2} Punkte/Dreieck)")
-        print(f"  Geraet   : {self.device}")
-        print(f"  Speichern: {self.save_path or '(nicht gespeichert)'}")
+              f"({(self.grid_G+1)*(self.grid_G+2)//2} points/triangle)")
+        print(f"  Device   : {self.device}")
+        print(f"  Saving   : {self.save_path or '(not saved)'}")
         gt_u, gt_v, gt_w = self._gt_bary
         print(f"  GT-Bary  : u={gt_u:.4f}  v={gt_v:.4f}  w={gt_w:.4f}")
         print(f"  GT-SDF   : {self._sdf_at(self._gt_point):.5f}")
-        print("  Q / Fenster schliessen = Abbrechen")
+        print("  Q / close window = cancel")
         print("=" * 58)
 
         self._last_bary     = np.array([1/3, 1/3, 1/3])
@@ -458,9 +458,9 @@ class TrainingApp:
 
         if self.save_path:
             self.trainer.save(self.save_path)
-            print(f"\nModell gespeichert: {self.save_path}")
+            print(f"\nModel saved: {self.save_path}")
 
-        print("\nTraining beendet -- Fenster schliessen zum Beenden.")
+        print("\nTraining finished -- close the window to exit.")
         plt.ioff()
         plt.show(block=True)
 
@@ -469,7 +469,7 @@ class TrainingApp:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Trainiere EllipsoidTriangleNet mit Live-Visualisierung",
+        description="Train EllipsoidTriangleNet with live visualization",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--steps",     type=int,   default=50_000)

@@ -105,8 +105,10 @@ def _ellipsoid_union_sdf_kernel(
     min_d = float(1.0e6)
 
     for i in range(num_ellipsoids):
-        # Transform to ellipsoid-local frame
-        local_p = wp.quat_rotate_inv(rotations[i], p - centers[i])
+        # Transform to ellipsoid-local frame.  Normalise the quaternion first:
+        # trained quats can drift off unit length, and a non-unit quat scales the
+        # rotated point, making the ellipsoid vanish (|q|>1) or balloon (|q|<1).
+        local_p = wp.quat_rotate_inv(wp.normalize(rotations[i]), p - centers[i])
         r = radii[i]
 
         #  MertStein hybrid SDF:
@@ -202,13 +204,22 @@ class EllipsoidSet:
         dx: float,
         n: int,
         sdf_mode: int = SDF_MERTSTEIN,
+        shape: tuple | None = None,
     ) -> np.ndarray:
 
+        # ``shape`` = explicit ``(nx, ny, nz)`` for an anisotropic grid; ``None``
+        # → cubic ``n³`` (legacy callers).  Must match the target grid's shape so
+        # the two SDFs can be compared voxel-for-voxel.
+        if shape is not None:
+            nx, ny, nz = int(shape[0]), int(shape[1]), int(shape[2])
+        else:
+            nx = ny = nz = int(n)
+
         if self.count == 0:
-            return np.full((n, n, n), 1e6, dtype=np.float32)
+            return np.full((nz, ny, nx), 1e6, dtype=np.float32)
 
         if sdf_mode == SDF_NEURAL:
-            return self._compute_sdf_grid_neural(origin, dx, n)
+            return self._compute_sdf_grid_neural(origin, dx, n, shape=(nx, ny, nz))
 
         wp_centers = wp.array(self.centers, dtype=wp.vec3, device=self.device)
         wp_radii = wp.array(self.radii, dtype=wp.vec3, device=self.device)
@@ -216,7 +227,6 @@ class EllipsoidSet:
 
         wp_origin = wp.vec3(float(origin[0]), float(origin[1]), float(origin[2]))
 
-        nx = ny = nz = int(n)
         total = nx * ny * nz
         out = wp.empty(total, dtype=wp.float32, device=self.device)
 
@@ -314,7 +324,8 @@ class EllipsoidSet:
     def _compute_sdf_grid_neural(self,
                                   origin: np.ndarray,
                                   dx: float,
-                                  n: int) -> np.ndarray:
+                                  n: int,
+                                  shape: tuple | None = None) -> np.ndarray:
         """
         Berechne das SDF-Gitter mit dem neuronalen Netz (PyTorch-Pfad).
 
@@ -342,10 +353,17 @@ class EllipsoidSet:
         net = self._neural_net
         dev = next(net.parameters()).device
 
-        # Gitterpunkte in Weltkoordinaten (n³, 3)
-        idx    = np.arange(n, dtype=np.float32)
-        coords = origin.astype(np.float32) + (idx + 0.5) * float(dx)
-        zg, yg, xg = np.meshgrid(coords, coords, coords, indexing="ij")
+        if shape is not None:
+            nx, ny, nz = int(shape[0]), int(shape[1]), int(shape[2])
+        else:
+            nx = ny = nz = int(n)
+
+        # Gitterpunkte in Weltkoordinaten (nz·ny·nx, 3), pro Achse eigene Koords.
+        o = origin.astype(np.float32)
+        xs = o[0] + (np.arange(nx, dtype=np.float32) + 0.5) * float(dx)
+        ys = o[1] + (np.arange(ny, dtype=np.float32) + 0.5) * float(dx)
+        zs = o[2] + (np.arange(nz, dtype=np.float32) + 0.5) * float(dx)
+        zg, yg, xg = np.meshgrid(zs, ys, xs, indexing="ij")
         pts_np = np.stack([xg, yg, zg], axis=-1).reshape(-1, 3)
 
         pts_t      = torch.as_tensor(pts_np,         dtype=torch.float32, device=dev)
@@ -355,7 +373,7 @@ class EllipsoidSet:
 
         min_sdf = eval_union_cuda(net, pts_t, centers_t, radii_t, rots_t)
 
-        return min_sdf.cpu().numpy().reshape(n, n, n).astype(np.float32)
+        return min_sdf.cpu().numpy().reshape(nz, ny, nx).astype(np.float32)
 
     def generate_meshes(self, subdivisions: int = 3) -> List[trimesh.Trimesh]:
 

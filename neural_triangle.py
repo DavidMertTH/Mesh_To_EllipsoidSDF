@@ -315,8 +315,8 @@ class EllipsoidTriangleTrainer:
             scheduler.step()
 
             if step % log_every == 0:
-                print(f"  Schritt {step:6d}/{n_steps}  "
-                      f"Verlust={loss.item():.6f}  "
+                print(f"  Step {step:6d}/{n_steps}  "
+                      f"loss={loss.item():.6f}  "
                       f"lr={scheduler.get_last_lr()[0]:.2e}")
 
         self.net.eval()
@@ -332,7 +332,7 @@ class EllipsoidTriangleTrainer:
             "depth":      self.net.depth,
             "state_dict": self.net.state_dict(),
         }, path)
-        print(f"Modell gespeichert: {path}")
+        print(f"Model saved: {path}")
 
     @classmethod
     def load(cls, path: str,
@@ -350,7 +350,7 @@ class EllipsoidTriangleTrainer:
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Trainiere EllipsoidTriangleNet",
+        description="Train EllipsoidTriangleNet",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--steps",     type=int,   default=50_000)
@@ -359,9 +359,9 @@ def main():
     parser.add_argument("--hidden",    type=int,   default=256)
     parser.add_argument("--depth",     type=int,   default=4)
     parser.add_argument("--grid-g",    type=int,   default=24,
-                        help="Simplex-Gitteraufloesung fuer GT")
+                        help="Simplex grid resolution for GT")
     parser.add_argument("--device",    type=str,   default=None,
-                        help="cpu oder cuda (Standard: auto)")
+                        help="cpu or cuda (default: auto)")
     parser.add_argument("--save",      type=str,   default="ellipsoid_triangle.pt")
     parser.add_argument("--log-every", type=int,   default=500)
     args = parser.parse_args()
@@ -369,11 +369,11 @@ def main():
     print("=" * 58)
     print("  Ellipsoid Triangle -- Neural Network Training")
     print("=" * 58)
-    print(f"  Schritte : {args.steps:,}")
+    print(f"  Steps    : {args.steps:,}")
     print(f"  Batch    : {args.batch:,}")
-    print(f"  Grid G   : {args.grid_g}  ({(args.grid_g+1)*(args.grid_g+2)//2} Punkte/Dreieck)")
+    print(f"  Grid G   : {args.grid_g}  ({(args.grid_g+1)*(args.grid_g+2)//2} points/triangle)")
     print(f"  LR       : {args.lr}")
-    print(f"  Speichern: {args.save}")
+    print(f"  Saving   : {args.save}")
     print("=" * 58)
 
     trainer = EllipsoidTriangleTrainer(

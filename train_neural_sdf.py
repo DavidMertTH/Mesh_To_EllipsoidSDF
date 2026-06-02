@@ -125,8 +125,8 @@ class TrainingApp:
         # ── Loss-Kurve ────────────────────────────────────────────────────
         self.ax_loss = self.fig.add_subplot(gs[1, 0])
         self.ax_loss.set_facecolor(PANEL)
-        self.ax_loss.set_xlabel("Schritt", color=SUBTLE, fontsize=9)
-        self.ax_loss.set_ylabel("L1-Verlust", color=SUBTLE, fontsize=9)
+        self.ax_loss.set_xlabel("Step", color=SUBTLE, fontsize=9)
+        self.ax_loss.set_ylabel("L1 loss", color=SUBTLE, fontsize=9)
         self.ax_loss.tick_params(colors=SUBTLE, labelsize=8)
         for sp in self.ax_loss.spines.values():
             sp.set_edgecolor("#374151")
@@ -136,7 +136,7 @@ class TrainingApp:
             [], [], color=ACCENT, lw=1.5, alpha=0.9
         )
         self._loss_smooth, = self.ax_loss.plot(
-            [], [], color="#fcd34d", lw=1.0, alpha=0.6, label="geglaettet"
+            [], [], color="#fcd34d", lw=1.0, alpha=0.6, label="smoothed"
         )
         self.ax_loss.legend(fontsize=8, labelcolor=TEXT,
                             facecolor=PANEL, edgecolor="none")
@@ -148,7 +148,7 @@ class TrainingApp:
         self.ax_sdf = self.fig.add_subplot(gs[1, 1])
         self.ax_sdf.set_facecolor(PANEL)
         self.ax_sdf.set_aspect("equal")
-        self.ax_sdf.set_title("SDF Schnitt  (z = 0)", color=TEXT,
+        self.ax_sdf.set_title("SDF slice  (z = 0)", color=TEXT,
                                fontsize=9, pad=4)
         self.ax_sdf.tick_params(colors=SUBTLE, labelsize=7)
         for sp in self.ax_sdf.spines.values():
@@ -197,9 +197,9 @@ class TrainingApp:
     def _info_str(self, step: int, loss: float) -> str:
         device_str = str(self.device).upper()
         return (
-            f"Geraet: {device_str}   "
+            f"Device: {device_str}   "
             f"Batch: {self.batch_size:,}   "
-            f"Schritte: {step:,} / {self.n_steps:,}"
+            f"Steps: {step:,} / {self.n_steps:,}"
         )
 
     def _compute_gt_slice(self) -> np.ndarray:
@@ -235,7 +235,7 @@ class TrainingApp:
 
     def _on_key(self, event):
         if event.key in ("q", "Q", "escape"):
-            print("\nAbbruch durch Nutzer -- speichere und beende...")
+            print("\nInterrupted by user -- saving and exiting...")
             self._stop.set()
 
     def _on_close(self, event):
@@ -347,7 +347,7 @@ class TrainingApp:
                 linewidths=1.5,
             )
             self.ax_sdf.set_title(
-                f"SDF Schnitt  (z=0,  Schritt {self._last_sdf_step:,})",
+                f"SDF slice  (z=0,  step {self._last_sdf_step:,})",
                 color="#e5e7eb", fontsize=9, pad=4,
             )
 
@@ -363,12 +363,12 @@ class TrainingApp:
         print("=" * 58)
         print("  Ellipsoid SDF -- Neural Network Training")
         print("=" * 58)
-        print(f"  Schritte : {self.n_steps:,}")
+        print(f"  Steps    : {self.n_steps:,}")
         print(f"  Batch    : {self.batch_size:,}")
         print(f"  LR       : {self.lr}")
-        print(f"  Geraet   : {self.device}")
-        print(f"  Speichern: {self.save_path or '(nicht gespeichert)'}")
-        print("  Q / Fenster schliessen = Abbrechen")
+        print(f"  Device   : {self.device}")
+        print(f"  Saving   : {self.save_path or '(not saved)'}")
+        print("  Q / close window = cancel")
         print("=" * 58)
 
         self._last_sdf      = np.zeros(self._shape, dtype=np.float32)
@@ -390,9 +390,9 @@ class TrainingApp:
 
         if self.save_path:
             self.trainer.save(self.save_path)
-            print(f"\nModell gespeichert: {self.save_path}")
+            print(f"\nModel saved: {self.save_path}")
 
-        print("\nTraining beendet -- Fenster schliessen zum Beenden.")
+        print("\nTraining finished -- close the window to exit.")
         plt.ioff()
         plt.show(block=True)
 
@@ -401,27 +401,27 @@ class TrainingApp:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Trainiere EllipsoidSDFNet mit Live-Visualisierung",
+        description="Train EllipsoidSDFNet with live visualization",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--steps",     type=int,   default=50_000,
-                        help="Anzahl Trainingsschritte")
+                        help="Number of training steps")
     parser.add_argument("--batch",     type=int,   default=32_768,
-                        help="Batch-Groesse pro Schritt")
+                        help="Batch size per step")
     parser.add_argument("--lr",        type=float, default=1e-3,
-                        help="Anfangs-Lernrate")
+                        help="Initial learning rate")
     parser.add_argument("--hidden",    type=int,   default=128,
-                        help="Neuronen pro versteckter Schicht")
+                        help="Neurons per hidden layer")
     parser.add_argument("--depth",     type=int,   default=3,
-                        help="Anzahl versteckter Schichten")
+                        help="Number of hidden layers")
     parser.add_argument("--device",    type=str,   default=None,
-                        help="Trainingsgeraet: cpu oder cuda (Standard: auto)")
+                        help="Training device: cpu or cuda (default: auto)")
     parser.add_argument("--save",      type=str,   default="ellipsoid_sdf.pt",
-                        help="Speicherpfad fuer das trainierte Modell")
+                        help="Save path for the trained model")
     parser.add_argument("--log-every", type=int,   default=10,
-                        help="Loss alle N Schritte in die Queue schicken")
+                        help="Send loss to the queue every N steps")
     parser.add_argument("--viz-every", type=int,   default=100,
-                        help="SDF-Bild alle N Schritte aktualisieren")
+                        help="Update the SDF image every N steps")
     args = parser.parse_args()
 
     app = TrainingApp(

@@ -358,7 +358,7 @@ def _load_neural_model(path: str) -> str:
             METHODS.append(("Neural", sdf_neural, "Neural"))
         return f"✓  {path}  [{device.upper()}]"
     except Exception as exc:
-        return f"Fehler: {exc}"
+        return f"Error: {exc}"
 
 
 def _unload_neural_model():
@@ -486,8 +486,8 @@ def run_benchmark(radii_tuple, grid_n=256, timing_repeats=5, use_gpu=False):
     t_norm = np.linspace(0.01, 2.0, n_radial)
 
     ray_dirs = {
-        "x-Achse":   np.array([1.0, 0.0, 0.0]),
-        "y-Achse":   np.array([0.0, 1.0, 0.0]),
+        "x-axis":   np.array([1.0, 0.0, 0.0]),
+        "y-axis":   np.array([0.0, 1.0, 0.0]),
         "45° (xy)":  np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0),
     }
 
@@ -620,7 +620,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         bar.addWidget(self._spin_n)
 
         bar.addSpacing(20)
-        self._btn_run = QtWidgets.QPushButton("▶  Berechnen")
+        self._btn_run = QtWidgets.QPushButton("▶  Compute")
         self._btn_run.setFixedHeight(32)
         self._btn_run.clicked.connect(self._on_run)
         bar.addWidget(self._btn_run)
@@ -629,21 +629,21 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         self._chk_gpu.setChecked(False)
         self._chk_gpu.setEnabled(_WARP_AVAILABLE)
         self._chk_gpu.setToolTip(
-            "Parallele Warp-CUDA-Kernel statt NumPy"
+            "Parallel Warp CUDA kernels instead of NumPy"
             if _WARP_AVAILABLE else
-            "Nicht verfuegbar  (Warp / CUDA fehlt)"
+            "Not available  (Warp / CUDA missing)"
         )
         bar.addWidget(self._chk_gpu)
 
         bar.addSpacing(10)
 
-        self._chk_interior = QtWidgets.QCheckBox("Nur Interior (SDF < 0)")
+        self._chk_interior = QtWidgets.QCheckBox("Interior only (SDF < 0)")
         self._chk_interior.setChecked(False)
-        self._chk_interior.setToolTip("Fehler nur für Punkte innerhalb des Ellipsoids berechnen")
+        self._chk_interior.setToolTip("Compute error only for points inside the ellipsoid")
         self._chk_interior.toggled.connect(self._on_interior_toggled)
         bar.addWidget(self._chk_interior)
 
-        self._btn_pdf = QtWidgets.QPushButton("📄 PDF exportieren")
+        self._btn_pdf = QtWidgets.QPushButton("📄 Export PDF")
         self._btn_pdf.setFixedHeight(32)
         self._btn_pdf.setEnabled(False)
         self._btn_pdf.clicked.connect(self._on_export_pdf)
@@ -661,20 +661,20 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         neural_bar = QtWidgets.QHBoxLayout()
         neural_bar.setSpacing(8)
 
-        neural_bar.addWidget(QtWidgets.QLabel("Neural SDF Modell:"))
+        neural_bar.addWidget(QtWidgets.QLabel("Neural SDF model:"))
 
         self._edit_model_path = QtWidgets.QLineEdit()
         self._edit_model_path.setReadOnly(True)
-        self._edit_model_path.setPlaceholderText("Kein Modell geladen")
+        self._edit_model_path.setPlaceholderText("No model loaded")
         self._edit_model_path.setFixedWidth(380)
         neural_bar.addWidget(self._edit_model_path)
 
-        btn_load = QtWidgets.QPushButton("Laden …")
+        btn_load = QtWidgets.QPushButton("Load …")
         btn_load.setFixedHeight(26)
         btn_load.clicked.connect(self._on_load_model)
         neural_bar.addWidget(btn_load)
 
-        btn_unload = QtWidgets.QPushButton("Entfernen")
+        btn_unload = QtWidgets.QPushButton("Remove")
         btn_unload.setFixedHeight(26)
         btn_unload.clicked.connect(self._on_unload_model)
         neural_bar.addWidget(btn_unload)
@@ -706,13 +706,13 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
 
     def _on_load_model(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Neural SDF Modell laden",
-            "", "PyTorch Modell (*.pt);;Alle Dateien (*)"
+            self, "Load neural SDF model",
+            "", "PyTorch model (*.pt);;All files (*)"
         )
         if not path:
             return
         self._edit_model_path.setText(path)
-        self._lbl_model_status.setText("Lade …")
+        self._lbl_model_status.setText("Loading …")
         QtWidgets.QApplication.processEvents()
 
         status = _load_neural_model(path)
@@ -745,7 +745,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         rz = self._spin_rz.value()
         n = self._spin_n.value()
 
-        self._lbl_status.setText("Berechne …")
+        self._lbl_status.setText("Computing …")
         self._btn_run.setEnabled(False)
         QtWidgets.QApplication.processEvents()
 
@@ -761,7 +761,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
 
         ar = results["aspect_ratio"]
         self._lbl_status.setText(
-            f"Fertig — κ = {ar:.2f}  |  {elapsed:.1f} s  |  Grid {n}×{n}"
+            f"Done — κ = {ar:.2f}  |  {elapsed:.1f} s  |  Grid {n}×{n}"
         )
         self._btn_run.setEnabled(True)
 
@@ -769,11 +769,11 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
 
     def _on_export_pdf(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "PDF speichern", "benchmark_sdf.pdf",
+            self, "Save PDF", "benchmark_sdf.pdf",
             "PDF (*.pdf);;SVG (*.svg);;PNG (*.png)")
         if path:
             self._fig.savefig(path, bbox_inches="tight", facecolor=self._fig.get_facecolor())
-            self._lbl_status.setText(f"Exportiert: {path}")
+            self._lbl_status.setText(f"Exported: {path}")
 
     def _on_interior_toggled(self, checked):
         if hasattr(self, "_last_results"):
@@ -841,7 +841,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
                      vmin=sdf_vmin, vmax=sdf_vmax, **ext_kw)
         ax_gt.contour(coords, coords, gt, levels=[0],
                       colors="black", linewidths=0.8)
-        ax_gt.set_title("Ground Truth\nXY-Schnitt (z = 0)",
+        ax_gt.set_title("Ground truth\nXY slice (z = 0)",
                         fontsize=9, color=text_color)
         ax_gt.set_xlabel("x", fontsize=8, color=text_color)
         ax_gt.set_ylabel("y", fontsize=8, color=text_color)
@@ -865,8 +865,8 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         # ── Row 1: Error — label in col 0 ────────────────────────────
         ax_empty = self._fig.add_subplot(gs[1, 0])
         ax_empty.set_facecolor("#0d1117")
-        label_extra = "\n(nur Interior)" if interior_only else ""
-        ax_empty.text(0.5, 0.5, f"|Fehler|\nXY-Schnitt (z = 0){label_extra}",
+        label_extra = "\n(interior only)" if interior_only else ""
+        ax_empty.text(0.5, 0.5, f"|Error|\nXY slice (z = 0){label_extra}",
                       ha="center", va="center", fontsize=10,
                       color=text_color, transform=ax_empty.transAxes)
         ax_empty.set_xticks([])
@@ -882,7 +882,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
             ax.contour(coords, coords, gt, levels=[0],
                        colors="black", linewidths=0.6)
             mae = mae_vals[name]
-            ax.set_title(f"{name} — |Fehler|\nMAE = {mae:.4f}",
+            ax.set_title(f"{name} — |Error|\nMAE = {mae:.4f}",
                          fontsize=9, color=text_color)
             ax.set_xlabel("x", fontsize=8, color=text_color)
             ax.tick_params(colors=text_color, labelsize=7)
@@ -918,7 +918,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         """Grouped bar chart: MAE, RMSE, L∞ for XY slice."""
         interior_only = self._chk_interior.isChecked()
         region = "interior" if interior_only else "total"
-        region_label = "Interior" if interior_only else "gesamt"
+        region_label = "Interior" if interior_only else "total"
 
         sl = res["slices"]["XY"]
         names, mae, rmse, linf = [], [], [], []
@@ -938,8 +938,8 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
 
         ax.set_xticks(x)
         ax.set_xticklabels(names, fontsize=7, color=tc, rotation=35, ha="right")
-        ax.set_ylabel("Fehler", fontsize=9, color=tc)
-        ax.set_title(f"Fehlermetriken (XY, {region_label})", fontsize=9, color=tc)
+        ax.set_ylabel("Error", fontsize=9, color=tc)
+        ax.set_title(f"Error metrics (XY, {region_label})", fontsize=9, color=tc)
         ax.legend(fontsize=8, loc="upper left", facecolor="#1a2030",
                   edgecolor="#333", labelcolor=tc)
         ax.tick_params(colors=tc, labelsize=7)
@@ -981,13 +981,13 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
                                   linewidth=1.2, label=ray_label))
 
         ax.axvline(1.0, color="#666", linestyle="--", linewidth=0.8, alpha=0.6)
-        ax.annotate("Oberfläche", xy=(1.0, 0.95), xycoords=("data", "axes fraction"),
+        ax.annotate("Surface", xy=(1.0, 0.95), xycoords=("data", "axes fraction"),
                     fontsize=7, color="#888", ha="left", va="top",
                     xytext=(4, 0), textcoords="offset points")
 
-        ax.set_xlabel("Normierter Abstand (0=Zentrum, 1=Oberfläche)", fontsize=8, color=tc)
-        ax.set_ylabel("|Fehler|", fontsize=9, color=tc)
-        ax.set_title("Radiales Fehlerprofil", fontsize=9, color=tc)
+        ax.set_xlabel("Normalized distance (0=center, 1=surface)", fontsize=8, color=tc)
+        ax.set_ylabel("|Error|", fontsize=9, color=tc)
+        ax.set_title("Radial error profile", fontsize=9, color=tc)
         ax.legend(handles=handles, fontsize=5, loc="upper right",
                   facecolor="#1a2030", edgecolor="#333", labelcolor=tc, ncol=3)
         ax.tick_params(colors=tc, labelsize=7)
@@ -999,7 +999,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         timing = res["timing"]
         names = list(timing.keys())
         values = list(timing.values())
-        short_names = ["Exakt"] + [s for _, _, s in res["methods_used"]]
+        short_names = ["Exact"] + [s for _, _, s in res["methods_used"]]
 
         colors = ["#888"] + ["#f2e641", "#4962f2", "#50c878", "#c878ff",
                               "#ff9f43", "#1abc9c", "#e74c3c", "#3498db"]
@@ -1009,7 +1009,7 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
         ax.set_yticks(range(len(names)))
         ax.set_yticklabels(short_names, fontsize=7, color=tc)
         ax.set_xlabel("ms (48³ Grid)", fontsize=9, color=tc)
-        ax.set_title("Laufzeit", fontsize=9, color=tc)
+        ax.set_title("Runtime", fontsize=9, color=tc)
         ax.tick_params(colors=tc, labelsize=7)
         ax.set_facecolor("#0d1117")
         ax.spines[:].set_color("#333")
@@ -1025,12 +1025,12 @@ class BenchmarkWindow(QtWidgets.QMainWindow):
     def _update_table(self, res):
         sl = res["slices"]["XY"]
         regions = ["total", "interior", "exterior", "near_surface"]
-        region_labels = ["Gesamt", "Interior", "Exterior", "Oberfläche (±15%)"]
+        region_labels = ["Total", "Interior", "Exterior", "Surface (±15%)"]
 
-        headers = ["Methode"]
+        headers = ["Method"]
         for rl in region_labels:
             headers += [f"MAE ({rl})", f"RMSE ({rl})", f"L∞ ({rl})"]
-        headers.append("Zeit (ms)")
+        headers.append("Time (ms)")
 
         t = self._table
         t.clear()
