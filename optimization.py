@@ -1086,7 +1086,7 @@ def _zero_f32_prefix(grad: wp.array(dtype=wp.float32)):
     grad[tid] = 0.0
 
 
-device = "cuda"
+device = best_device()
 
 
 def _soft_clamp_np(x: np.ndarray, limit: float) -> np.ndarray:

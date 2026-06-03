@@ -47,7 +47,7 @@ from optimization import (
 from bone_ellipsoid_mapper import _local_to_world_kernel
 
 
-device = "cuda"
+device = best_device()
 
 
 # ── Pre-computed pose data ───────────────────────────────────────────────────

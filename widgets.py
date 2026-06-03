@@ -289,13 +289,14 @@ class SdfSlicePanel(QtWidgets.QWidget):
         rgba = colorize_sdf_slice(slice2d, self._lut, depth, out_band)
         # Pre-coloured RGBA → must be shown RAW.  ImageView otherwise applies a
         # LUT and (worse) levels=[0,1] to the uint8 image, scaling every channel
-        # value >=1 up to 255 == washed-out white.  Clear both so the colours
-        # come through exactly as computed.
+        # value >=1 up to 255 == washed-out white.  Use an identity 0..255 level
+        # so the colours come through exactly as computed.  (levels=None would
+        # crash newer pyqtgraph once autoDownsample turns the uint8 image into
+        # float on render: makeARGB demands levels for float input.)
         item = self.img_xy.getImageItem()
         item.setLookupTable(None)
         self.img_xy.setImage(rgba, autoLevels=False, autoHistogramRange=False,
-                             levels=None)
-        item.setLevels(None)
+                             levels=(0, 255))
 
     def _on_compute_clicked(self):
         self.computeRequested.emit(self.requested_n)

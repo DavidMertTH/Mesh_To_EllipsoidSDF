@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/david/Mesh_To_EllipsoidSDF/**)",
+      "Bash(.venv/Scripts/python.exe -c \"import warp as wp; print\\('cuda_available=', wp.is_cuda_available\\(\\)\\); from ellipsoid import best_device; print\\('best_device=', best_device\\(\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import optimization, pose_optimizer; print\\('optimization.device =', optimization.device\\); print\\('pose_optimizer.device =', pose_optimizer.device\\)\")"
+    ]
+  }
+}
