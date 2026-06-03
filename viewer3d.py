@@ -635,6 +635,8 @@ class ViewportOverlay(QtWidgets.QFrame):
             ("mesh", "Mesh", True),
             ("skeleton", "Skeleton", False),
             ("ellipsoids", "Ellipsoids", True),
+            ("operations", "Operations", False),
+            ("analysis", "Analysis", False),
         )
         for i, (key, label, has_combo) in enumerate(rows, start=1):
             cb = QtWidgets.QCheckBox(label)
@@ -644,6 +646,18 @@ class ViewportOverlay(QtWidgets.QFrame):
             self._checks[key] = cb
             if has_combo:
                 grid.addWidget(self._make_combo(key), i, 1)
+
+        # SuperFit operation gizmos: colour-coded boxes marking where each
+        # merge / split / spawn / fuse / delete happened (fade out over ~50 steps).
+        self._checks["operations"].setToolTip(
+            "Mark where SuperFit acted (fades over 50 steps):\n"
+            "  green = spawn   orange = split   magenta = merge\n"
+            "  blue = fuse     red = delete")
+        # Transparent spheres for the live densify analysis (current snapshot).
+        self._checks["analysis"].setToolTip(
+            "Show the current densify analysis as transparent spheres:\n"
+            "  cyan = under-represented region   yellow = over-represented\n"
+            "  pink = bridging (spans a gap between structures)")
 
         # No skeleton until one is loaded.
         self.set_skeleton_available(False)
@@ -855,10 +869,24 @@ class SceneViewer3D(_BaseViewer):
         self._region_item: Optional[gl.GLLinePlotItem] = None
         self._underrep_item: Optional[gl.GLScatterPlotItem] = None
 
+        # ── SuperFit operation gizmos ──
+        # Each event is dict(op, c=center(3,), r=radius, birth=step); drawn as a
+        # colour-coded wireframe box that fades out over ``_op_gizmo_life`` steps.
+        self._op_gizmo_item: Optional[gl.GLLinePlotItem] = None
+        self._op_events: list[dict] = []
+        self._op_current_step = 0
+        self._op_gizmo_life = 50
+
+        # ── densify analysis overlay (transparent spheres, current snapshot) ──
+        self._analysis_item: Optional[gl.GLMeshItem] = None
+        self._analysis_regions: dict = {}
+
         # ── display flags ──
         self._show_mesh = True
         self._show_skeleton = True
         self._show_ellipsoids = True
+        self._show_op_gizmos = True
+        self._show_analysis = True
         # Independent render mode per surface object — defaults come from the
         # overlay combos (the single source of truth); the mesh starts wireframe.
         self._mesh_render_mode = ViewportOverlay._DEFAULT_MODE["mesh"]
@@ -976,6 +1004,14 @@ class SceneViewer3D(_BaseViewer):
                 self._rm_label.setVisible(on)
                 if on:
                     self._render_raymarch(full=True)
+        elif key == "operations":
+            self._show_op_gizmos = on
+            if self._op_gizmo_item is not None:
+                self._op_gizmo_item.setVisible(on and bool(self._op_events))
+        elif key == "analysis":
+            self._show_analysis = on
+            if self._analysis_item is not None:
+                self._analysis_item.setVisible(on and bool(self._analysis_regions))
 
     def _on_render_mode_changed(self, target: str, mode: str) -> None:
         if target == "mesh":
@@ -1395,6 +1431,143 @@ class SceneViewer3D(_BaseViewer):
         if self._region_item is not None:
             self._view.removeItem(self._region_item)
             self._region_item = None
+
+    # ── SuperFit operation gizmos ───────────────────────────────────────
+    # Colour per operation type (RGB); alpha is added per event from its age.
+    _OP_COLORS = {
+        "spawn":  (0.25, 1.00, 0.35),   # green  — new ellipsoid
+        "split":  (1.00, 0.65, 0.10),   # orange — divided ellipsoid
+        "merge":  (0.90, 0.30, 1.00),   # magenta — fused pair → one
+        "fuse":   (0.30, 0.60, 1.00),   # blue   — redundant, dropped
+        "delete": (1.00, 0.25, 0.25),   # red    — outside / degenerate, dropped
+    }
+
+    def add_op_gizmos(self, step: int, events) -> None:
+        """Record SuperFit operation markers emitted at maintenance ``step``.
+
+        ``events`` is an iterable of ``(op, center_world, radius_world)``.  Each
+        becomes a colour-coded wireframe box that lingers for ``_op_gizmo_life``
+        steps (see :meth:`tick_op_gizmos`) and fades as it ages.
+        """
+        self._op_current_step = int(step)
+        for op, center, radius in events:
+            self._op_events.append({
+                "op": str(op),
+                "c": np.asarray(center, dtype=np.float32),
+                "r": max(float(radius), 1e-4),
+                "birth": int(step),
+            })
+        self._rebuild_op_gizmos()
+
+    def tick_op_gizmos(self, step: int) -> None:
+        """Advance the gizmo clock to ``step``: drop expired markers + refade."""
+        self._op_current_step = int(step)
+        if not self._op_events:
+            return
+        alive = [e for e in self._op_events
+                 if 0 <= step - e["birth"] < self._op_gizmo_life]
+        self._op_events = alive
+        self._rebuild_op_gizmos()
+
+    def clear_op_gizmos(self) -> None:
+        self._op_events = []
+        if self._op_gizmo_item is not None:
+            self._view.removeItem(self._op_gizmo_item)
+            self._op_gizmo_item = None
+
+    def _rebuild_op_gizmos(self) -> None:
+        """Rebuild the single line item holding every live operation box."""
+        seg_list, col_list = [], []
+        for e in self._op_events:
+            age = self._op_current_step - e["birth"]
+            frac = max(0.0, 1.0 - age / float(self._op_gizmo_life))
+            half = e["r"]
+            segs = self._box_segments(e["c"] - half, e["c"] + half)   # (E, 3)
+            r, g, b = self._OP_COLORS.get(e["op"], (1.0, 1.0, 1.0))
+            alpha = 0.20 + 0.80 * frac      # newest = opaque, oldest = faint
+            col = np.tile(np.array([r, g, b, alpha], dtype=np.float32),
+                          (len(segs), 1))
+            seg_list.append(segs)
+            col_list.append(col)
+
+        if not seg_list:
+            if self._op_gizmo_item is not None:
+                self._op_gizmo_item.setVisible(False)
+            return
+
+        pts = np.concatenate(seg_list, axis=0).astype(np.float32)
+        cols = np.concatenate(col_list, axis=0).astype(np.float32)
+        if self._op_gizmo_item is None:
+            self._op_gizmo_item = gl.GLLinePlotItem(
+                pos=pts, color=cols, width=2.0, mode="lines", antialias=True)
+            self._op_gizmo_item.setGLOptions("translucent")
+            self._view.addItem(self._op_gizmo_item)
+        else:
+            self._op_gizmo_item.setData(pos=pts, color=cols, width=2.0,
+                                        mode="lines")
+        self._op_gizmo_item.setVisible(self._show_op_gizmos)
+
+    # ── densify analysis overlay (transparent spheres) ──────────────────
+    # Fill colour per analysis class (RGB); alpha is applied in _rebuild.
+    _ANALYSIS_COLORS = {
+        "under":  (0.15, 0.85, 0.95),   # cyan   — under-represented region
+        "over":   (1.00, 0.85, 0.15),   # yellow — over-represented (protruding)
+        "bridge": (1.00, 0.35, 0.65),   # pink   — bridging a gap
+    }
+
+    def set_analysis_regions(self, regions: dict) -> None:
+        """Show the current densify analysis as transparent world-space spheres.
+
+        ``regions`` maps each class ("under" / "over" / "bridge") to a list of
+        ``(center_world, radius_world)`` pairs.  Replaces the previous snapshot.
+        """
+        self._analysis_regions = regions or {}
+        self._rebuild_analysis()
+
+    def clear_analysis_regions(self) -> None:
+        self._analysis_regions = {}
+        if self._analysis_item is not None:
+            self._view.removeItem(self._analysis_item)
+            self._analysis_item = None
+
+    def _rebuild_analysis(self) -> None:
+        """Concatenate one transparent icosphere per analysed region into a
+        single GLMeshItem (one draw call), colour-coded per class."""
+        verts_list, faces_list, cols_list = [], [], []
+        offset = 0
+        for cls, items in self._analysis_regions.items():
+            rgb = self._ANALYSIS_COLORS.get(cls)
+            if rgb is None:
+                continue
+            for center, radius in items:
+                r = max(float(radius), 1e-4)
+                v = (_UNIT_VERTS * r
+                     + np.asarray(center, dtype=np.float32)[None, :])
+                verts_list.append(v.astype(np.float32))
+                faces_list.append(_UNIT_FACES + offset)
+                cols_list.append(np.tile(
+                    np.array([*rgb, 0.22], dtype=np.float32),
+                    (_UNIT_N_VERTS, 1)))
+                offset += _UNIT_N_VERTS
+
+        if not verts_list:
+            if self._analysis_item is not None:
+                self._analysis_item.setVisible(False)
+            return
+
+        verts = np.concatenate(verts_list, axis=0).astype(np.float32)
+        faces = np.concatenate(faces_list, axis=0).astype(np.int32)
+        cols = np.concatenate(cols_list, axis=0).astype(np.float32)
+        if self._analysis_item is None:
+            self._analysis_item = gl.GLMeshItem(
+                vertexes=verts, faces=faces, vertexColors=cols,
+                drawFaces=True, drawEdges=False, smooth=True)
+            self._analysis_item.setGLOptions("translucent")
+            self._view.addItem(self._analysis_item)
+        else:
+            self._analysis_item.setMeshData(
+                vertexes=verts, faces=faces, vertexColors=cols)
+        self._analysis_item.setVisible(self._show_analysis)
 
     # ── SDF slice plane ─────────────────────────────────────────────────
 

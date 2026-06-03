@@ -1337,6 +1337,8 @@ class OptimizationWorker(QtCore.QThread):
     local_progress   = QtCore.Signal(int, int)   # (current, total) local-fit steps
     region_changed   = QtCore.Signal(object)  # (aabb_min, aabb_max) world box, or None
     prep_progress    = QtCore.Signal(float, str)  # (0..1, label) pre-training setup
+    op_events        = QtCore.Signal(int, object)  # (step, [(op:str, center:(3,), radius:float), ...])
+    analysis_regions = QtCore.Signal(int, object)  # (step, {'over'|'under'|'bridge': [(center, radius), ...]})
     finished         = QtCore.Signal()
 
     DEFAULT_BATCH_FRACTION = 0.125
@@ -1455,6 +1457,17 @@ class OptimizationWorker(QtCore.QThread):
         self._local_steps = local_steps
         self._local_lr = local_lr
         self._region_radius_vox = region_radius_vox
+        # How many under-represented regions to surface for the analysis overlay
+        # (≥ the densify budget so the viewport shows more than just the few that
+        # get acted on this cycle).
+        self._analysis_region_k = 24
+        # Severity floor (relative-miss × surface-emphasis) below which a region
+        # is NOT considered under-represented.  Filters the marginal half-voxel
+        # gaps that otherwise flood both the overlay and the spawn/split picker.
+        # Severity = rel · sw with sw up to (1 + surface_weight) on the surface,
+        # so requiring a surface region to reach rel ≈ 0.6 (the points-detector
+        # ``rel_threshold``) before it counts means a floor of 0.6·(1+sw_max).
+        self._analysis_min_severity = 0.6 * (1.0 + float(self._surface_weight))
         self._spawn_per_round = spawn_per_round
         self._spawn_underrep = spawn_underrep
         self._split_enabled = split_enabled
@@ -2261,7 +2274,8 @@ class OptimizationWorker(QtCore.QThread):
             self._origin, self._dx, self._n, sdf_mode=self._sdf_mode,
             shape=(self._nx, self._ny, self._nz))
 
-    def _detect_worst_regions(self, centers, radii, rotations, k):
+    def _detect_worst_regions(self, centers, radii, rotations, k,
+                              min_severity: float = 0.0):
         """Find up to ``k`` *spatially-separated* under-represented regions.
 
         Greedy peak picking on the severity grid: take the argmax, record its
@@ -2272,6 +2286,12 @@ class OptimizationWorker(QtCore.QThread):
           - ``pool_flat``   : flat voxel indices of the local interior pool
           - ``seed_depth``  : local feature thickness at the seed (|target|)
           - ``severity``    : peak severity value
+
+        ``min_severity`` stops the search as soon as the next-worst peak falls
+        below it (severity = relative miss × surface emphasis).  The grid assigns
+        a non-zero severity to *any* voxel missed by ≥ half a voxel, so without a
+        floor the picker keeps surfacing marginal, essentially-covered regions;
+        the floor restricts it to genuinely under-represented ones.
         """
         nx, ny, nz = self._nx, self._ny, self._nz
         dx, origin = self._dx, self._origin
@@ -2304,10 +2324,11 @@ class OptimizationWorker(QtCore.QThread):
             return flat[d <= r]
 
         regions = []
+        floor = max(0.0, float(min_severity))
         for _ in range(int(k)):
             seed_flat = int(np.argmax(flat_sev))
             peak = float(flat_sev[seed_flat])
-            if peak <= 0.0:
+            if peak <= floor:
                 break
             siz, siy, six = np.unravel_index(seed_flat, self._shape)
             seed_world = (origin.astype(np.float32)
@@ -2441,20 +2462,33 @@ class OptimizationWorker(QtCore.QThread):
         return flat[flat_target[flat] < 0.0]
 
     def _detect_protruding_ellipsoids(self, centers, radii, rotations) -> np.ndarray:
-        """Indices of large ellipsoids that stick out past the mesh surface.
+        """Indices of ellipsoids that stick out past the mesh surface *because
+        they are too big in that direction*.  Returned worst-first.
 
         For each ellipsoid we sample the target SDF at its six principal-axis
-        tips (center ± semi-axis·axis).  A tip with ``target > margin`` lies
-        outside the mesh, so the ellipsoid protrudes there.  Splitting only
-        helps if the ellipsoid is also *large* — either in absolute terms or
-        relative to the local feature thickness (a fat ellipsoid bridging
-        several thin parts).  Returned worst-(most-protruding)-first.
+        tips (center ± semi-axis·axis).  A tip with ``target > 0`` lies outside
+        the mesh.  But a tip grazing the surface is normal and *good* — a
+        well-fitting ellipsoid's surface coincides with the mesh, so its tips sit
+        right at it.  The old test flagged any tip poking out by half a voxel and
+        then gated on ``max_r`` vs. the local thickness; for an elongated
+        ellipsoid (a limb / finger) the long axis is naturally far larger than
+        the cross-section, so that gate was always true and virtually every good
+        elongated fit was flagged.
+
+        Instead we require the overshoot to be a meaningful fraction of *that
+        tip's own semi-axis*: ``t / r[k] > rel_thresh``.  This is exactly "the
+        ellipsoid is at least ``split_size_factor`` too long along axis k" and is
+        scale- and elongation-invariant — a 1-voxel poke on a 20-voxel axis is
+        ignored, while a genuinely oversized axis is caught.  ``rel_thresh`` is
+        derived from the same ``split_size_factor`` knob: for an axis oversized
+        by factor f the centred overshoot is ``(f−1)/f`` of the semi-axis.
         """
         target = self._sdf_target_np
-        thick = self._thickness_np
         dx = float(self._dx)
-        margin = float(self._split_margin_vox) * dx
+        margin = float(self._split_margin_vox) * dx          # sub-voxel-noise floor
         min_r = float(self._min_split_radius_vox) * dx
+        f = max(float(self._split_size_factor), 1.0 + 1e-6)
+        rel_thresh = 1.0 - 1.0 / f                            # (f−1)/f
 
         idx, scores = [], []
         for i in range(len(centers)):
@@ -2464,23 +2498,19 @@ class OptimizationWorker(QtCore.QThread):
 
             protr = 0.0
             for k in range(3):
+                rk = float(r[k])
+                if rk <= 0.0:
+                    continue
                 axis = Rm[:, k]
                 for s in (1.0, -1.0):
-                    t = self._grid_value(target, c + s * float(r[k]) * axis)
-                    if t > margin:
-                        protr = max(protr, t)
+                    t = self._grid_value(target, c + s * rk * axis)
+                    # Outside by both an absolute (noise) and a relative
+                    # (vs this semi-axis) margin → genuinely oversized here.
+                    if t > margin and (t / rk) > rel_thresh:
+                        protr = max(protr, t / rk)
             if protr <= 0.0:
                 continue
-
-            max_r = float(np.max(r))
-            if max_r < min_r:
-                continue
-            oversized = True
-            if thick is not None:
-                th_c = self._grid_value(thick, c)
-                if th_c > 0.0:
-                    oversized = max_r > self._split_size_factor * (0.5 * th_c)
-            if not oversized:
+            if float(np.max(r)) < min_r:
                 continue
 
             idx.append(i)
@@ -3647,10 +3677,21 @@ class OptimizationWorker(QtCore.QThread):
 
         n_before = len(centers)
 
+        # Operation gizmo events for the 3-D viewport: each is
+        # ``(op, center_world, radius_world)`` recorded at the spot the move
+        # happened, so the user can watch where SuperFit acted.
+        ops: list[tuple] = []
+
+        def _record(op, idx, cen, rad):
+            for i in np.atleast_1d(np.asarray(idx, dtype=int)):
+                ops.append((op, cen[i].astype(np.float32).copy(),
+                            float(np.max(np.abs(rad[i])))))
+
         # ── 0a) Delete ellipsoids that sit entirely outside the mesh ──
         out_idx = self._detect_outside_ellipsoids(centers, radii, rotations)
         n_deleted = int(len(out_idx))
         if n_deleted > 0:
+            _record('delete', out_idx, centers, radii)
             keep = np.ones(len(centers), dtype=bool)
             keep[out_idx] = False
             centers, radii, rotations = centers[keep], radii[keep], rotations[keep]
@@ -3661,6 +3702,7 @@ class OptimizationWorker(QtCore.QThread):
         # transiently making everything degenerate).
         if 0 < len(deg_idx) < len(centers):
             n_deleted += int(len(deg_idx))
+            _record('delete', deg_idx, centers, radii)
             keep = np.ones(len(centers), dtype=bool)
             keep[deg_idx] = False
             centers, radii, rotations = centers[keep], radii[keep], rotations[keep]
@@ -3671,6 +3713,7 @@ class OptimizationWorker(QtCore.QThread):
             centers, radii, rotations, self._fuse_per_round)
         n_fused = int(len(fuse_idx)) + n_deleted
         if len(fuse_idx) > 0:
+            _record('fuse', fuse_idx, centers, radii)
             keep = np.ones(len(centers), dtype=bool)
             keep[fuse_idx] = False
             centers, radii, rotations = centers[keep], radii[keep], rotations[keep]
@@ -3678,14 +3721,50 @@ class OptimizationWorker(QtCore.QThread):
         # ── 0c) Merge overlapping pairs into one when it barely moves the surface
         centers, radii, rotations, n_merged = self._detect_merges(
             centers, radii, rotations)
+        # _detect_merges appends the merged ellipsoids at the tail of the arrays,
+        # so the last ``n_merged`` entries are the fused-pair results.
+        if n_merged > 0:
+            _record('merge', np.arange(len(centers) - n_merged, len(centers)),
+                    centers, radii)
         n_fused += n_merged
+
+        # ── Analysis snapshot for the 3-D viewport ──────────────────────
+        # Run the three densify detectors on the post-fuse/merge population and
+        # publish *what they flag*, independent of which mechanisms are enabled
+        # or how much budget is left — so the user can see how over-/under-/
+        # bridging classification behaves.  The action paths below reuse these
+        # results (no detector runs twice).
+        viz_bridge = self._detect_bridging_ellipsoids(centers, radii, rotations)
+        viz_protr = self._detect_protruding_ellipsoids(centers, radii, rotations)
+        viz_regions = self._detect_worst_regions(
+            centers, radii, rotations, self._analysis_region_k,
+            min_severity=self._analysis_min_severity)
+        if not self.signalsBlocked():
+            bridge_set = set(int(i) for i in viz_bridge)
+            region_r_world = float(self._region_radius_vox) * float(self._dx)
+            analysis = {
+                # Bridging takes priority over plain protrusion (as in the action
+                # path), so an ellipsoid is shown in at most one over-rep class.
+                'over': [(centers[i].astype(np.float32).copy(),
+                          float(np.max(np.abs(radii[i]))))
+                         for i in viz_protr if int(i) not in bridge_set],
+                'bridge': [(centers[i].astype(np.float32).copy(),
+                            float(np.max(np.abs(radii[i])))) for i in viz_bridge],
+                'under': [(np.asarray(reg['seed_world'], np.float32).copy(),
+                           region_r_world) for reg in viz_regions],
+            }
+            self.analysis_regions.emit(step, analysis)
 
         n_curr = len(centers)
         budget = self._max_ellipsoids - n_curr           # net additions allowed
         if budget <= 0:
             if n_fused > 0:
+                if ops:
+                    self.op_events.emit(step, ops)
                 self.maintenance_done.emit(step, n_before, n_fused, 0)
                 return centers, radii, rotations
+            if ops:
+                self.op_events.emit(step, ops)
             return None
 
         # ── Densify: SPLIT over-represented ellipsoids + SPLIT/SPAWN in under-rep
@@ -3696,8 +3775,8 @@ class OptimizationWorker(QtCore.QThread):
         #    *protrudes* past the surface.  Combine both, bridging-first, dedup.
         targets, seen = [], set()
         if self._split_enabled:
-            bridge = self._detect_bridging_ellipsoids(centers, radii, rotations)
-            protr = self._detect_protruding_ellipsoids(centers, radii, rotations)
+            bridge = viz_bridge           # reuse the analysis-snapshot detections
+            protr = viz_protr
             cap_over = int(min(self._split_per_round, budget))
             for v in list(bridge) + list(protr):
                 v = int(v)
@@ -3715,8 +3794,9 @@ class OptimizationWorker(QtCore.QThread):
         spawn_sites = []
         if self._split_enabled or self._spawn_underrep:
             n_dens = int(min(self._spawn_per_round, budget - len(targets)))
-            regions = (self._detect_worst_regions(centers, radii, rotations, n_dens)
-                       if n_dens > 0 else [])
+            # The worst-first viz regions are a superset; the action path only
+            # needs the top-``n_dens`` (greedy peak order is identical).
+            regions = viz_regions[:n_dens] if n_dens > 0 else []
             split_tgts, spawn_regions = self._densify_regions(
                 centers, radii, regions, budget - len(targets), exclude=seen,
                 split_enabled=self._split_enabled,
@@ -3744,8 +3824,12 @@ class OptimizationWorker(QtCore.QThread):
                     spawn_sites = spawn_sites + [
                         (mc[i].astype(np.float32), h) for i, (_c, h) in enumerate(spawn_sites)]
         n_spawn = int(len(spawn_c))
+        if n_spawn > 0:
+            _record('spawn', np.arange(n_spawn), spawn_c, spawn_r)
 
         if not targets and n_spawn == 0:
+            if ops:
+                self.op_events.emit(step, ops)
             if n_fused > 0:
                 self.maintenance_done.emit(step, n_before, n_fused, 0)
                 return centers, radii, rotations
@@ -3767,6 +3851,7 @@ class OptimizationWorker(QtCore.QThread):
             parent_max_r = float(np.max(np.abs(radii[i])))
             half = max(r_radius_world, parent_max_r * float(self._split_size_factor))
             region_sites.append((centers[i].astype(np.float32).copy(), half))
+            ops.append(('split', centers[i].astype(np.float32).copy(), parent_max_r))
 
         # Append spawned ellipsoids and their region sites.
         if n_spawn > 0:
@@ -3846,6 +3931,8 @@ class OptimizationWorker(QtCore.QThread):
             )
             self.phase_changed.emit("global")
 
+        if ops:
+            self.op_events.emit(step, ops)
         n_appended = len(centers) - offset
         self.maintenance_done.emit(
             step, n_before, n_fused + n_split + n_spawn, n_appended)

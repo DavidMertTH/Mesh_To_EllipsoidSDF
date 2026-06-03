@@ -1537,7 +1537,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._opt_worker.local_progress.connect(self._on_opt_local_progress)
         self._opt_worker.region_changed.connect(self._on_opt_region_changed)
         self._opt_worker.prep_progress.connect(self._on_opt_prep_progress)
+        self._opt_worker.op_events.connect(self._on_opt_op_events)
+        self._opt_worker.analysis_regions.connect(self._on_opt_analysis_regions)
         self._opt_worker.finished.connect(self._on_opt_finished)
+        self._viewer.clear_op_gizmos()      # drop markers from a previous run
+        self._viewer.clear_analysis_regions()
         self._opt_worker.start()
 
         sdf_name = SDF_METHOD_NAMES.get(sdf_mode, "?")
@@ -1582,6 +1586,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # per-primitive eps array for the deformed mesh).
         self._shape.render(self._viewer, centers, radii, rotations, eps)
         self._lbl_ell_count.setText(f"Count: {len(centers)}")
+
+        # Age out / fade the SuperFit operation gizmos as training advances.
+        self._viewer.tick_op_gizmos(step)
 
         # Training progress in the status-bar progress bar (step / total).
         phase = getattr(self, "_opt_phase", "global")
@@ -1631,6 +1638,19 @@ class MainWindow(QtWidgets.QMainWindow):
             + ("isolated local fit of new ellipsoids"
                if phase == "local" else "global optimisation"))
 
+    def _on_opt_op_events(self, step: int, events) -> None:
+        """Mark where SuperFit just acted (merge/split/spawn/fuse/delete).
+
+        Each marker is a colour-coded box in the 3-D view that fades over the
+        next 50 steps; toggle the whole layer with the "Operations" checkbox.
+        """
+        self._viewer.add_op_gizmos(step, events)
+
+    def _on_opt_analysis_regions(self, step: int, regions) -> None:
+        """Show the current densify analysis (over/under/bridging) as
+        transparent spheres; toggle with the "Analysis" checkbox."""
+        self._viewer.set_analysis_regions(regions)
+
     def _on_opt_region_changed(self, box) -> None:
         """Mark (or clear) the high-res region boxes currently being optimised.
 
@@ -1664,6 +1684,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dashboard.finish()
         self._opt_worker = None
         self._viewer.clear_region_box()
+        self._viewer.clear_op_gizmos()
+        self._viewer.clear_analysis_regions()
         self._progress_end()
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._btn_stop.setEnabled(False)

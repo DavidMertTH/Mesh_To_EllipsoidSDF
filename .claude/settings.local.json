@@ -180,7 +180,12 @@
       "Bash(timeout 150 .venv/Scripts/python.exe -c ' *)",
       "Bash(.venv/Scripts/python.exe -c \"import pyqtgraph as pg, inspect; from pyqtgraph.opengl import MeshData; print\\(MeshData.__module__\\)\")",
       "Bash(QT_QPA_PLATFORM=offscreen .venv/Scripts/python.exe -c ' *)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('sdf_compute.py',encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('sdf_compute.py',encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -m py_compile optimization.py viewer3d.py main_window.py)",
+      "Bash(python -c \"import viewer3d, optimization; print\\('import OK'\\); print\\('OP_COLORS:', list\\(viewer3d.SceneViewer3D._OP_COLORS.keys\\(\\)\\)\\); print\\('has op_events signal:', hasattr\\(optimization.OptimizationWorker, 'op_events'\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import viewer3d, optimization; print\\('import OK'\\); print\\('OP_COLORS:', list\\(viewer3d.SceneViewer3D._OP_COLORS.keys\\(\\)\\)\\); print\\('has op_events signal:', hasattr\\(optimization.OptimizationWorker, 'op_events'\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -m py_compile optimization.py viewer3d.py main_window.py)",
+      "Bash(.venv/Scripts/python.exe -c \"import optimization; print\\('compile + import OK'\\)\")"
     ]
   }
 }
