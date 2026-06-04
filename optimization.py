@@ -1356,7 +1356,7 @@ class OptimizationWorker(QtCore.QThread):
         batch_size: int | None = None,
         sample_budget: int = 49152,
         surface_band_vox: float = 3.0,
-        surface_fraction: float = 0.6,
+        surface_fraction: float = 0.75,
         maintenance_every: int = 200,
         miss_penalty_weight: float = 3.0,
         outside_penalty_weight: float = 14.0,
@@ -1658,18 +1658,12 @@ class OptimizationWorker(QtCore.QThread):
                 e_np = np.concatenate([e_np, b_np], axis=1)
         self.step_visual.emit(step, loss_val, c_np, r_np, q_np, e_np)
 
-        if step % (self._report_every * 10) == 0:
-            # Heavy n³ work runs HERE, on the worker thread, so the GUI thread
-            # never blocks computing the union SDF grid / under-rep at high res.
-            ell_grid = self._pred_grid_from_params(c_np, r_np, q_np)
-            ur_points, ur_values = compute_relative_underrep(
-                target_grid=self._sdf_target_np, pred_grid=ell_grid,
-                origin=origin, dx=dx, n=n,
-                surface_weight=self._surface_weight,
-                surface_sigma_vox=max(self._surface_sigma / max(dx, 1e-12), 1e-6),
-                thickness_grid=self._thickness_np,
-            )
-            self.step_sdf.emit(step, loss_val, ell_grid, ur_points, ur_values)
+        # NB: the per-step ellipsoid-SDF grid + under-rep used to be computed
+        # here and emitted via ``step_sdf`` for an ellipsoid slice view.  That
+        # view was removed (the slice now shows the mesh only), so its consumer
+        # is a no-op — computing the n³ grid every report_every·10 steps was
+        # pure wasted work (costly on CPU especially) and has been dropped.
+        # The spawn/maintenance path computes its own under-rep independently.
 
     # ── buffer allocation ─────────────────────────────────────────────
 

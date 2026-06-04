@@ -2,21 +2,23 @@
 main_window.py — Application main window (fullscreen, three columns).
 
   ┌──────────────────────────┬──────────────────┬──────────────────┐
-  │  3-D Viewport            │  SDF analysis    │  Options column  │
-  │  (mesh + skeleton +      │  (slice)         │  (scrollable):   │
-  │   ellipsoids, overlay)   ├──────────────────┤   Mesh, Training,│
-  │                          │  Convergence +   │   Maintenance    │
-  │ ┌ FBX / rig panel ─────┐ │  statistics      │   (merge/spawn/  │
-  │ └ (below, if rigged)   ┘ │  (loss curve)    │    split), LR,   │
-  │                          │                  │   colours, Fit   │
+  │  3-D Viewport            │  SDF Slice / Mesh │  Options column  │
+  │  (mesh + skeleton +      │  (tabbed)        │  (scrollable):   │
+  │   ellipsoids, overlay)   │  ┌ Mesh tab ────┐│   Mesh, Training,│
+  │                          │  │ rotation/blow││   Maintenance    │
+  │                          │  │ + FBX/rig    ││   (merge/spawn/  │
+  │                          │  └ panel ───────┘│    split), LR,   │
+  │                          ├──────────────────┤   colours, Fit   │
+  │                          │  Convergence +   │                  │
+  │                          │  statistics      │                  │
   └──────────────────────────┴──────────────────┴──────────────────┘
 
 Starts fullscreen (F11 / Esc to toggle).
 Left:    mesh, skeleton bones and fitted ellipsoids share one GL scene with an
-         in-viewport overlay (visibility toggles + render mode).  The FBX/rig
-         panel appears *below* the viewport when a rigged mesh is loaded.
-Middle:  the mesh SDF slice (top) and the convergence curve + run statistics
-         (bottom) combined in one resizable column.
+         in-viewport overlay (visibility toggles + render mode).
+Middle:  a tabbed top panel (SDF slice / Mesh) over the convergence curve + run
+         statistics.  The "Mesh" tab holds per-mesh rotation/blowup controls and
+         the FBX/rig panel (shown only when a rigged mesh is loaded).
 Right:   a scrollable options column — every selectable control, including
          on/off switches for the merge / spawn / split maintenance moves and
          the learning-rate parameters.
@@ -121,8 +123,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_mesh_result: SdfResult | None = None
         # Single unified viewport: mesh + skeleton + ellipsoids together.
         self._viewer = SceneViewer3D()
-        # SDF slice is shown for the mesh only.
-        self._mesh_sdf_panel = SdfSlicePanel()
+        # SDF slice is shown for the mesh only.  Without a CUDA GPU the n³ SDF
+        # runs on the CPU, so start at a much smaller default grid (64 vs 512).
+        self._cpu_only = not str(self._device).startswith("cuda")
+        self._mesh_sdf_panel = SdfSlicePanel(
+            default_n=128 if self._cpu_only else 512)
+        # Visual-refresh cadence (steps between viewport/dashboard updates).  On
+        # GPU each emit forces a device sync + readback, so a wider stride (20)
+        # keeps throughput up; on CPU steps are slow, so refresh more often (5)
+        # for responsiveness — the sync is essentially free there.
+        self._report_every = 5 if self._cpu_only else 20
 
         self._run_tracker = RunTrackerPanel()
         # Compact live status board (cards + mini graphs); complements the tracker.
@@ -230,20 +240,18 @@ class MainWindow(QtWidgets.QMainWindow):
         #   right  — a scrollable column with every option
         self._build_option_widgets()
 
-        # ── Left: viewport + FBX panel beneath ──
+        # ── Left: viewport only (the FBX/rig panel now lives in the Mesh tab) ──
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
         left_layout.addWidget(self._viewer.widget, 1)
-        left_layout.addWidget(self._rig_panel, 0)
-        self._rig_panel.setVisible(False)   # only when a rigged mesh is loaded
 
         # ── Middle: tabbed (SDF Slice / Mesh) on top, tabbed Dashboard / Runs
-        # below ──
+        # below ──.  The Mesh tab bundles per-mesh settings + the FBX/rig panel.
         self._top_tabs = QtWidgets.QTabWidget()
         self._top_tabs.addTab(self._mesh_sdf_panel, "SDF Slice")
-        self._top_tabs.addTab(self._mesh_settings, "Mesh")
+        self._top_tabs.addTab(self._build_mesh_tab(), "Mesh")
         self._analysis_tabs = QtWidgets.QTabWidget()
         self._analysis_tabs.addTab(self._dashboard, "Dashboard")
         self._analysis_tabs.addTab(self._run_tracker, "Runs")
@@ -275,6 +283,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         self._scan_mesh_dir()
         self._load_default_mesh()
+
+    def _build_mesh_tab(self) -> QtWidgets.QScrollArea:
+        """Compose the 'Mesh' tab: per-mesh settings + the FBX/rig panel.
+
+        The rig panel (pose scrubbing, multi-pose fit, bone assignment, Unity
+        export) used to sit below the viewport; it now lives here, scrollable
+        and hidden until a rigged FBX is loaded (``_rig_panel.setVisible``).
+        """
+        container = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(container)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(4)
+        v.addWidget(self._mesh_settings)
+        v.addWidget(self._rig_panel)
+        self._rig_panel.setVisible(False)   # only when a rigged mesh is loaded
+        v.addStretch(1)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(container)
+        return scroll
 
     def _load_default_mesh(self):
         """Load T-Pose.fbx (if present) as the startup model."""
@@ -1178,7 +1207,7 @@ class MainWindow(QtWidgets.QMainWindow):
             mapper=mapper,
             num_steps=self._rig_panel.multi_pose_steps,
             steps_per_pose=self._rig_panel.multi_pose_steps_per_pose,
-            report_every=20,
+            report_every=self._report_every,
             grid_n=grid_n,
             margin=margin,
             lr=self._rig_panel.multi_pose_lr,
@@ -1410,7 +1439,7 @@ class MainWindow(QtWidgets.QMainWindow):
             num_ellipsoids=self._spin_num_ellipsoids.value(),
             method="adam",
             num_steps=self._spin_max_steps.value(),
-            report_every=20,
+            report_every=self._report_every,
             maintenance_every=0,
             max_ellipsoids=self._spin_max_ellipsoids.value(),
             symmetry=self._chk_symmetry.isChecked(),

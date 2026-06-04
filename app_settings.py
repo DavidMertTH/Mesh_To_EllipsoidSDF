@@ -126,11 +126,11 @@ SETTINGS_SPEC = [
 
     ("Sampling", [
         ("Batch sampling", [
-            ("sample_budget", "Sample budget (voxels)", "int", 4096, 262144, 4096, 0, 49152,
+            ("sample_budget", "Sample budget (voxels)", "int", 4096, 262144, 4096, 0, 16384,
              "Voxels sampled per optimisation step — resolution-independent cost."),
             ("surface_band_vox", "Surface band (vox)", "float", 0.5, 10.0, 0.5, 1, 3.0,
              "Half-width (in voxels) of the surface band for importance sampling."),
-            ("surface_fraction", "Surface fraction", "float", 0.0, 1.0, 0.05, 2, 0.6,
+            ("surface_fraction", "Surface fraction", "float", 0.0, 1.0, 0.05, 2, 0.75,
              "Fraction of each batch drawn from the surface band."),
             ("coverage_sample_size", "Coverage sample size", "int", 1000, 100000, 1000, 0, 20000,
              "Number of samples used to estimate coverage / under-representation."),

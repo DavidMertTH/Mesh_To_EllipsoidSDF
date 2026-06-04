@@ -180,7 +180,20 @@
       "Bash(timeout 150 .venv/Scripts/python.exe -c ' *)",
       "Bash(.venv/Scripts/python.exe -c \"import pyqtgraph as pg, inspect; from pyqtgraph.opengl import MeshData; print\\(MeshData.__module__\\)\")",
       "Bash(QT_QPA_PLATFORM=offscreen .venv/Scripts/python.exe -c ' *)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('sdf_compute.py',encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('sdf_compute.py',encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(./.venv/Scripts/python.exe -X importtime -c \"import pyqtgraph\")",
+      "Bash(sort -t'|' -k2 -n -r perf.txt)",
+      "Bash(./.venv/Scripts/python.exe -m py_compile main.py)",
+      "Bash(python -m py_compile main_window.py mesh_settings.py rig_panel.py)",
+      "Bash(python -m py_compile main_window.py widgets.py)",
+      "Bash(python -m py_compile main_window.py optimization.py widgets.py)",
+      "Bash(python3 -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(python3 -c \"import glob,os; fs=glob.glob\\(os.path.expanduser\\('~/.claude/projects/*/*.jsonl'\\)\\); print\\(len\\(fs\\)\\); [print\\(f\\) for f in fs]\")",
+      "Bash(python *)",
+      "Bash(.venv/Scripts/python.exe -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(.venv/Scripts/python.exe main.py)",
+      "Bash(.venv/Scripts/pythonw.exe -c \"import sys; open\\('pythonw_test.txt','w'\\).write\\(repr\\(sys.stdout\\)\\)\")",
+      "Bash(rm pythonw_test.txt)"
     ]
   }
 }

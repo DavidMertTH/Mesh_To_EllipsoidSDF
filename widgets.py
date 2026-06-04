@@ -179,11 +179,15 @@ class SdfSlicePanel(QtWidgets.QWidget):
 
     computeRequested = QtCore.Signal(int)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, default_n: int = 512):
         super().__init__(parent)
         self._lut = make_sdf_lut()
         self._sdf_grid: Optional[np.ndarray] = None
         self._dx: float = 1.0                 # voxel size (for the exterior band)
+        # Default grid resolution.  The host lowers this (→ 64) when no CUDA GPU
+        # is present, since the n³ SDF runs on the CPU there and 512³ is far too
+        # heavy.  Not persisted, so it is re-applied per session.
+        self._default_n = int(default_n)
         self._build_ui()
 
     # ── public API ────────────────────────────────────────────────────────
@@ -232,7 +236,7 @@ class SdfSlicePanel(QtWidgets.QWidget):
 
         self.spin_n = QtWidgets.QSpinBox()
         self.spin_n.setRange(16, 2_000_000_000)   # no practical upper cap
-        self.spin_n.setValue(512)
+        self.spin_n.setValue(self._default_n)
         self.spin_n.setSingleStep(16)
 
         self.btn_compute = QtWidgets.QPushButton("Compute (G)")

@@ -1,13 +1,28 @@
 
 
+import os
 import sys
 import time
 from pathlib import Path
 
-import pyqtgraph as pg
+# When launched via Start.bat (pythonw.exe, double-click) there is no console,
+# so sys.stdout / sys.stderr are None.  Libraries imported below (e.g. Warp)
+# print startup banners, and writing to a None stream raises AttributeError and
+# crashes the app silently.  Redirect those streams to a sink so the writes are
+# harmless.  No-op when a real console is attached (running via python.exe).
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import theme
+
+# NB: pyqtgraph is *not* imported here.  It pulls in numpy + its own modules
+# (~0.5 s on top of Qt) and is only needed once we build MainWindow — so we
+# defer it until after the splash is on screen, letting the loading screen
+# pop up about half a second sooner.
 
 # 'Syne' is the display/heading font used on davidmertth.github.io.  Bundled as
 # a TTF so we don't depend on it being installed system-wide.
@@ -188,7 +203,19 @@ def _make_splash() -> SplashScreen:
 
 
 def main():
-    pg.mkQApp()
+    # Create the QApplication with bare PySide6 (cheap) and get the splash on
+    # screen *before* touching the heavy imports.  Everything below the
+    # splash.show() runs while the loading screen is already visible.
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+
+    splash = _make_splash()
+    splash.show()
+    splash.set_progress(0.03, "Loading modules …")
+
+    # Now the slow imports — pyqtgraph (+numpy) first, then warp/torch via
+    # MainWindow.  The bar advances around them; the splash is already up.
+    import pyqtgraph as pg
+    pg.mkQApp()  # registers the existing QApplication with pyqtgraph
     # Theme pyqtgraph (axis text, plot/image backgrounds) to match light/dark
     # mode.  Must run before any pg widget is created (i.e. before MainWindow).
     if theme.is_dark_mode():
@@ -196,13 +223,6 @@ def main():
     else:
         pg.setConfigOptions(foreground="k", background="w")
 
-    # Show the loading screen, then build the (slow) main window behind it.
-    splash = _make_splash()
-    splash.show()
-    splash.set_progress(0.03, "Loading modules …")
-
-    # The heavy module imports (warp/torch/…) happen here — advance the bar
-    # around them, then hand MainWindow a callback for its own init milestones.
     from main_window import MainWindow
     splash.set_progress(0.35, "Modules loaded")
 
