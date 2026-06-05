@@ -45,9 +45,9 @@ SETTINGS_SPEC = [
              "gaps per maintenance cycle."),
         ]),
         ("Split", [
-            ("split_per_round", "Splits per cycle", "int", 0, 50, 1, 0, 5,
+            ("split_per_round", "Splits per cycle", "int", 0, 50, 1, 0, 7,
              "How many oversized / bridging ellipsoids may be split per cycle."),
-            ("split_size_factor", "Oversize factor", "float", 1.0, 3.0, 0.05, 2, 1.3,
+            ("split_size_factor", "Oversize factor", "float", 1.0, 3.0, 0.05, 2, 1.2,
              "An ellipsoid is considered oversized (split candidate) when it is\n"
              "this many times larger than the local target scale."),
             ("split_margin_vox", "Split margin (vox)", "float", 0.0, 5.0, 0.1, 1, 0.5,
@@ -126,7 +126,7 @@ SETTINGS_SPEC = [
 
     ("Sampling", [
         ("Batch sampling", [
-            ("sample_budget", "Sample budget (voxels)", "int", 4096, 262144, 4096, 0, 16384,
+            ("sample_budget", "Sample budget (voxels)", "int", 64, 262144, 64, 0, 4096,
              "Voxels sampled per optimisation step — resolution-independent cost."),
             ("surface_band_vox", "Surface band (vox)", "float", 0.5, 10.0, 0.5, 1, 3.0,
              "Half-width (in voxels) of the surface band for importance sampling."),

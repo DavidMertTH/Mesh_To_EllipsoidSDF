@@ -193,7 +193,15 @@
       "Bash(.venv/Scripts/python.exe -c \"import sys; print\\(sys.version\\)\")",
       "Bash(.venv/Scripts/python.exe main.py)",
       "Bash(.venv/Scripts/pythonw.exe -c \"import sys; open\\('pythonw_test.txt','w'\\).write\\(repr\\(sys.stdout\\)\\)\")",
-      "Bash(rm pythonw_test.txt)"
+      "Bash(rm pythonw_test.txt)",
+      "Bash(python -m py_compile optimization.py viewer3d.py main_window.py)",
+      "Bash(python -c \"import viewer3d, optimization; print\\('import OK'\\); print\\('OP_COLORS:', list\\(viewer3d.SceneViewer3D._OP_COLORS.keys\\(\\)\\)\\); print\\('has op_events signal:', hasattr\\(optimization.OptimizationWorker, 'op_events'\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import viewer3d, optimization; print\\('import OK'\\); print\\('OP_COLORS:', list\\(viewer3d.SceneViewer3D._OP_COLORS.keys\\(\\)\\)\\); print\\('has op_events signal:', hasattr\\(optimization.OptimizationWorker, 'op_events'\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -m py_compile optimization.py viewer3d.py main_window.py)",
+      "Bash(.venv/Scripts/python.exe -c \"import optimization; print\\('compile + import OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -m py_compile pose_optimizer.py main_window.py rig_panel.py)",
+      "Bash(git *)",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }

@@ -132,16 +132,17 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
         # Initial ellipsoid params (from T-pose optimisation)
         bone_local: BoneLocalEllipsoids,
         mapper: BoneEllipsoidMapper,
-        # Training config
+        # Training config — driven by the SAME settings as the normal fit path:
+        # ``lr``/``num_steps`` come from the right panel, the loss weights +
+        # sample budget from the Settings dialog (passed in as ``advanced``).
+        # There are no rig-specific settings anymore.
         num_steps: int = 3000,
-        steps_per_pose: int | None = None,
         report_every: int = 20,
         grid_n: int = 64,
         margin: float = 0.5,
-        batch_fraction: float = 0.125,
         lr: float = 0.005,
         maintenance_every: int = 0,
-        miss_penalty_weight: float = 3.0,
+        advanced: dict | None = None,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
@@ -155,14 +156,23 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
         self._mapper = mapper
 
         self._num_steps = num_steps
-        self._steps_per_pose = steps_per_pose
+        # No rig setting for this — internal block size, kept for behaviour parity.
+        self._steps_per_pose = 10
         self._report_every = report_every
         self._grid_n = grid_n
         self._margin = margin
-        self._batch_fraction = batch_fraction
         self._lr = lr
         self._maintenance_every = maintenance_every
-        self._miss_penalty_weight = miss_penalty_weight
+
+        # Pull the loss / sampling knobs from the shared advanced-settings dict
+        # (keys match OptimizationWorker / app_settings exactly).  The pose loss
+        # previously hard-coded these to neutral values and ignored the dialog.
+        adv = advanced or {}
+        self._sample_budget = int(adv.get("sample_budget", 4096))
+        self._surface_weight = float(adv.get("surface_weight", 4.0))
+        self._surface_sigma_vox = float(adv.get("surface_sigma_vox", 1.5))
+        self._miss_penalty_weight = float(adv.get("miss_penalty_weight", 3.0))
+        self._outside_penalty_weight = float(adv.get("outside_penalty_weight", 14.0))
 
         self._stop_flag = False
 
@@ -282,7 +292,9 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
         )
 
         # ── Allocate working buffers ──
-        bs = max(1024, min(int(total * self._batch_fraction), total))
+        # Batch size = the shared "Sample budget" setting, clamped to the
+        # smallest pose grid (resolution-independent, matches the normal path).
+        bs = max(1, min(int(self._sample_budget), total))
 
         world_centers = wp.empty(N, dtype=wp.vec3, device=device,
                                  requires_grad=True)
@@ -488,14 +500,19 @@ class MultiPoseOptimizationWorker(QtCore.QThread):
                     device=device,
                 )
 
-                # 4. Loss against mesh SDF
+                # 4. Loss against mesh SDF — surface + miss + protrusion weights
+                #    now come from the shared Settings dialog (per-pose dx scales
+                #    the surface sigma from voxels to world units).  Thin-feature
+                #    weighting stays off here (no thickness grid is pre-computed).
+                surf_sigma_world = float(self._surface_sigma_vox) * float(pd.dx)
                 loss.zero_()
                 wp.launch(
                     _rmse_loss_kernel_batch,
                     dim=bs,
                     inputs=[sdf_pred, pd.wp_sdf_target, wp_indices,
                             loss, bs, float(self._miss_penalty_weight),
-                            float(0.0), float(1.0), float(0.0),
+                            float(self._surface_weight), float(surf_sigma_world),
+                            float(self._outside_penalty_weight),
                             pd.wp_sdf_target, float(1.0), float(0.0), float(1.0)],
                     device=device,
                 )

@@ -92,18 +92,6 @@ class RigModePanel(QtWidgets.QGroupBox):
             return self._rigged_mesh.poses[idx]
         return Pose.t_pose()
 
-    @property
-    def multi_pose_steps(self) -> int:
-        return self._spin_steps.value()
-
-    @property
-    def multi_pose_lr(self) -> float:
-        return self._spin_lr.value()
-
-    @property
-    def multi_pose_steps_per_pose(self) -> int:
-        return self._spin_steps_per_pose.value()
-
     # ── UI construction ──────────────────────────────────────────────
 
     def _build_ui(self):
@@ -146,35 +134,15 @@ class RigModePanel(QtWidgets.QGroupBox):
         layout.addWidget(self._lbl_bones)
 
         # ── Multi-pose training ──
+        # No rig-specific knobs: steps + LR come from the right panel, all loss
+        # and sampling settings from the Settings dialog — same as a normal fit.
         layout.addSpacing(8)
-        layout.addWidget(QtWidgets.QLabel("Multi-Pose Training:"))
-
-        train_form = QtWidgets.QFormLayout()
-        train_form.setLabelAlignment(QtCore.Qt.AlignLeft)
-
-        self._spin_steps = QtWidgets.QSpinBox()
-        self._spin_steps.setRange(100, 50000)
-        self._spin_steps.setValue(3000)
-        self._spin_steps.setSingleStep(500)
-        self._spin_steps.setToolTip("Total training steps across all poses")
-        train_form.addRow("Steps:", self._spin_steps)
-
-        self._spin_lr = QtWidgets.QDoubleSpinBox()
-        self._spin_lr.setRange(0.0001, 0.1)
-        self._spin_lr.setValue(0.005)
-        self._spin_lr.setSingleStep(0.001)
-        self._spin_lr.setDecimals(4)
-        self._spin_lr.setToolTip("Learning rate for bone-local parameter training")
-        train_form.addRow("LR:", self._spin_lr)
-
-        self._spin_steps_per_pose = QtWidgets.QSpinBox()
-        self._spin_steps_per_pose.setRange(1, 1000)
-        self._spin_steps_per_pose.setValue(10)
-        self._spin_steps_per_pose.setSingleStep(5)
-        self._spin_steps_per_pose.setToolTip("Training steps on each pose before switching")
-        train_form.addRow("Steps/Pose:", self._spin_steps_per_pose)
-
-        layout.addLayout(train_form)
+        _hint = QtWidgets.QLabel(
+            "Multi-Pose Training uses the main Steps / LR and Settings dialog."
+        )
+        _hint.setWordWrap(True)
+        _hint.setStyleSheet("font-size: 10px; color: gray;")
+        layout.addWidget(_hint)
 
         # ── One-click auto pipeline ──
         self._btn_auto = QtWidgets.QPushButton("▶ Auto Fit All Poses")
