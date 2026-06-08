@@ -1367,12 +1367,16 @@ class OptimizationWorker(QtCore.QThread):
         containment_weight: float = 6.0,
         surface_weight: float = 4.0,
         surface_sigma_vox: float = 1.5,
+        underrep_rel_threshold: float = 0.6,
+        underrep_min_gap_vox: float = 0.5,
+        underrep_min_thickness_vox: float = 4.0,
         max_prune_fraction: float = 0.15,
         min_volume_abs: float = 1e-8,
         coverage_sample_size: int = 20000,
         superfit: bool = False,
         max_ellipsoids: int = 60,
         superfit_every: int = 150,
+        densify_start_frac: float = 0.0,
         densify_until_frac: float = 0.75,
         local_steps: int = 1200,
         local_lr: float = 0.02,
@@ -1391,6 +1395,7 @@ class OptimizationWorker(QtCore.QThread):
         merge_per_round: int = 3,
         merge_tol: float = 0.12,
         merge_enabled: bool = True,
+        prune_enabled: bool = True,
         bone_aware: bool = False,
         bone_centers_np: np.ndarray | None = None,
         bone_span_weight: float = 0.4,
@@ -1416,6 +1421,8 @@ class OptimizationWorker(QtCore.QThread):
         region_res: int | None = None,
         local_fit: bool = True,
         local_fit_start_frac: float = 0.25,
+        local_fit_end_frac: float = 1.0,
+        local_fit_every: int = 150,
         region_dc_cycles: int = 3,
         region_steps: int = 2000,
         symmetry_enabled: bool = False,
@@ -1448,6 +1455,9 @@ class OptimizationWorker(QtCore.QThread):
         self._containment_weight = containment_weight
         self._surface_weight = surface_weight
         self._surface_sigma = max(surface_sigma_vox * float(dx), 1e-6)
+        self._underrep_rel_threshold = float(underrep_rel_threshold)
+        self._underrep_min_gap_vox = float(underrep_min_gap_vox)
+        self._underrep_min_thickness_vox = float(underrep_min_thickness_vox)
         self._max_prune_fraction = max_prune_fraction
         self._min_volume_abs = min_volume_abs
         self._coverage_sample_size = coverage_sample_size
@@ -1455,6 +1465,7 @@ class OptimizationWorker(QtCore.QThread):
         self._superfit = superfit
         self._max_ellipsoids = max_ellipsoids
         self._superfit_every = superfit_every
+        self._densify_start_frac = float(np.clip(densify_start_frac, 0.0, 1.0))
         self._densify_until_frac = float(np.clip(densify_until_frac, 0.0, 1.0))
         self._local_steps = local_steps
         self._local_lr = local_lr
@@ -1467,9 +1478,10 @@ class OptimizationWorker(QtCore.QThread):
         # is NOT considered under-represented.  Filters the marginal half-voxel
         # gaps that otherwise flood both the overlay and the spawn/split picker.
         # Severity = rel · sw with sw up to (1 + surface_weight) on the surface,
-        # so requiring a surface region to reach rel ≈ 0.6 (the points-detector
-        # ``rel_threshold``) before it counts means a floor of 0.6·(1+sw_max).
-        self._analysis_min_severity = 0.6 * (1.0 + float(self._surface_weight))
+        # so requiring a surface region to reach the configured ``rel_threshold``
+        # before it counts means a floor of rel_threshold·(1+sw_max).
+        self._analysis_min_severity = (
+            self._underrep_rel_threshold * (1.0 + float(self._surface_weight)))
         # SuperFit region detection (the only n³ cost per cycle) runs on a
         # resolution-capped copy of the target grid so its cost is independent
         # of the global grid n.  Longest axis of the detection grid ≤ this cap;
@@ -1494,6 +1506,7 @@ class OptimizationWorker(QtCore.QThread):
         self._merge_per_round = merge_per_round
         self._merge_tol = merge_tol
         self._merge_enabled = merge_enabled
+        self._prune_enabled = prune_enabled
         self._merge_sphere_pts = None   # cached unit-sphere surface points
         # ── bone-awareness: penalise ellipsoids spanning multiple bones ──
         self._bone_span_weight = float(bone_span_weight)
@@ -1551,6 +1564,13 @@ class OptimizationWorker(QtCore.QThread):
         # (default 25 %): early steps refine the global layout first, then the
         # high-res per-region fit starts once the population has roughly settled.
         self._local_fit_start_frac = float(np.clip(local_fit_start_frac, 0.0, 1.0))
+        # Local fit runs on its own window [start, end] and its own elapsed
+        # cadence (``local_fit_every`` steps), fully decoupled from the densify
+        # window/cadence so the two phases can overlap, be disjoint, or differ in
+        # frequency.  ``_last_local_fit_step`` tracks when local fit last fired.
+        self._local_fit_end_frac = float(np.clip(local_fit_end_frac, 0.0, 1.0))
+        self._local_fit_every = max(1, int(local_fit_every))
+        self._last_local_fit_step = -10**9
         # Symmetry constraint: mirror-projection during training onto an
         # auto-detected plane (resolved lazily once the loop starts).
         self._symmetry_enabled = bool(symmetry_enabled)
@@ -2069,7 +2089,7 @@ class OptimizationWorker(QtCore.QThread):
         cov = self._compute_coverage_info(centers, radii, rotations)
 
         n_pruned = n_removed
-        if budget > 0 and len(centers) >= 2 and cov['valid']:
+        if self._prune_enabled and budget > 0 and len(centers) >= 2 and cov['valid']:
             to_remove = self._select_prune_candidates(cov, budget)
             if to_remove:
                 keep_mask = np.ones(len(centers), dtype=bool)
@@ -2082,7 +2102,7 @@ class OptimizationWorker(QtCore.QThread):
                 cov = self._filter_coverage_info(cov, np.where(keep_mask)[0])
 
         # ── 3. Proactively replace low-coverage ellipsoids ────────────
-        if cov['valid'] and budget > 0:
+        if self._prune_enabled and cov['valid'] and budget > 0:
             n_uncov = cov['n_uncovered']
             n_sample = len(cov['pts'])
             uncov_frac = n_uncov / max(n_sample, 1)
@@ -2387,8 +2407,9 @@ class OptimizationWorker(QtCore.QThread):
             self._sdf_target_np, pred_grid, dx,
             surface_weight=self._surface_weight,
             surface_sigma_vox=max(self._surface_sigma / max(dx, 1e-12), 1e-6),
-            min_gap_vox=0.5,
+            min_gap_vox=self._underrep_min_gap_vox,
             thickness_grid=self._thickness_np,
+            min_thickness_vox=self._underrep_min_thickness_vox,
         )
         flat_sev = sev.ravel()                 # view: suppression below edits sev
         flat_target = self._sdf_target_np.ravel()
@@ -2943,14 +2964,34 @@ class OptimizationWorker(QtCore.QThread):
         if not self._merge_enabled or n <= 1 or self._merge_per_round <= 0:
             return centers, radii, rotations, 0
 
-        mean_r = radii.mean(axis=1)
-        # Cheap prefilter: only pairs whose centres are close enough to overlap.
+        # Prefilter: keep only pairs that actually overlap along their line of
+        # centres.  The half-extent (support) of an ellipsoid along a unit
+        # direction ``u`` is ``sqrt(uᵀ·Σ·u)`` with ``Σ = R·diag(r²)·Rᵀ``.  Using
+        # this directional reach instead of a mean radius makes the test correct
+        # for *elongated* ellipsoids — collinear finger spheres/capsules whose
+        # long axes overlap end-to-end are now detected as merge candidates
+        # (a mean-radius test underestimates the long-axis reach and misses
+        # them, which is why finger sphere-chains were never consolidated).
+        sigma = []
+        for k in range(n):
+            Rk = _quat_to_rot_matrix(rotations[k]).astype(np.float64)
+            rk = radii[k].astype(np.float64)
+            sigma.append(Rk @ np.diag(rk * rk) @ Rk.T)
+
         cand = []
         for i in range(n):
             for j in range(i + 1, n):
-                d = float(np.linalg.norm(centers[i] - centers[j]))
-                slack = d - (mean_r[i] + mean_r[j])
-                if slack < 0.0:               # rough sphere overlap
+                diff = (centers[i].astype(np.float64)
+                        - centers[j].astype(np.float64))
+                d = float(np.linalg.norm(diff))
+                if d < 1e-9:
+                    cand.append((-1e9, i, j))     # coincident → maximal overlap
+                    continue
+                u = diff / d
+                reach_i = float(np.sqrt(max(u @ sigma[i] @ u, 0.0)))
+                reach_j = float(np.sqrt(max(u @ sigma[j] @ u, 0.0)))
+                slack = d - (reach_i + reach_j)
+                if slack < 0.0:                   # surfaces overlap along centre line
                     cand.append((slack, i, j))
         if not cand:
             return centers, radii, rotations, 0
@@ -2965,18 +3006,54 @@ class OptimizationWorker(QtCore.QThread):
             if i in consumed or j in consumed:
                 continue
             c_m, r_m, q_m = self._merge_two_ellipsoids(i, j, centers, radii, rotations)
-            # Volume guard: only fuse near-duplicates.  The moment-merged
-            # ellipsoid of two *offset* primitives is a fat bounding ellipsoid
-            # much larger than either — merging those would inflate the result
-            # and shrink the population in a runaway loop.  Reject if the merged
-            # volume noticeably exceeds the larger of the two.
-            vol_i = float(np.prod(np.maximum(radii[i], 1e-9)))
-            vol_j = float(np.prod(np.maximum(radii[j], 1e-9)))
-            vol_m = float(np.prod(np.maximum(r_m, 1e-9)))
-            if vol_m > 1.25 * max(vol_i, vol_j):
+            # Shape-aware guard (replaces the old total-volume guard).  Merging
+            # two *collinear* primitives into one ellipsoid is the desired result
+            # for a finger sphere-chain — the merged ellipsoid is elongated along
+            # the offset (a capsule), so its *volume* necessarily exceeds either
+            # input and the old volume guard rejected exactly the merges we want.
+            #
+            # The runaway it protected against was *isotropic* ballooning (fusing
+            # offset/separate blobs into a fat bounding ellipsoid).  That inflates
+            # the CROSS-SECTION — the two smallest semi-axes — whereas a genuine
+            # collinear merge only grows the long axis.  So gate on cross-section
+            # growth: allow the long axis to extend freely, reject cross-section
+            # inflation.  Faithfulness is still enforced by the surface- and
+            # loss-gates below.
+            def _cross_section(r):
+                s = np.sort(np.abs(np.asarray(r, dtype=np.float64)))
+                return float(s[0] * s[1])         # product of the two smallest
+            cs_i = _cross_section(radii[i])
+            cs_j = _cross_section(radii[j])
+            cs_m = _cross_section(r_m)
+            if cs_m > 1.25 * max(cs_i, cs_j):
                 continue
-            if self._merge_changes_surface(i, j, c_m, r_m, q_m,
-                                           centers, radii, rotations):
+
+            # Is this a *collinear / elongating* merge (a finger sphere-chain
+            # consolidating into a capsule)?  Signal: the merged ellipsoid's long
+            # axis is aligned with the line of centres, and the centres are
+            # meaningfully separated.  For such merges the surface-equality gate
+            # below is the wrong test — it compares the merged ellipsoid against
+            # the *union of the two inputs* (a peanut), but we deliberately want
+            # a smooth capsule that differs from that peanut while fitting the
+            # *target* better.  The cross-section gate (above) already forbids
+            # cross-section ballooning, and the loss gate (below) verifies the
+            # fit against the target SDF, so those two suffice here.
+            diff = (centers[i].astype(np.float64)
+                    - centers[j].astype(np.float64))
+            d = float(np.linalg.norm(diff))
+            collinear = False
+            if d > 1e-9:
+                u = diff / d
+                Rm = _quat_to_rot_matrix(q_m).astype(np.float64)
+                long_axis = Rm[:, int(np.argmax(np.abs(r_m)))]
+                align = abs(float(u @ long_axis))
+                reach_i = float(np.sqrt(max(u @ sigma[i] @ u, 0.0)))
+                reach_j = float(np.sqrt(max(u @ sigma[j] @ u, 0.0)))
+                sep = d / max(reach_i + reach_j, 1e-9)
+                collinear = (align > 0.85) and (sep > 0.30)
+
+            if not collinear and self._merge_changes_surface(
+                    i, j, c_m, r_m, q_m, centers, radii, rotations):
                 continue
             # Final, decisive gate: only merge if it does not raise the fit loss.
             if self._merge_increases_loss(i, j, c_m, r_m, q_m,
@@ -3747,13 +3824,32 @@ class OptimizationWorker(QtCore.QThread):
         else ``None``.  Net growth stops once ``max_ellipsoids`` is reached
         (a split is net +1: two children replace one parent).
         """
-        if not self._superfit or self._superfit_every <= 0:
+        # Densify and local fit are independent: either one being enabled is
+        # enough to enter this method (the run loop dispatches here when
+        # ``superfit OR local_fit`` is on).
+        if not (self._superfit or self._local_fit_enabled):
             return None
-        if step == 0 or step % self._superfit_every != 0:
-            return None
-        # Stop densification for the final fraction of training so the population
-        # settles cleanly (pure Adam refinement, à la Gaussian Splatting).
-        if step >= self._densify_until_frac * self._num_steps:
+        ns = float(self._num_steps)
+        # Densify (population-changing) moves fire on the SuperFit cadence, but
+        # only inside the [densify_start, densify_until] window — afterwards the
+        # population settles cleanly (pure Adam refinement, à la Gaussian
+        # Splatting).  Local fit runs on its OWN window [local_fit_start,
+        # local_fit_end] and its own elapsed cadence (local_fit_every),
+        # completely decoupled: the two phases may overlap, be disjoint, or run
+        # at different frequencies.  Densify requires SuperFit to be enabled;
+        # local fit does not.
+        densify_active = bool(
+            self._superfit
+            and self._superfit_every > 0 and step > 0
+            and step % self._superfit_every == 0
+            and step >= self._densify_start_frac * ns
+            and step < self._densify_until_frac * ns)
+        local_active = bool(
+            self._local_fit_enabled
+            and step >= self._local_fit_start_frac * ns
+            and step <= self._local_fit_end_frac * ns
+            and (step - self._last_local_fit_step) >= self._local_fit_every)
+        if not (densify_active or local_active):
             return None
 
         wp.synchronize_device(device)
@@ -3774,7 +3870,10 @@ class OptimizationWorker(QtCore.QThread):
                             float(np.max(np.abs(rad[i])))))
 
         # ── 0a) Delete ellipsoids that sit entirely outside the mesh ──
-        out_idx = self._detect_outside_ellipsoids(centers, radii, rotations)
+        # All population-changing moves (delete / fuse / merge / split / spawn)
+        # are gated on the densify window; outside it only local fit may run.
+        out_idx = (self._detect_outside_ellipsoids(centers, radii, rotations)
+                   if densify_active else np.empty(0, dtype=int))
         n_deleted = int(len(out_idx))
         if n_deleted > 0:
             _record('delete', out_idx, centers, radii)
@@ -3783,7 +3882,8 @@ class OptimizationWorker(QtCore.QThread):
             centers, radii, rotations = centers[keep], radii[keep], rotations[keep]
 
         # ── 0a2) Delete degenerate shapes (too flat / too pointy) ──
-        deg_idx = self._detect_degenerate_ellipsoids(radii)
+        deg_idx = (self._detect_degenerate_ellipsoids(radii)
+                   if densify_active else np.empty(0, dtype=int))
         # Never wipe the whole population in one round (safety against a bad fit
         # transiently making everything degenerate).
         if 0 < len(deg_idx) < len(centers):
@@ -3795,8 +3895,11 @@ class OptimizationWorker(QtCore.QThread):
 
         # ── 0b) Fuse redundant ellipsoids (no independent task → drop them) ──
         # Done first so freed slots are reused by the split/spawn moves below.
-        fuse_idx = self._detect_redundant_ellipsoids(
+        # Gated by the Prune toggle (this is the population-shrinking pruning;
+        # the 0a/0a2 safety deletes above stay on regardless).
+        fuse_idx = (self._detect_redundant_ellipsoids(
             centers, radii, rotations, self._fuse_per_round)
+            if (densify_active and self._prune_enabled) else np.empty(0, dtype=int))
         n_fused = int(len(fuse_idx)) + n_deleted
         if len(fuse_idx) > 0:
             _record('fuse', fuse_idx, centers, radii)
@@ -3805,13 +3908,16 @@ class OptimizationWorker(QtCore.QThread):
             centers, radii, rotations = centers[keep], radii[keep], rotations[keep]
 
         # ── 0c) Merge overlapping pairs into one when it barely moves the surface
-        centers, radii, rotations, n_merged = self._detect_merges(
-            centers, radii, rotations)
-        # _detect_merges appends the merged ellipsoids at the tail of the arrays,
-        # so the last ``n_merged`` entries are the fused-pair results.
-        if n_merged > 0:
-            _record('merge', np.arange(len(centers) - n_merged, len(centers)),
-                    centers, radii)
+        if densify_active:
+            centers, radii, rotations, n_merged = self._detect_merges(
+                centers, radii, rotations)
+            # _detect_merges appends the merged ellipsoids at the tail of the
+            # arrays, so the last ``n_merged`` entries are the fused-pair results.
+            if n_merged > 0:
+                _record('merge', np.arange(len(centers) - n_merged, len(centers)),
+                        centers, radii)
+        else:
+            n_merged = 0
         n_fused += n_merged
 
         # ── Analysis snapshot for the 3-D viewport ──────────────────────
@@ -3847,16 +3953,11 @@ class OptimizationWorker(QtCore.QThread):
             self.analysis_regions.emit(step, analysis)
 
         n_curr = len(centers)
-        budget = self._max_ellipsoids - n_curr           # net additions allowed
-        if budget <= 0:
-            if n_fused > 0:
-                if ops:
-                    self.op_events.emit(step, ops)
-                self.maintenance_done.emit(step, n_before, n_fused, 0)
-                return centers, radii, rotations
-            if ops:
-                self.op_events.emit(step, ops)
-            return None
+        # Net additions allowed this cycle.  Zero outside the densify window (or
+        # at the cap) so the split/spawn detectors below naturally produce
+        # nothing — but local fit may still run afterwards.
+        budget = (self._max_ellipsoids - n_curr) if densify_active else 0
+        budget = max(0, budget)
 
         # ── Densify: SPLIT over-represented ellipsoids + SPLIT/SPAWN in under-rep
         # Both mechanisms are independently switchable (split_enabled /
@@ -3918,14 +4019,9 @@ class OptimizationWorker(QtCore.QThread):
         if n_spawn > 0:
             _record('spawn', np.arange(n_spawn), spawn_c, spawn_r)
 
-        if not targets and n_spawn == 0:
-            if ops:
-                self.op_events.emit(step, ops)
-            if n_fused > 0:
-                self.maintenance_done.emit(step, n_before, n_fused, 0)
-                return centers, radii, rotations
-            self.maintenance_done.emit(step, n_before, 0, 0)
-            return None
+        # Note: when ``budget == 0`` (outside the densify window, or at the cap)
+        # ``targets`` is empty and ``n_spawn == 0``, so the child-building below
+        # is a no-op and flow falls straight through to the local-fit phase.
 
         # Build split children (over-rep), recording each split site as a region
         # centre (the parent's location, with a half-extent covering the parent).
@@ -3960,6 +4056,18 @@ class OptimizationWorker(QtCore.QThread):
         radii     = np.concatenate([radii]     + child_r, axis=0)
         rotations = np.concatenate([rotations] + child_q, axis=0)
 
+        # Local fit with no fresh densify regions (e.g. local window extends past
+        # the densify window, or densify added nothing this cycle): source the
+        # worst regions from the analysis snapshot and re-fit the EXISTING
+        # geometry there.  ``_local_fit_regions`` assigns trainable ellipsoids by
+        # region-box membership, so refitting in place needs no appended children.
+        if local_active and not region_sites and viz_regions:
+            r_radius_world = float(self._region_radius_vox) * float(self._dx)
+            for reg in viz_regions:
+                sc = np.asarray(reg['seed_world'], np.float32).copy()
+                region_sites.append((sc, r_radius_world))
+                pools.append(self._interior_ball_pool(sc, self._region_radius_vox))
+
         # Under symmetry only the source (better-fitting) half survives the
         # post-maintenance ``_build_symmetric_layout``; the other half is
         # discarded and re-derived as the source's reflection.  Locally fitting a
@@ -3979,26 +4087,19 @@ class OptimizationWorker(QtCore.QThread):
                     kept.append((site_c, site_half))
             region_sites = kept
 
-        # Gate: local fit starts only once training has passed the configured
-        # fraction (default 25 %).  Before that, maintenance still runs but the
-        # high-res per-region fit is skipped.
-        local_fit_active = (
-            self._local_fit_enabled
-            and step >= self._local_fit_start_frac * self._num_steps)
-        if not local_fit_active:
-            # Local fitting off (disabled, or not yet past the start fraction):
-            # keep the divide-and-conquer maintenance (delete/fuse/split/spawn
-            # already applied above) but leave the new ellipsoids for the global
-            # optimiser to refine.
-            pass
-        elif self._sdf_computer is not None and self._sdf_computer.is_ready:
-            # One region at a time: re-fit every ellipsoid centred in each region
-            # against a fresh high-res SDF box limited to that region.  All region
-            # boxes are computed up front in a SINGLE batched kernel launch.
-            # ``region_sites`` may be empty here only under symmetry (every region
-            # landed on the discarded half) — then there is nothing to fit; the
-            # re-layout re-derives that half from the source.
-            if region_sites:
+        # Gate: local fit runs on its own window + elapsed cadence (computed at
+        # the top).  Stamp the firing step whenever the cadence is due — even if
+        # there is nothing to fit this cycle — so it does not re-trigger every
+        # step.  New densify children, when local fit is NOT due, are simply left
+        # for the global optimiser to refine.
+        did_local = False
+        if local_active:
+            self._last_local_fit_step = step
+            if region_sites and self._sdf_computer is not None \
+                    and self._sdf_computer.is_ready:
+                # Re-fit every ellipsoid centred in each region against a fresh
+                # high-res SDF box limited to that region.  All region boxes are
+                # computed up front in a SINGLE batched kernel launch.
                 self.phase_changed.emit("local")
                 box_geoms = [self._region_box(c, h) for c, h in region_sites]
                 box_results = self._sdf_computer.compute_box_grids_batch(
@@ -4010,20 +4111,26 @@ class OptimizationWorker(QtCore.QThread):
                     centers, radii, rotations, region_sites, box_results, step)
                 self.region_changed.emit(None)
                 self.phase_changed.emit("global")
-        else:
-            # Fallback: single coarse-grid local fit over the union of pools.
-            self.phase_changed.emit("local")
-            pools = [p for p in pools if p.size > 0]
-            union_pool = (np.unique(np.concatenate(pools)).astype(np.int32)
-                          if pools else np.arange(self._nx * self._ny * self._nz,
-                                                  dtype=np.int32))
-            centers, radii, rotations = self._local_fit(
-                centers, radii, rotations, offset, union_pool, step,
-            )
-            self.phase_changed.emit("global")
+                did_local = True
+            elif region_sites:
+                # Fallback: single coarse-grid local fit over the union of pools.
+                self.phase_changed.emit("local")
+                pools = [p for p in pools if p.size > 0]
+                union_pool = (np.unique(np.concatenate(pools)).astype(np.int32)
+                              if pools else np.arange(self._nx * self._ny * self._nz,
+                                                      dtype=np.int32))
+                centers, radii, rotations = self._local_fit(
+                    centers, radii, rotations, offset, union_pool, step,
+                )
+                self.phase_changed.emit("global")
+                did_local = True
 
         if ops:
             self.op_events.emit(step, ops)
+        if n_fused == 0 and n_split == 0 and n_spawn == 0 and not did_local:
+            # Nothing changed this cycle (no densify moves, no local fit).
+            self.maintenance_done.emit(step, n_before, 0, 0)
+            return None
         n_appended = len(centers) - offset
         self.maintenance_done.emit(
             step, n_before, n_fused + n_split + n_spawn, n_appended)
@@ -4363,7 +4470,10 @@ class OptimizationWorker(QtCore.QThread):
             wp.launch(_exp_radii_kernel, dim=num_e,
                       inputs=[pred_log_radii, pred_radii], device=device)
 
-            if self._superfit:
+            # SuperFit handles BOTH densification and local fit, so dispatch
+            # there whenever either is enabled (local fit can run with
+            # densification off).  Plain maintenance only when neither is on.
+            if self._superfit or self._local_fit_enabled:
                 result = self._maybe_superfit(step, pred_centers, pred_radii, pred_rot_flat)
             else:
                 result = self._maybe_maintain(step, pred_centers, pred_radii, pred_rot_flat)

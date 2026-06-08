@@ -27,6 +27,7 @@ from rig_loader import RiggedMesh, load_rigged_mesh, is_rigged_mesh
 from skinning import deform_mesh
 from bone_ellipsoid_mapper import BoneEllipsoidMapper, BoneLocalEllipsoids
 from ellipsoid import EllipsoidSet
+import pose_library
 
 
 class RigModePanel(QtWidgets.QGroupBox):
@@ -51,7 +52,10 @@ class RigModePanel(QtWidgets.QGroupBox):
     autoPipelineRequested = QtCore.Signal()
     exportUnityRequested = QtCore.Signal()
 
-    def __init__(self, parent=None):
+    # Sentinel stored as combo data for the FBX's own animation entry.
+    NATIVE = -1
+
+    def __init__(self, parent=None, pose_dir: Optional[Path] = None):
         super().__init__("Rig Mode", parent)
         self.setCheckable(True)
         self.setChecked(False)
@@ -60,6 +64,11 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._rigged_mesh: Optional[RiggedMesh] = None
         self._mapper: Optional[BoneEllipsoidMapper] = None
         self._bone_local: Optional[BoneLocalEllipsoids] = None
+
+        # Pose-library state: poses loaded from disk.
+        self._pose_dir: Path = Path(pose_dir) if pose_dir \
+            else pose_library.DEFAULT_POSE_DIR
+        self._library_poses: List[Pose] = []
 
         self._build_ui()
 
@@ -84,13 +93,33 @@ class RigModePanel(QtWidgets.QGroupBox):
         return self._slider_pose.value()
 
     @property
+    def active_poses(self) -> List[Pose]:
+        """The pose list currently driving the timeline.
+
+        ``[native Animation]`` selected → the FBX's own animation frames.
+        A saved pose selected → just that single (one-frame) pose.
+        """
+        data = self._cmb_source.currentData()
+        if data is not None and data != self.NATIVE:
+            if 0 <= data < len(self._library_poses):
+                return [self._library_poses[data]]
+            return [Pose.t_pose()]
+        if self._rigged_mesh is not None:
+            return self._rigged_mesh.poses
+        return [Pose.t_pose()]
+
+    def pose_at(self, idx: int) -> Pose:
+        """Return the pose at *idx* in the active source (clamped to T-pose)."""
+        poses = self.active_poses
+        if 0 <= idx < len(poses):
+            return poses[idx]
+        return Pose.t_pose()
+
+    @property
     def current_pose(self) -> Optional[Pose]:
         if self._rigged_mesh is None:
             return None
-        idx = self._slider_pose.value()
-        if 0 <= idx < len(self._rigged_mesh.poses):
-            return self._rigged_mesh.poses[idx]
-        return Pose.t_pose()
+        return self.pose_at(self._slider_pose.value())
 
     # ── UI construction ──────────────────────────────────────────────
 
@@ -104,6 +133,18 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._lbl_status.setWordWrap(True)
         self._lbl_status.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(self._lbl_status)
+
+        # ── Animation / pose source ──
+        src_row = QtWidgets.QHBoxLayout()
+        src_row.addWidget(QtWidgets.QLabel("Source:"))
+        self._cmb_source = QtWidgets.QComboBox()
+        self._cmb_source.setToolTip(
+            "Play the animation baked into the FBX, or apply one of the "
+            "saved single-frame poses from the poses/ folder."
+        )
+        self._cmb_source.currentIndexChanged.connect(self._on_source_changed)
+        src_row.addWidget(self._cmb_source, 1)
+        layout.addLayout(src_row)
 
         # ── Pose controls ──
         pose_row = QtWidgets.QHBoxLayout()
@@ -132,6 +173,23 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._lbl_bones.setWordWrap(True)
         self._lbl_bones.setStyleSheet("font-size: 10px; color: gray;")
         layout.addWidget(self._lbl_bones)
+
+        # ── Pose library management ──
+        lib_row = QtWidgets.QHBoxLayout()
+        self._btn_save_pose = QtWidgets.QPushButton("💾 Save Pose")
+        self._btn_save_pose.setToolTip(
+            "Save the current pose to the pose library (poses/ folder)."
+        )
+        self._btn_save_pose.setEnabled(False)
+        self._btn_save_pose.clicked.connect(self._on_save_pose_clicked)
+        lib_row.addWidget(self._btn_save_pose)
+
+        self._btn_reload_lib = QtWidgets.QPushButton("⟳ Reload Library")
+        self._btn_reload_lib.setToolTip("Re-scan the poses/ folder from disk.")
+        self._btn_reload_lib.setEnabled(False)
+        self._btn_reload_lib.clicked.connect(lambda: self.reload_library())
+        lib_row.addWidget(self._btn_reload_lib)
+        layout.addLayout(lib_row)
 
         # ── Multi-pose training ──
         # No rig-specific knobs: steps + LR come from the right panel, all loss
@@ -204,21 +262,28 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._mapper = BoneEllipsoidMapper(rigged_mesh.skeleton)
         self._bone_local = None
 
-        n_poses = len(rigged_mesh.poses)
+        # Load saved poses for this skeleton and rebuild the source dropdown,
+        # defaulting to the FBX's own animation.
+        self._library_poses = pose_library.load_all_poses(
+            rigged_mesh.skeleton, self._pose_dir,
+        )
+        self._populate_source_combo(select=self.NATIVE)
+
         n_bones = rigged_mesh.skeleton.num_bones
 
-        self._slider_pose.setRange(0, max(0, n_poses - 1))
-        self._slider_pose.setValue(0)
-        self._slider_pose.setEnabled(n_poses > 1)
+        self._btn_assign.setEnabled(True)
+        self._btn_auto.setEnabled(True)
+        self._btn_save_pose.setEnabled(True)
+        self._btn_reload_lib.setEnabled(True)
 
         self._lbl_status.setText(
             f"Rig: {rigged_mesh.mesh_name} | "
-            f"{n_bones} bones | {n_poses} poses"
+            f"{n_bones} bones | {len(rigged_mesh.poses)} FBX poses | "
+            f"{len(self._library_poses)} saved"
         )
         self._lbl_status.setStyleSheet("color: green; font-size: 11px;")
-        self._btn_assign.setEnabled(True)
-        self._btn_auto.setEnabled(True)
-        self._on_pose_changed(0)
+
+        self._refresh_slider_for_source()
 
         self.rigLoaded.emit(rigged_mesh)
 
@@ -261,7 +326,7 @@ class RigModePanel(QtWidgets.QGroupBox):
             pose_index = self._slider_pose.value()
 
         rm = self._rigged_mesh
-        pose = rm.poses[pose_index] if pose_index < len(rm.poses) else Pose.t_pose()
+        pose = self.pose_at(pose_index)
         skin_mats = rm.skeleton.compute_skin_matrices(pose)
         return deform_mesh(
             rm.vertices, rm.skin_joints, rm.skin_weights, skin_mats,
@@ -279,8 +344,7 @@ class RigModePanel(QtWidgets.QGroupBox):
         if pose_index < 0:
             pose_index = self._slider_pose.value()
 
-        rm = self._rigged_mesh
-        pose = rm.poses[pose_index] if pose_index < len(rm.poses) else Pose.t_pose()
+        pose = self.pose_at(pose_index)
         return self._mapper.local_to_world_np(self._bone_local, pose)
 
     # ── Slots ────────────────────────────────────────────────────────
@@ -288,12 +352,85 @@ class RigModePanel(QtWidgets.QGroupBox):
     def _on_toggle(self, checked: bool):
         self.rigModeToggled.emit(checked)
 
+    def _refresh_slider_for_source(self):
+        """Re-range the timeline slider for the active source and refresh view."""
+        n = len(self.active_poses)
+        self._slider_pose.blockSignals(True)
+        self._slider_pose.setRange(0, max(0, n - 1))
+        self._slider_pose.setValue(0)
+        self._slider_pose.setEnabled(n > 1)
+        self._slider_pose.blockSignals(False)
+        self._on_pose_changed(0)
+
+    def _populate_source_combo(self, select=None):
+        """Rebuild the source dropdown: [native Animation] + saved poses.
+
+        *select* is the combo data to re-select afterwards (defaults to the
+        previously selected entry, falling back to native).
+        """
+        if select is None:
+            select = self._cmb_source.currentData()
+        self._cmb_source.blockSignals(True)
+        self._cmb_source.clear()
+        self._cmb_source.addItem("[native Animation]", self.NATIVE)
+        for i, p in enumerate(self._library_poses):
+            self._cmb_source.addItem(p.name, i)
+        target = self._cmb_source.findData(select)
+        self._cmb_source.setCurrentIndex(max(0, target))
+        self._cmb_source.blockSignals(False)
+
+    def _on_source_changed(self, _index: int):
+        self._refresh_slider_for_source()
+
+    def reload_library(self):
+        """Re-scan the poses/ folder and rebuild the dropdown."""
+        if self._rigged_mesh is None:
+            return
+        prev = self._cmb_source.currentData()
+        self._library_poses = pose_library.load_all_poses(
+            self._rigged_mesh.skeleton, self._pose_dir,
+        )
+        self._populate_source_combo(select=prev)
+        self._refresh_slider_for_source()
+
+    def _on_save_pose_clicked(self):
+        if self._rigged_mesh is None:
+            return
+        pose = self.current_pose
+        if pose is None:
+            return
+        default_name = pose.name if pose.name not in ("", "T-Pose") else "pose"
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Save Pose", "Pose name:", text=default_name,
+        )
+        if not ok or not name.strip():
+            return
+        # Persist under the chosen name so it reloads correctly.
+        pose_to_save = Pose(name=name.strip(), bone_locals=dict(pose.bone_locals))
+        try:
+            path = pose_library.save_pose(
+                pose_to_save, self._rigged_mesh.skeleton,
+                name.strip(), self._pose_dir,
+            )
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self, "Save Pose", f"Failed to save pose:\n{e}")
+            return
+        self.reload_library()
+        # Select the freshly saved pose in the dropdown.
+        for i, p in enumerate(self._library_poses):
+            if p.name == name.strip():
+                self._populate_source_combo(select=i)
+                self._refresh_slider_for_source()
+                break
+        self._lbl_bones.setText(f"Saved pose → {path.name}")
+
     def _on_pose_changed(self, idx: int):
         if self._rigged_mesh is None:
             return
-        n = len(self._rigged_mesh.poses)
-        pose = self._rigged_mesh.poses[idx] if idx < n else Pose.t_pose()
-        self._lbl_pose.setText(f"{idx} / {n - 1}")
+        n = len(self.active_poses)
+        pose = self.pose_at(idx)
+        self._lbl_pose.setText(f"{idx} / {max(0, n - 1)}")
         self._lbl_pose_name.setText(f"Pose: {pose.name}")
         self.poseChanged.emit(idx)
 

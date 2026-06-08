@@ -867,6 +867,8 @@ class SceneViewer3D(_BaseViewer):
         self._bone_line_item: Optional[gl.GLLinePlotItem] = None
         self._joint_item: Optional[gl.GLScatterPlotItem] = None
         self._region_item: Optional[gl.GLLinePlotItem] = None
+        # Exploded per-bone region preview (Bone-Separation verification).
+        self._region_preview_item: Optional[gl.GLMeshItem] = None
         self._underrep_item: Optional[gl.GLScatterPlotItem] = None
 
         # ── SuperFit operation gizmos ──
@@ -1206,6 +1208,46 @@ class SceneViewer3D(_BaseViewer):
         )
         self._mesh_item.setVisible(self._show_mesh)
         self._view.addItem(self._mesh_item)
+
+    # ── exploded region preview (Bone-Separation verification) ──────────
+
+    def show_region_preview(
+        self,
+        verts: np.ndarray,
+        faces: np.ndarray,
+        vertex_colors: np.ndarray,
+    ) -> None:
+        """Show an exploded, per-bone-coloured preview of the region submeshes.
+
+        Used to verify the Bone-Separation carving: each bone's submesh is
+        pushed radially outward (by the host's Mesh-Blowup control) and tinted a
+        distinct colour.  The normal mesh is hidden while the preview is active
+        so the coloured regions read cleanly; ``clear_region_preview`` restores
+        it.  Always drawn opaque (RENDER_SOLID) so the colours stay legible
+        regardless of the mesh's own render mode.
+        """
+        self._clear_region_preview_item()
+        item = _build_mesh_item(
+            np.ascontiguousarray(verts, dtype=np.float32),
+            np.ascontiguousarray(faces),
+            RENDER_SOLID,
+            vertex_colors=np.ascontiguousarray(vertex_colors, dtype=np.float32),
+        )
+        self._region_preview_item = item
+        self._view.addItem(item)
+        if self._mesh_item is not None:
+            self._mesh_item.setVisible(False)
+
+    def clear_region_preview(self) -> None:
+        """Remove the exploded region preview and restore the normal mesh."""
+        self._clear_region_preview_item()
+        if self._mesh_item is not None:
+            self._mesh_item.setVisible(self._show_mesh)
+
+    def _clear_region_preview_item(self) -> None:
+        if self._region_preview_item is not None:
+            self._view.removeItem(self._region_preview_item)
+            self._region_preview_item = None
 
     # ── ellipsoids ──────────────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-"""
+﻿"""
 main_window.py — Application main window (fullscreen, three columns).
 
   ┌──────────────────────────┬──────────────────┬──────────────────┐
@@ -26,6 +26,7 @@ Right:   a scrollable options column — every selectable control, including
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -41,8 +42,17 @@ import shape_plugins
 from shape_plugins import (
     widget_value, set_widget_value, widget_change_signal, available_shapes,
 )
-from mesh_io import load_and_prepare
+from mesh_io import load_and_prepare, load_and_prepare_arrays
 from sdf_compute import SdfComputer, SdfResult
+from api_server import ApiServer
+from rig_ingest import (
+    assign_ellipsoids_to_bones,
+    build_skeleton_from_bones,
+    world_to_bone_local_entries,
+)
+from bone_separation import partition_mesh_by_bone
+from bonesep_controller import BoneSeparationController
+from batched_fit import BatchedFitWorker
 from ellipsoid import EllipsoidSet, SDF_QUILEZ, SDF_METHOD_NAMES, best_device
 from viewer3d import SceneViewer3D
 from widgets import SdfSlicePanel
@@ -121,6 +131,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ellipsoids: EllipsoidSet | None = None
 
         self._last_mesh_result: SdfResult | None = None
+
+        # ── Headless/Unity API state ────────────────────────────────────────
+        # When a fit is driven over the HTTP API instead of the GUI, these track
+        # the in-flight job so the SDF-done / step / finished slots can chain
+        # compute → fit → result and report progress back to the API client.
+        self._api_server: ApiServer | None = None
+        self._api_job_id: str | None = None
+        self._api_stage: str | None = None        # None | "sdf" | "fit"
+        self._api_norm = None                     # NormalizationTransform
+        self._api_options: dict | None = None
+        self._api_last = None                     # (centers, radii, rotations)
+        self._api_verts = None                    # original (un-normalized) verts
+        self._api_rig: dict | None = None         # Unity skinning payload
+
+        # Bone Separation: parallel (batched) controller.  ``_bonesep_ctl`` is the
+        # orchestration state machine (None when idle); ``_batched_worker`` is the
+        # single Adam loop fitting all bones at once; ``_region_sdf_active`` routes
+        # the shared SDF worker's result to the controller during precompute.
+        self._bonesep_ctl: BoneSeparationController | None = None
+        self._batched_worker: BatchedFitWorker | None = None
+        self._region_sdf_active: bool = False
+        self._bonesep_on_complete = None
+        self._bonesep_is_api: bool = False
+        self._bonesep_fit_kwargs: dict = {}
+        # Dedicated SDF computer/worker for the region-SDF precompute phase, kept
+        # separate from ``self._sdf`` so per-bone grids never clobber the loaded
+        # mesh's grid, slice view or viewport volume.
+        self._region_sdf: SdfComputer | None = None
+        self._region_sdf_worker: SdfWorker | None = None
+
+        # Mesh-Blowup preview: cached per-bone submeshes + their centroids for
+        # the exploded region view (None when no preview is active).
+        self._region_parts: list | None = None
+        self._region_centroids: np.ndarray | None = None
+        self._region_global_center: np.ndarray | None = None
+        self._region_colors: np.ndarray | None = None
+
         # Single unified viewport: mesh + skeleton + ellipsoids together.
         self._viewer = SceneViewer3D()
         # SDF slice is shown for the mesh only.  Without a CUDA GPU the n³ SDF
@@ -178,6 +225,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._progress_anim.setDuration(320)
         self._progress_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
         self._progress_anim.valueChanged.connect(self._update_progress_label)
+
+        # Second bar: the overall Bone-Separation progress (how many bone regions
+        # are done), shown to the RIGHT of the per-bone bar above.  Only visible
+        # during a bone-separation run; the per-bone bar tracks the current bone.
+        self._overall_label = QtWidgets.QLabel("")
+        self._overall_label.setVisible(False)
+        self._status.addPermanentWidget(self._overall_label)
+        self._overall_progress = QtWidgets.QProgressBar()
+        self._overall_progress.setRange(0, 1000)
+        self._overall_progress.setMinimumWidth(220)
+        self._overall_progress.setMaximumWidth(320)
+        self._overall_progress.setTextVisible(False)
+        self._overall_progress.setVisible(False)
+        self._status.addPermanentWidget(self._overall_progress)
+        self._overall_msg = ""
+        self._overall_anim = QtCore.QPropertyAnimation(
+            self._overall_progress, b"value", self)
+        self._overall_anim.setDuration(320)
+        self._overall_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._overall_anim.valueChanged.connect(self._update_overall_label)
+
         self._style_progress_bar()
         self._sdf_worker: SdfWorker | None = None
 
@@ -204,6 +272,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings_dialog: SettingsDialog | None = None
 
         self._opt_worker: OptimizationWorker | None = None
+        # Live-render decoupling: the optimizer can emit ``step_visual`` far faster
+        # than the GUI can render (tiny bones in Bone-Separation hit ~800 steps/s).
+        # Doing the heavy work (3D rebuild, dashboard re-plot, animated progress
+        # bars) in the signal slot floods the GUI event queue and freezes the UI
+        # (Stop needs dozens of clicks).  Instead the slot only *stashes* the
+        # latest frame; a GUI-thread timer renders it at a fixed rate, so the
+        # update cost is bounded no matter how fast the optimizer runs.
+        self._pending_visual: tuple | None = None
+        self._visual_timer = QtCore.QTimer(self)
+        self._visual_timer.setInterval(45)               # ~22 FPS GUI refresh
+        self._visual_timer.timeout.connect(self._flush_visual)
         self._multipose_worker = None  # MultiPoseOptimizationWorker
         self._current_mesh_name: str = ""
         self._current_sdf_mode: int = SDF_QUILEZ
@@ -228,6 +307,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mesh_settings.rotationChanged.connect(self._on_mesh_rotation_changed)
         self._mesh_settings.blowupChanged.connect(
             lambda vox: self._viewer.set_sdf_blowup(vox))
+        self._mesh_settings.regionPreviewToggled.connect(
+            self._on_region_preview_toggled)
+        self._mesh_settings.regionBlowupChanged.connect(
+            self._on_region_blowup_changed)
 
         # Restore the right-hand options panel from the last session and keep it
         # persisted on every change (panel_settings.json).
@@ -374,6 +457,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "Penalizes ellipsoids that span more than one bone — a little\n"
             "overlap is fine, but no ellipsoid should span multiple bones.")
 
+        # Fit scope: whole mesh at once, or one independent SDF+fit per bone.
+        self._cmb_fit_scope = QtWidgets.QComboBox()
+        self._cmb_fit_scope.addItem("Full Object", "full")
+        self._cmb_fit_scope.addItem("Bone Separation", "bone")
+        self._cmb_fit_scope.setToolTip(
+            "Full Object: one SDF for the whole mesh (default).\n"
+            "Bone Separation: carve the mesh into per-bone regions, then build a\n"
+            "separate SDF for each and fit it independently, one bone at a time.\n"
+            "Needs skinning data (rigged FBX or a Unity rig payload).")
+
         # Learning rate
         self._spin_lr_init = QtWidgets.QDoubleSpinBox()
         self._spin_lr_init.setRange(0.0001, 0.5)
@@ -484,6 +577,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rig_form = QtWidgets.QFormLayout(self._grp_rig)
         rig_form.setLabelAlignment(QtCore.Qt.AlignLeft)
         rig_form.addRow(self._chk_bone_aware)
+        rig_form.addRow("Fit scope:", self._cmb_fit_scope)
         v.addWidget(self._grp_rig)
         self._grp_rig.setVisible(False)
 
@@ -760,7 +854,7 @@ class MainWindow(QtWidgets.QMainWindow):
         primary = theme.BLUE_HEX
         secondary = theme.YELLOW_HEX
         fg = "#e6e6e6" if theme.is_dark_mode() else "#1e1e1e"
-        self._sdf_progress.setStyleSheet(f"""
+        css = f"""
             QProgressBar {{
                 border: 1px solid rgba(128, 128, 128, 0.5);
                 border-radius: 7px;
@@ -775,7 +869,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                             stop:0 {primary}, stop:1 {secondary});
             }}
-        """)
+        """
+        self._sdf_progress.setStyleSheet(css)
+        if hasattr(self, "_overall_progress"):
+            self._overall_progress.setStyleSheet(css)
 
     def _update_progress_label(self, value: int) -> None:
         """Sync the left label's percentage to *value* (in bar units)."""
@@ -816,6 +913,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sdf_progress.setVisible(False)
         self._progress_label.clear()
         self._progress_label.setVisible(False)
+
+    # ── overall (bone-separation) progress bar ────────────────────────────
+
+    def _update_overall_label(self, value: int) -> None:
+        """Sync the overall bar's label percentage to *value* (in bar units)."""
+        span = max(1, self._overall_progress.maximum())
+        pct = int(round(value / span * 100))
+        self._overall_label.setText(
+            f"{self._overall_msg} · {pct}%" if self._overall_msg else f"{pct}%")
+
+    def _overall_begin(self, msg: str) -> None:
+        """Show the overall progress bar, reset to 0, and set the label."""
+        self._overall_msg = msg
+        self._overall_anim.stop()
+        self._overall_progress.setValue(0)
+        self._overall_progress.setVisible(True)
+        self._update_overall_label(0)
+        self._overall_label.setVisible(True)
+
+    def _overall_set(self, value: float, msg: str | None = None) -> None:
+        """Lerp the overall bar toward *value* (0–100 %); update the label."""
+        if msg is not None:
+            self._overall_msg = msg
+        self._overall_progress.setVisible(True)
+        self._overall_label.setVisible(True)
+        span = self._overall_progress.maximum()
+        target = int(max(0, min(span, round(value / 100.0 * span))))
+        self._overall_anim.stop()
+        self._overall_anim.setStartValue(self._overall_progress.value())
+        self._overall_anim.setEndValue(target)
+        self._overall_anim.start()
+        self._update_overall_label(self._overall_progress.value())
+
+    def _overall_end(self) -> None:
+        """Hide the overall progress bar and its label."""
+        self._overall_anim.stop()
+        self._overall_msg = ""
+        self._overall_progress.setVisible(False)
+        self._overall_label.clear()
+        self._overall_label.setVisible(False)
 
     # ── provisional colour pickers ───────────────────────────────────────
 
@@ -902,6 +1039,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rig_panel.setVisible(False)  # Hide all rig/FBX options
         self._viewer.remove_skeleton()     # No skeleton → hide its overlay toggle
         self._grp_rig.setVisible(False)    # Hide bone-awareness option
+        self._mesh_settings.set_region_available(False)  # no rig → no regions
         self._bone_centers = None
         try:
             mesh = load_and_prepare(path, target_scale=1.0)
@@ -937,6 +1075,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rig_panel.setChecked(True)
         self._rig_panel.set_rigged_mesh(rigged)
         self._grp_rig.setVisible(True)    # Reveal bone-awareness option
+        self._mesh_settings.set_region_available(True)  # enable Mesh Blowup
         self._bone_centers = self._compute_bone_centers(rigged)
 
         verts = rigged.vertices
@@ -1018,7 +1157,7 @@ class MainWindow(QtWidgets.QMainWindow):
             deformed = self._apply_rotation(deformed)
             self._viewer.show_mesh(deformed, rm.faces)
 
-            pose = rm.poses[pose_index] if pose_index < len(rm.poses) else Pose.t_pose()
+            pose = self._rig_panel.pose_at(pose_index)
             self._show_skeleton_for_pose(rm, pose)
 
             # Defer the heavy SDF recompute; keep only the latest pose pending.
@@ -1032,7 +1171,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._viewer.show_ellipsoids_fast(wc, wr, wq)
 
         self._status.showMessage(
-            f"Pose {pose_index}: {rm.poses[pose_index].name if pose_index < len(rm.poses) else 'T-Pose'}"
+            f"Pose {pose_index}: {self._rig_panel.pose_at(pose_index).name}"
         )
 
     def _recompute_pose_sdf(self) -> None:
@@ -1057,6 +1196,9 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Mesh settings: rotation + SDF blowup ───────────────────────────
     def _set_base_mesh(self, verts: np.ndarray, faces: np.ndarray) -> None:
         """Remember the un-rotated mesh + a fixed rotation pivot; reset controls."""
+        # Drop any exploded region preview from the previous mesh (reset() below
+        # unchecks the toggle silently, so clear the cached geometry here).
+        self._clear_region_preview_state()
         self._base_verts = np.ascontiguousarray(verts, dtype=np.float32)
         self._base_faces = np.ascontiguousarray(faces)
         # Fixed pivot (bind-pose bbox centre) so the rotation is stable across
@@ -1078,6 +1220,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_mesh_rotation_changed(self, rx: float, ry: float, rz: float) -> None:
         """Store the rotation and re-apply it to the current mesh (and pose)."""
         self._mesh_rotation = (rx, ry, rz)
+        # Keep the exploded region preview (if any) aligned with the rotation.
+        if self._region_parts is not None:
+            self._refresh_region_preview()
         # Rigged: re-render the active pose so the rotation rides on top of it
         # (mesh + skeleton) and the SDF recompute uses the rotated posed mesh.
         if self._rig_panel.is_active and self._rig_panel.rigged_mesh is not None:
@@ -1205,7 +1350,7 @@ class MainWindow(QtWidgets.QMainWindow):
             skeleton=rm.skeleton,
             skin_joints=rm.skin_joints,
             skin_weights=rm.skin_weights,
-            poses=rm.poses,
+            poses=self._rig_panel.active_poses,
             bone_local=bl,
             mapper=mapper,
             num_steps=self._spin_max_steps.value(),
@@ -1286,7 +1431,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rm = self._rig_panel.rigged_mesh
         if rm is None:
             return
-        pose = rm.poses[pose_index] if pose_index < len(rm.poses) else Pose.t_pose()
+        pose = self._rig_panel.pose_at(pose_index)
 
         # Use pre-computed deformed mesh (instant)
         cached = getattr(self, '_precomputed_meshes', {})
@@ -1295,11 +1440,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._show_skeleton_for_pose(rm, pose)
 
         # Update pose slider to match
+        n_active = len(self._rig_panel.active_poses)
         self._rig_panel._slider_pose.blockSignals(True)
         self._rig_panel._slider_pose.setValue(pose_index)
         self._rig_panel._slider_pose.blockSignals(False)
         self._rig_panel._lbl_pose.setText(
-            f"{pose_index} / {len(rm.poses) - 1}")
+            f"{pose_index} / {max(0, n_active - 1)}")
         self._rig_panel._lbl_pose_name.setText(f"Pose: {pose.name}")
 
     def _on_multipose_pose_loss(self, step: int, pose_name: str, loss: float):
@@ -1401,11 +1547,17 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Ready to fit ellipsoids."
         )
 
+        # Chain into the fit when an API job is waiting for its SDF grid.
+        if self._api_job_id is not None and self._api_stage == "sdf":
+            self._api_start_fit()
+
     def _on_sdf_failed(self, msg: str) -> None:
         self._sdf_worker = None
         self._progress_end()
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._status.showMessage(f"Mesh SDF failed: {msg}")
+        if self._api_job_id is not None and self._api_stage == "sdf":
+            self._api_fail(self._api_job_id, f"SDF compute failed: {msg}")
 
     def _ensure_sdf_idle(self) -> None:
         """Block until any in-flight SDF worker finishes.
@@ -1432,35 +1584,441 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── fit / stop ────────────────────────────────────────────────────────
 
-    def _on_fit_clicked(self):
-        if self._last_mesh_result is None:
-            self._status.showMessage("Compute mesh SDF first (press G or Compute).")
-            return
-        # Shared controls + the active shape's shape-specific kwargs.
+    def _gather_fit_kwargs(self) -> dict:
+        """Build the ``start_optimization`` kwargs from the live option widgets.
+
+        Excludes ``num_ellipsoids`` / ``max_ellipsoids`` (the caller sets those,
+        which lets Bone Separation override the count per bone) and the
+        bone-awareness penalty (caller-specific).  Used by both the full-object
+        fit and the per-bone fits so they share one source of settings.
+        """
         shape_kwargs = self._shape.fit_kwargs()
-        self.start_optimization(
-            num_ellipsoids=self._spin_num_ellipsoids.value(),
+        return dict(
             method="adam",
             num_steps=self._spin_max_steps.value(),
             report_every=self._report_every,
             maintenance_every=0,
-            max_ellipsoids=self._spin_max_ellipsoids.value(),
             symmetry=self._chk_symmetry.isChecked(),
             lr_init=self._spin_lr_init.value(),
             lr_final=self._spin_lr_final.value(),
             lr_decay_k=self._spin_lr_decay.value(),
-            bone_aware=(self._grp_rig.isVisible()
-                        and self._chk_bone_aware.isChecked()
-                        and self._bone_centers is not None),
-            bone_centers=self._bone_centers,
             advanced=self._settings,
             **shape_kwargs,   # sdf_mode, superfit*, local_fit*, soft_union, merge/spawn/split
         )
 
+    def _on_fit_clicked(self):
+        if self._last_mesh_result is None:
+            self._status.showMessage("Compute mesh SDF first (press G or Compute).")
+            return
+        # Bone Separation: train each bone on its own SDF, one at a time.
+        if (self._cmb_fit_scope.currentData() == "bone"
+                and self._has_skin_for_bonesep()):
+            self._start_bone_separation_manual()
+            return
+        self.start_optimization(
+            num_ellipsoids=self._spin_num_ellipsoids.value(),
+            max_ellipsoids=self._spin_max_ellipsoids.value(),
+            bone_aware=(self._grp_rig.isVisible()
+                        and self._chk_bone_aware.isChecked()
+                        and self._bone_centers is not None),
+            bone_centers=self._bone_centers,
+            **self._gather_fit_kwargs(),
+        )
+
     def _on_stop_clicked(self):
         self._rig_panel.set_auto_pipeline_running(False)
+        # Cancel the parallel bone-separation pipeline (controller + workers).
+        if self._bonesep_ctl is not None:
+            self._bonesep_ctl.cancel()
+        if (self._batched_worker is not None
+                and self._batched_worker.isRunning()):
+            self._visual_timer.stop()
+            self._batched_worker.request_stop()
+            self._batched_worker.wait()
+        self._batched_worker = None
+        self._bonesep_ctl = None
+        self._overall_end()             # hide the overall bone-separation bar
         self.stop_optimization()
         self._stop_multipose()
+
+    # ── Bone Separation: parallel (batched) fitting ──────────────────────
+    #
+    # The skinned mesh is carved into one compact submesh per bone
+    # (``partition_mesh_by_bone``).  Instead of fitting bones one after another
+    # (which starves the GPU — a tiny finger fills a fraction of the device per
+    # step), the pipeline runs in two clean phases, orchestrated by
+    # :class:`BoneSeparationController`:
+    #
+    #   1. PRECOMPUTE — every fit-bone's isolated region SDF is computed (still
+    #      one at a time, but SDF is the cheap phase) and turned into a
+    #      :class:`batched_fit.BoneFitJob` carrying its own world-space sample
+    #      pool + region-SDF targets.
+    #   2. BATCHED FIT — ALL jobs are handed to :class:`batched_fit.BatchedFitWorker`,
+    #      which fits every bone in a SINGLE Adam loop (each against its own SDF
+    #      via per-sample / per-ellipsoid group ids), so the GPU runs full and the
+    #      slow phase happens once instead of N times.
+    #
+    # Symmetry is handled by the controller: paired (left/right) bones are
+    # mirrored from their fitted source; on-plane (centre) bones are symmetrised
+    # inside the batched worker.
+    #
+    # This MainWindow is the controller's *host* (see ``BoneSepHost``): it owns
+    # the async SDF + batched-fit workers and calls back into the controller's
+    # ``on_sdf_ready`` / ``on_sdf_failed`` / ``fit_progress`` / ``on_fit_finished``
+    # on the GUI thread.  ``accum`` handed to the completion callback is
+    # ``(world_centers, world_radii, world_rotations, bone_indices)``.
+
+    def _has_skin_for_bonesep(self) -> bool:
+        """True when a rigged mesh with usable skinning + mapper is loaded."""
+        rm = self._rig_panel.rigged_mesh
+        return bool(
+            self._rig_panel.is_active and rm is not None
+            and getattr(rm, "skin_joints", None) is not None
+            and getattr(rm, "skin_weights", None) is not None
+            and self._rig_panel.mapper is not None)
+
+    def _start_bone_separation_manual(self) -> None:
+        """GUI entry point: bone-separate the loaded rigged mesh, then fit."""
+        rm = self._rig_panel.rigged_mesh
+        if rm is None:
+            self._status.showMessage("Load a rigged mesh first.")
+            return
+        self.stop_optimization()
+        self._stop_multipose()
+        self._begin_bone_separation(
+            rm.vertices, rm.faces, rm.skin_joints, rm.skin_weights,
+            on_complete=lambda accum: self._bonesep_complete_gui(accum, rm),
+            base_kwargs=self._gather_fit_kwargs(),
+            is_api=False,
+        )
+
+    def _begin_bone_separation(
+        self,
+        verts: np.ndarray,
+        faces: np.ndarray,
+        skin_joints: np.ndarray,
+        skin_weights: np.ndarray,
+        on_complete,
+        base_kwargs: dict,
+        *,
+        is_api: bool = False,
+    ) -> None:
+        """Partition the mesh and launch the parallel (batched) fit pipeline."""
+        try:
+            parts = partition_mesh_by_bone(
+                verts, faces, skin_joints, skin_weights,
+                total_budget=self._spin_num_ellipsoids.value(),
+                total_max=self._spin_max_ellipsoids.value(),
+            )
+        except Exception as e:
+            if is_api and self._api_job_id is not None:
+                self._api_fail(self._api_job_id, f"bone partition failed: {e}")
+            else:
+                self._status.showMessage(f"Bone Separation failed: {e}")
+            return
+
+        if not parts:
+            if is_api and self._api_job_id is not None:
+                self._api_fail(self._api_job_id,
+                               "no bone produced a usable region")
+            else:
+                self._status.showMessage(
+                    "Bone Separation: no bone produced a usable region.")
+            return
+
+        # Stash the completion routing for ``bonesep_complete`` / ``bonesep_failed``.
+        self._bonesep_on_complete = on_complete
+        self._bonesep_is_api = bool(is_api)
+        self._bonesep_fit_kwargs = dict(base_kwargs)
+
+        self._btn_fit.setEnabled(False)
+        self._btn_stop.setEnabled(True)
+        self._overall_begin("Gesamt · Bone Separation")
+        self._progress_begin("Bone Separation …")
+
+        # The controller is GUI-free; this window is its host (see BoneSepHost).
+        self._bonesep_ctl = BoneSeparationController(
+            self, parts, base_kwargs,
+            symmetry=bool(base_kwargs.get("symmetry")),
+            mesh_vertices=verts,
+        )
+        self._bonesep_ctl.begin()
+
+    # ── BoneSepHost interface (called by the controller on the GUI thread) ──
+
+    def compute_region_sdf(self, vertices: np.ndarray, faces: np.ndarray,
+                           symmetry: bool) -> None:
+        """Start one isolated region-SDF compute on a dedicated worker.
+
+        Uses a private ``SdfComputer`` so the per-bone grid never clobbers the
+        loaded mesh's grid / slice view / viewport volume.  The result is routed
+        back to the controller via ``on_sdf_ready`` / ``on_sdf_failed``.
+        """
+        if self._region_sdf is None:
+            self._region_sdf = SdfComputer(device=self._device)
+        if (self._region_sdf_worker is not None
+                and self._region_sdf_worker.isRunning()):
+            self._region_sdf_worker.wait()
+        self._region_sdf.set_mesh(vertices, faces)
+        n = self._mesh_sdf_panel.requested_n
+        margin = self._slider_margin.value() / 100.0
+        self._region_sdf_active = True
+        w = SdfWorker(self._region_sdf, n, margin, parent=self,
+                      symmetry=bool(symmetry))
+        self._region_sdf_worker = w
+        w.progress.connect(self._on_region_sdf_progress)
+        w.done.connect(self._on_region_sdf_done)
+        w.failed.connect(self._on_region_sdf_failed)
+        w.start()
+
+    def _on_region_sdf_progress(self, frac: float, msg: str) -> None:
+        self._progress_set(float(frac) * 100.0, f"Region-SDF · {msg}")
+
+    def _on_region_sdf_done(self, result) -> None:
+        self._region_sdf_worker = None
+        self._region_sdf_active = False
+        if self._bonesep_ctl is not None:
+            self._bonesep_ctl.on_sdf_ready(result)
+
+    def _on_region_sdf_failed(self, msg: str) -> None:
+        self._region_sdf_worker = None
+        self._region_sdf_active = False
+        if self._bonesep_ctl is not None:
+            self._bonesep_ctl.on_sdf_failed(msg)
+
+    def run_batched_fit(self, jobs) -> None:
+        """Fit ALL bone jobs in a single Adam loop on a background thread."""
+        fk = self._bonesep_fit_kwargs
+        worker = BatchedFitWorker(
+            jobs,
+            device=str(self._device),
+            num_steps=int(fk.get("num_steps", 1200)),
+            report_every=int(self._report_every),
+            lr_init=float(fk.get("lr_init", 0.01)),
+            lr_final=float(fk.get("lr_final", 0.0002)),
+            lr_decay_k=float(fk.get("lr_decay_k", 7.0)),
+            rng=np.random.default_rng(),
+            parent=self,
+        )
+        self._batched_worker = worker
+        self._batched_total_steps = int(fk.get("num_steps", 1200))
+        self._pending_visual = None
+        self._visual_timer.start()          # decouple GUI refresh from step rate
+        worker.step_visual.connect(self._on_batched_step)
+        worker.prep_progress.connect(self._on_batched_prep)
+        worker.fit_finished.connect(self._on_batched_finished)
+        worker.start()
+
+    def report_overall(self, frac: float, msg: str) -> None:
+        self._overall_set(float(np.clip(frac, 0.0, 1.0)) * 100.0, msg)
+
+    def report_current(self, frac: float, msg: str) -> None:
+        self._progress_set(float(np.clip(frac, 0.0, 1.0)) * 100.0, msg)
+
+    def set_status(self, msg: str) -> None:
+        self._status.showMessage(msg)
+
+    def bonesep_complete(self, accum: tuple) -> None:
+        """Controller finished: tear down state, then run the completion cb."""
+        on_complete = self._bonesep_on_complete
+        self._bonesep_ctl = None
+        self._batched_worker = None
+        self._bonesep_on_complete = None
+        self._btn_fit.setEnabled(self._last_mesh_result is not None)
+        self._btn_stop.setEnabled(False)
+        self._overall_end()
+        self._progress_end()
+        if on_complete is not None:
+            on_complete(accum)
+
+    def bonesep_failed(self, msg: str) -> None:
+        """Controller aborted: tear down state and report the failure."""
+        is_api = self._bonesep_is_api
+        self._bonesep_ctl = None
+        self._batched_worker = None
+        self._bonesep_on_complete = None
+        self._btn_fit.setEnabled(self._last_mesh_result is not None)
+        self._btn_stop.setEnabled(False)
+        self._overall_end()
+        self._progress_end()
+        if is_api and self._api_job_id is not None:
+            self._api_fail(self._api_job_id, msg)
+        else:
+            self._status.showMessage(f"Bone Separation: {msg}")
+
+    # ── batched-fit worker handlers ──────────────────────────────────────
+
+    def _on_batched_step(self, step: int, loss: float,
+                         centers: np.ndarray, radii: np.ndarray,
+                         rotations: np.ndarray) -> None:
+        """Hot path: stash the latest combined frame + forward fit progress."""
+        self._pending_visual = (int(step), float(loss),
+                                centers, radii, rotations, None)
+        if self._bonesep_ctl is not None:
+            total = max(1, int(getattr(self, "_batched_total_steps", 1)))
+            self._bonesep_ctl.fit_progress(step / total)
+
+    def _on_batched_prep(self, frac: float, label: str) -> None:
+        self._progress_set(float(frac) * 100.0, f"Batched-Fit · {label}")
+
+    def _on_batched_finished(self) -> None:
+        """Worker done: flush the final frame and hand results to the controller."""
+        self._visual_timer.stop()
+        self._flush_visual()
+        worker = self._batched_worker
+        if self._bonesep_ctl is not None and worker is not None:
+            self._bonesep_ctl.on_fit_finished(worker.results)
+
+    def _bonesep_complete_gui(self, accum, rm) -> None:
+        """GUI completion: show the assembled ellipsoids + bone-local mapping."""
+        centers, radii, rotations, bone_idx = accum
+        self._ellipsoids = EllipsoidSet(device=self._device)
+        self._ellipsoids.set_parameters(centers, radii, rotations)
+        self._viewer.show_ellipsoids(self._ellipsoids)
+        self._lbl_ell_count.setText(f"Count: {len(centers)}")
+
+        mapper = self._rig_panel.mapper
+        if mapper is not None:
+            try:
+                bl = mapper.world_to_local(
+                    centers, radii, rotations, bone_idx, pose=None)
+                self._rig_panel.set_bone_local(bl)
+                self._rig_panel._btn_assign.setEnabled(True)
+            except Exception as e:
+                self._status.showMessage(
+                    f"Bone Separation: local mapping failed: {e}")
+                return
+        self._status.showMessage(
+            f"Bone Separation done — {len(centers)} ellipsoids across "
+            f"{len(np.unique(bone_idx))} bone(s).")
+
+    def _api_bonesep_complete(self, accum) -> None:
+        """API completion: denormalize, map to bone-local, publish v2 result."""
+        job_id = self._api_job_id
+        if job_id is None or self._api_server is None:
+            self._api_reset()
+            return
+        try:
+            centers, radii, rotations, bone_idx = accum
+            t = self._api_norm
+            centers_o = np.array([t.to_original_point(c) for c in centers],
+                                 dtype=np.float64)
+            radii_o = np.array([t.to_original_length(r) for r in radii],
+                               dtype=np.float64)
+            entries = world_to_bone_local_entries(
+                centers_o, radii_o, rotations, bone_idx, self._api_rig)
+            result = {
+                "version": 2,
+                "coordinate_system": "right_hand_y_up",
+                "quaternion_convention": "xyzw",
+                "rigged": True,
+                "count": len(entries),
+                "ellipsoids": entries,
+            }
+            self._api_server.registry.update(
+                job_id, state="done", result=result, count=len(entries))
+            self._status.showMessage(
+                f"API fit {job_id[:8]} done — {len(entries)} ellipsoids "
+                f"(bone-separation)")
+        except Exception as e:
+            self._api_server.registry.update(
+                job_id, state="error", error=str(e))
+            self._status.showMessage(f"API fit {job_id[:8]} failed: {e}")
+        finally:
+            self._api_reset()
+
+    # ── Mesh Blowup: exploded per-bone region preview ────────────────────
+    #
+    # A verification view for the Bone-Separation carving: partition the loaded
+    # rigged mesh into the same per-bone submeshes that Bone-Separation fits, and
+    # push each region radially outward from the shared centroid so the regions
+    # (and their seam overlap) can be inspected.  The spread is a pure
+    # translation, so dragging the slider is cheap.
+
+    @staticmethod
+    def _region_palette(n: int) -> np.ndarray:
+        """Distinct, stable RGBA colour per bone (golden-ratio hue spacing)."""
+        import colorsys
+        cols = np.ones((max(1, n), 4), dtype=np.float32)
+        for i in range(n):
+            h = (i * 0.61803398875) % 1.0
+            r, g, b = colorsys.hsv_to_rgb(h, 0.62, 1.0)
+            cols[i] = (r, g, b, 1.0)
+        return cols
+
+    def _clear_region_preview_state(self) -> None:
+        """Drop the cached preview geometry and remove the viewport item."""
+        self._region_parts = None
+        self._region_centroids = None
+        self._region_global_center = None
+        self._region_colors = None
+        self._viewer.clear_region_preview()
+
+    def _on_region_preview_toggled(self, on: bool) -> None:
+        """Build (or tear down) the exploded per-bone region preview."""
+        if not on:
+            self._clear_region_preview_state()
+            self._status.showMessage("Mesh Blowup preview off.")
+            return
+        if not self._has_skin_for_bonesep():
+            self._mesh_settings.set_region_available(False)
+            self._status.showMessage(
+                "Mesh Blowup needs a rigged mesh with skin weights.")
+            return
+        rm = self._rig_panel.rigged_mesh
+        try:
+            parts = partition_mesh_by_bone(
+                rm.vertices, rm.faces, rm.skin_joints, rm.skin_weights,
+                total_budget=self._spin_num_ellipsoids.value(),
+                total_max=self._spin_max_ellipsoids.value(),
+            )
+        except Exception as e:
+            self._status.showMessage(f"Mesh Blowup: partition failed: {e}")
+            return
+        if not parts:
+            self._status.showMessage(
+                "Mesh Blowup: no bone produced a usable region.")
+            return
+        self._region_parts = parts
+        self._region_centroids = np.array(
+            [p.vertices.mean(axis=0) for p in parts], dtype=np.float32)
+        self._region_global_center = self._region_centroids.mean(axis=0)
+        self._region_colors = self._region_palette(len(parts))
+        self._refresh_region_preview()
+        self._status.showMessage(
+            f"Mesh Blowup preview: {len(parts)} bone region(s).")
+
+    def _on_region_blowup_changed(self, factor: float) -> None:
+        """Live-update the explosion distance (translation only)."""
+        if self._region_parts is not None:
+            self._refresh_region_preview()
+
+    def _refresh_region_preview(self) -> None:
+        """Rebuild the exploded, per-bone-coloured combined mesh and show it."""
+        parts = self._region_parts
+        if not parts:
+            return
+        factor = self._mesh_settings.region_blowup()
+        all_v: list[np.ndarray] = []
+        all_f: list[np.ndarray] = []
+        all_c: list[np.ndarray] = []
+        voff = 0
+        for i, p in enumerate(parts):
+            disp = (self._region_centroids[i]
+                    - self._region_global_center) * factor
+            v = (p.vertices + disp).astype(np.float32)
+            all_v.append(v)
+            all_f.append(p.faces.astype(np.int64) + voff)
+            voff += len(v)
+            col = self._region_colors[i % len(self._region_colors)]
+            all_c.append(np.tile(col, (len(v), 1)))
+        verts = np.vstack(all_v)
+        faces = np.vstack(all_f)
+        colors = np.vstack(all_c).astype(np.float32)
+        # Keep the preview aligned with the rest of the scene (skeleton etc.),
+        # which is drawn under the current global mesh rotation.
+        verts = self._apply_rotation(verts)
+        self._viewer.show_region_preview(verts, faces, colors)
 
     # ── thickness heatmap on the mesh view ──────────────────────────────
 
@@ -1489,15 +2047,19 @@ class MainWindow(QtWidgets.QMainWindow):
         maintenance_every: int = 200,
         superfit: bool = False,
         superfit_every: int = 150,
+        densify_start_frac: float = 0.0,
         densify_until_frac: float = 0.75,
         soft_union: bool = False,
         max_ellipsoids: int = 60,
         local_fit: bool = True,
         local_fit_start_frac: float = 0.25,
+        local_fit_end_frac: float = 1.0,
+        local_fit_every: int = 150,
         symmetry: bool = False,
         merge_enabled: bool = True,
         spawn_enabled: bool = True,
         split_enabled: bool = True,
+        prune_enabled: bool = True,
         lr_init: float = 0.01,
         lr_final: float = 0.0002,
         lr_decay_k: float = 7.0,
@@ -1535,6 +2097,7 @@ class MainWindow(QtWidgets.QMainWindow):
             maintenance_every=maintenance_every,
             superfit=superfit,
             superfit_every=superfit_every,
+            densify_start_frac=densify_start_frac,
             densify_until_frac=densify_until_frac,
             soft_union=soft_union,
             max_ellipsoids=max_ellipsoids,
@@ -1542,10 +2105,13 @@ class MainWindow(QtWidgets.QMainWindow):
             sdf_computer=self._sdf,
             local_fit=local_fit,
             local_fit_start_frac=local_fit_start_frac,
+            local_fit_end_frac=local_fit_end_frac,
+            local_fit_every=local_fit_every,
             symmetry_enabled=symmetry,
             merge_enabled=merge_enabled,
             spawn_underrep=spawn_enabled,
             split_enabled=split_enabled,
+            prune_enabled=prune_enabled,
             lr_init=lr_init,
             lr_final=lr_final,
             lr_decay_k=lr_decay_k,
@@ -1563,6 +2129,8 @@ class MainWindow(QtWidgets.QMainWindow):
             worker_kwargs.update(advanced)
         self._opt_worker = OptimizationWorker(**worker_kwargs)
         self._opt_phase = "global"
+        self._pending_visual = None
+        self._visual_timer.start()         # decouple GUI refresh from step rate
         self._opt_worker.step_visual.connect(self._on_opt_step_visual)
         self._opt_worker.step_sdf.connect(self._on_opt_step_sdf)
         self._opt_worker.phase_changed.connect(self._on_opt_phase_changed)
@@ -1597,6 +2165,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def stop_optimization(self) -> None:
         if self._opt_worker is not None and self._opt_worker.isRunning():
+            self._visual_timer.stop()
             self._opt_worker.request_stop()
             self._opt_worker.wait()
             self._opt_worker = None
@@ -1614,13 +2183,51 @@ class MainWindow(QtWidgets.QMainWindow):
             rotations: np.ndarray,
             eps: np.ndarray | None = None,
     ) -> None:
+        # Hot path — runs once per emitted step (can be ~40×/s at 800 steps/s).
+        # Keep it cheap: only record state needed for correctness if the run ends
+        # before the next timer tick, then stash the frame.  All heavy GUI work
+        # happens in ``_flush_visual`` on the render timer.  (Bone Separation no
+        # longer routes through here — it uses ``_on_batched_step``.)
+        if self._api_job_id is not None and self._api_stage == "fit":
+            self._api_last = (centers, radii, rotations)
+        self._pending_visual = (int(step), float(loss),
+                                centers, radii, rotations, eps)
+
+    def _flush_visual(self) -> None:
+        """Render the latest stashed optimizer frame (driven by a GUI timer).
+
+        Decouples the GUI refresh rate from the optimizer's step rate so a fast
+        fit can't flood the event queue.  Also called once on finish to guarantee
+        the final frame is shown.
+        """
+        pv = self._pending_visual
+        if pv is None:
+            return
+        self._pending_visual = None
+        step, loss, centers, radii, rotations, eps = pv
+
         # Route rendering through the active shape plugin (superquadrics use the
         # per-primitive eps array for the deformed mesh).
         self._shape.render(self._viewer, centers, radii, rotations, eps)
+        self._viewer.tick_op_gizmos(step)
         self._lbl_ell_count.setText(f"Count: {len(centers)}")
 
-        # Age out / fade the SuperFit operation gizmos as training advances.
-        self._viewer.tick_op_gizmos(step)
+        # Keep ellipsoids reference for rig assignment.
+        self._ellipsoids = EllipsoidSet(device=self._device)
+        self._ellipsoids.set_parameters(centers, radii, rotations)
+
+        # Bone Separation (batched): the worker emits already-combined world
+        # ellipsoids for ALL bones, and the controller drives both progress bars
+        # + the status line.  So here we only render — skip the optimizer-specific
+        # progress/status/API/dashboard bookkeeping below.
+        if self._batched_worker is not None:
+            if (self._bonesep_is_api and self._api_server is not None
+                    and self._api_job_id is not None):
+                self._api_server.registry.update(
+                    self._api_job_id, step=step,
+                    total=int(getattr(self, "_batched_total_steps", 0)),
+                    loss=loss, count=int(len(centers)))
+            return
 
         # Training progress in the status-bar progress bar (step / total).
         phase = getattr(self, "_opt_phase", "global")
@@ -1630,13 +2237,15 @@ class MainWindow(QtWidgets.QMainWindow):
                                f"Optimizing [{phase.upper()}] · step {step}/{total}")
 
         if phase != "local":
-            print(f"Step {step}: loss = {loss:.6f}")
             self._status.showMessage(
                 f"Optimizing [{phase.upper()}] … step {step}/{total}  loss={loss:.6f}")
 
-        # Keep ellipsoids reference for rig assignment
-        self._ellipsoids = EllipsoidSet(device=self._device)
-        self._ellipsoids.set_parameters(centers, radii, rotations)
+        # Mirror live progress into the active API job (Debug-mode polling).
+        if (self._api_job_id is not None and self._api_stage == "fit"
+                and self._api_server is not None):
+            self._api_server.registry.update(
+                self._api_job_id, step=step, total=total,
+                loss=loss, count=int(len(centers)))
 
         # Feed loss to the run tracker + dashboard only during the global phase:
         # local-fit emits all carry the same global step number and would pollute
@@ -1711,6 +2320,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return
 
     def _on_opt_finished(self) -> None:
+        # Stop the GUI refresh timer and flush the last pending frame so the
+        # finished result is always shown at full fidelity (the timer may have
+        # skipped the final step).
+        self._visual_timer.stop()
+        self._flush_visual()
         self._status.showMessage("Optimization finished.")
         self._run_tracker.finish_run()
         self._dashboard.finish()
@@ -1725,3 +2339,229 @@ class MainWindow(QtWidgets.QMainWindow):
         # Enable bone assignment if rig mode is active
         if self._rig_panel.is_active and self._ellipsoids is not None:
             self._rig_panel._btn_assign.setEnabled(True)
+
+        # (Bone Separation no longer runs through the OptimizationWorker, so there
+        # is nothing to bank here — it finishes via ``_on_batched_finished``.)
+
+        # If this fit was driven over the API, assemble and publish the result.
+        if self._api_job_id is not None and self._api_stage == "fit":
+            self._api_finish_fit()
+
+    # ── Unity / HTTP API ───────────────────────────────────────────────────
+
+    def start_api_server(self, host: str = "127.0.0.1",
+                         port: int = 8765) -> None:
+        """Start the embedded HTTP API and route fit requests to this window.
+
+        Fit requests arrive on a background HTTP thread and are delivered here
+        via a queued signal, so the orchestration below runs on the GUI thread
+        and the fit renders in the normal viewport.
+        """
+        if self._api_server is not None:
+            return
+        self._api_server = ApiServer(host=host, port=port)
+        self._api_server.bridge.fit_requested.connect(
+            self._api_on_fit_requested, QtCore.Qt.QueuedConnection)
+        self._api_server.start()
+
+    def _api_reset(self) -> None:
+        """Clear all per-job API state so the next request starts clean."""
+        self._api_job_id = None
+        self._api_stage = None
+        self._api_last = None
+        self._api_verts = None
+        self._api_rig = None
+
+    def _api_fail(self, job_id: str, msg: str) -> None:
+        if self._api_server is not None:
+            self._api_server.registry.update(job_id, state="error", error=msg)
+        self._status.showMessage(f"API job failed: {msg}")
+        if self._bonesep_ctl is not None:
+            self._bonesep_ctl.cancel()
+        self._bonesep_ctl = None
+        self._batched_worker = None
+        self._api_reset()
+
+    def _api_on_fit_requested(self, job_id: str) -> None:
+        """GUI-thread slot: ingest the posted mesh and kick off SDF compute.
+
+        The fit itself is started in ``_on_sdf_done`` once the grid is ready;
+        the result is assembled in ``_on_opt_finished``.
+        """
+        if self._api_server is None:
+            return
+        job = self._api_server.registry.get(job_id)
+        if job is None:
+            return
+        if self._api_job_id is not None:
+            self._api_server.registry.update(
+                job_id, state="error", error="another fit is in progress")
+            return
+        try:
+            payload = job.payload
+            verts = np.asarray(payload["vertices"], dtype=np.float32).reshape(-1, 3)
+            faces = np.asarray(payload["faces"], dtype=np.int64).reshape(-1, 3)
+            mesh, transform = load_and_prepare_arrays(verts, faces, target_scale=1.0)
+            nverts = mesh.vertices.view(np.ndarray)
+            nfaces = mesh.faces.view(np.ndarray)
+        except Exception as e:                       # malformed payload
+            self._api_fail(job_id, f"bad mesh payload: {e}")
+            return
+
+        self._api_job_id = job_id
+        self._api_norm = transform
+        self._api_options = dict(payload.get("options") or {})
+        self._api_rig = payload.get("rig")
+        self._api_verts = verts
+        self._api_last = None
+        self._bone_centers = None
+        self._current_mesh_name = "unity-api"
+
+        # ``_set_base_mesh`` resets per-mesh controls (incl. SDF blowup) the way
+        # a fresh file load does.  Over the Unity bridge the user dials the
+        # blowup in once and expects it to persist across fits, so carry the
+        # current value across the reset.
+        blowup_vox = self._mesh_settings.blowup_voxels()
+        self._set_base_mesh(nverts, nfaces)
+        # API jobs fit flat in the Python UI (the rig is only overlaid), so the
+        # rigged-mesh-only Mesh-Blowup preview stays disabled here.
+        self._mesh_settings.set_region_available(False)
+        if blowup_vox != 0.0:
+            self._mesh_settings.set_blowup_voxels(blowup_vox)
+            self._viewer.set_sdf_blowup(blowup_vox)
+        self._viewer.show_mesh(nverts, nfaces)
+        self._ensure_sdf_idle()
+        self._sdf.set_mesh(nverts, nfaces)
+
+        # Show the posted rig's skeleton overlaid on the mesh (it would
+        # otherwise be invisible in the Python UI).  The fit itself still runs
+        # flat; bones are re-attached when the result is assembled.
+        self._api_show_rig_bones(self._api_rig, transform)
+
+        self._api_server.registry.update(job_id, state="running")
+        self._api_stage = "sdf"
+        self._status.showMessage(
+            f"API fit {job_id[:8]} … computing SDF "
+            f"(verts={len(nverts)} faces={len(nfaces)})")
+        self._on_compute_all()
+
+    def _api_show_rig_bones(self, rig: dict | None, transform) -> None:
+        """Overlay the posted rig's bind-pose skeleton on the displayed mesh.
+
+        The rig payload's bone positions are in the posted mesh's *original*
+        space; the viewport shows the *normalized* mesh, so the joints are mapped
+        through the same forward normalization (``(p - center) * scale``) before
+        being drawn.  No rig → drop any previous skeleton.
+        """
+        if not (rig and rig.get("bones")):
+            self._viewer.remove_skeleton()
+            return
+        try:
+            skeleton = build_skeleton_from_bones(rig["bones"])
+            positions, _ = skeleton.compute_bone_positions_rotations(None)
+            positions = (np.asarray(positions, dtype=np.float64) - transform.center) \
+                * transform.scale
+            positions = self._apply_rotation(positions.astype(np.float32))
+            # The skeleton itself is flat (each bone a root, by design — see
+            # rig_ingest); use the payload's parent indices only to draw the
+            # connecting bone segments.
+            parent_indices = np.array(
+                [int(b.get("parent", -1)) for b in rig["bones"]], dtype=np.int32)
+            self._viewer.show_bones(positions, parent_indices)
+        except Exception as e:                       # malformed rig → skip overlay
+            self._viewer.remove_skeleton()
+            self._status.showMessage(f"API rig overlay skipped: {e}")
+
+    def _api_start_fit(self) -> None:
+        """Begin the optimization for the active API job (post SDF compute).
+
+        The fit uses whatever settings are *currently selected* in the EllipSDF
+        window — exactly the same controls the manual "Fit" button reads — so a
+        user can dial in the options live and the Unity request honours them.
+        The options carried in the request payload are ignored on purpose.
+        """
+        # Bone Separation over the API: train each bone of the posted rig on its
+        # own region SDF, then assemble bone-local entries.  Driven directly here
+        # (not via _on_fit_clicked, which keys off the rig *panel* that an API
+        # job never activates).  The "bonesep" stage keeps the plain "fit"/"sdf"
+        # API hooks dormant so only the bone-separation controller runs.
+        rig = self._api_rig
+        if (self._cmb_fit_scope.currentData() == "bone"
+                and rig and rig.get("bones")
+                and rig.get("boneIndices") is not None
+                and rig.get("boneWeights") is not None
+                and self._base_verts is not None
+                and self._base_faces is not None):
+            self._api_stage = "bonesep"
+            try:
+                verts = np.asarray(self._base_verts, dtype=np.float32).reshape(-1, 3)
+                faces = np.asarray(self._base_faces).reshape(-1, 3)
+                joints = np.asarray(rig["boneIndices"]).reshape(
+                    len(verts), -1).astype(np.int64)
+                weights = np.asarray(rig["boneWeights"], dtype=np.float64).reshape(
+                    len(verts), -1)
+            except Exception as e:
+                self._api_fail(self._api_job_id, f"bad rig skin data: {e}")
+                return
+            self._begin_bone_separation(
+                verts, faces, joints, weights,
+                on_complete=self._api_bonesep_complete,
+                base_kwargs=self._gather_fit_kwargs(),
+                is_api=True,
+            )
+            return
+
+        self._api_stage = "fit"
+        self._on_fit_clicked()
+
+    def _api_finish_fit(self) -> None:
+        """Denormalize the fitted ellipsoids and publish the job result."""
+        job_id = self._api_job_id
+        if job_id is None or self._api_server is None:
+            return
+        try:
+            if self._api_last is None:
+                raise RuntimeError("no ellipsoids were produced")
+            centers, radii, rotations = self._api_last
+            t = self._api_norm
+            # Map fitted ellipsoids back to the posted mesh's original space.
+            centers_o = np.array([t.to_original_point(c) for c in centers],
+                                 dtype=np.float64)
+            radii_o = np.array([t.to_original_length(r) for r in radii],
+                               dtype=np.float64)
+
+            rig = self._api_rig
+            rigged = bool(rig and rig.get("bones"))
+            if rigged:
+                # Bone-local entries (Sphere_<i> parented under its bone).
+                entries = assign_ellipsoids_to_bones(
+                    centers_o, radii_o, rotations, self._api_verts, rig)
+            else:
+                # Flat entries in original mesh space.
+                entries = [{
+                    "name": f"Sphere_{i}",
+                    "bone": None,
+                    "center": [round(float(v), 7) for v in centers_o[i]],
+                    "radii": [round(float(v), 7) for v in radii_o[i]],
+                    "rotation": [round(float(v), 7) for v in rotations[i]],
+                } for i in range(len(centers_o))]
+
+            result = {
+                "version": 2,
+                "coordinate_system": "right_hand_y_up",
+                "quaternion_convention": "xyzw",
+                "rigged": rigged,
+                "count": len(entries),
+                "ellipsoids": entries,
+            }
+            self._api_server.registry.update(
+                job_id, state="done", result=result, count=len(entries))
+            self._status.showMessage(
+                f"API fit {job_id[:8]} done — {len(entries)} ellipsoids"
+                f" ({'rigged' if rigged else 'flat'})")
+        except Exception as e:
+            self._api_server.registry.update(
+                job_id, state="error", error=str(e))
+            self._status.showMessage(f"API fit {job_id[:8]} failed: {e}")
+        finally:
+            self._api_reset()

@@ -54,6 +54,7 @@ def _underrep_score(
     depth_floor_vox: float,
     outside_margin_vox: float,
     flat_thickness: np.ndarray | None = None,
+    min_thickness_vox: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return (consider_idx, rel, gap, sw) for all considered voxels.
 
@@ -69,6 +70,16 @@ def _underrep_score(
     feature (small thickness) then yields a much larger relative error than the
     same gap on a thick limb.  Without a thickness field it falls back to the
     per-voxel interior depth ``-target``.
+
+    ``min_thickness_vox`` floors that local thickness (in voxels) before it is
+    used as the relative-miss scale.  Features thinner than the grid can resolve
+    (e.g. a finger only ~2 voxels across, or sub-voxel on a coarse grid) would
+    otherwise drive the denominator toward zero, inflating their relative error
+    so far that the region is *permanently* flagged — a union of coarse
+    ellipsoids can never close a sub-voxel gap, so spawn fires endlessly and
+    carpets the feature with tiny spheres.  Flooring the thickness treats such
+    features at the resolution scale, so coverage to within a voxel or two is
+    accepted and the spawn loop stops.  ``0.0`` keeps the old behaviour.
     """
     margin = float(outside_margin_vox) * float(dx)
     consider_idx = np.where(flat_target < margin)[0]
@@ -81,9 +92,14 @@ def _underrep_score(
     if flat_thickness is not None:
         # Feature thickness is a diameter; half of it is the radial reach used
         # as the relative-miss scale (matches the old depth = -target scale).
-        # Only a tiny floor here (local_thickness already floors at 1 voxel), so
-        # the thinnest features keep a small denominator → high relative error.
-        denom = np.maximum(0.5 * flat_thickness[consider_idx], 0.5 * float(dx))
+        # Floor the thickness at ``min_thickness_vox`` voxels first so features
+        # below the grid resolution are scored at the resolution scale instead
+        # of driving the denominator (and thus the relative error) toward
+        # infinity — that runaway is what made thin fingers spawn-thrash into a
+        # chain of tiny spheres.
+        thick = np.maximum(flat_thickness[consider_idx],
+                           float(min_thickness_vox) * float(dx))
+        denom = np.maximum(0.5 * thick, 0.5 * float(dx))
     else:
         denom = np.maximum(-t, float(depth_floor_vox) * float(dx))
     rel = (gap / denom).astype(np.float32)                      # detection signal
@@ -107,6 +123,7 @@ def compute_relative_underrep(
     rel_threshold: float = 0.6,
     min_gap_vox: float = 1.0,
     thickness_grid: np.ndarray | None = None,
+    min_thickness_vox: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return world-space points of under-represented voxels (surface-weighted).
 
@@ -163,7 +180,7 @@ def compute_relative_underrep(
     consider_idx, rel, gap, sw = _underrep_score(
         flat_target, flat_pred, dx,
         surface_weight, surface_sigma_vox, depth_floor_vox, outside_margin_vox,
-        flat_thickness,
+        flat_thickness, min_thickness_vox,
     )
     if consider_idx.size == 0:
         return (np.empty((0, 3), dtype=np.float32),
@@ -195,6 +212,7 @@ def relative_underrep_grid(
     outside_margin_vox: float = 0.0,
     min_gap_vox: float = 1.0,
     thickness_grid: np.ndarray | None = None,
+    min_thickness_vox: float = 0.0,
 ) -> np.ndarray:
     """Full (n, n, n) surface-weighted under-representation severity grid.
 
@@ -211,7 +229,7 @@ def relative_underrep_grid(
     consider_idx, rel, gap, sw = _underrep_score(
         flat_target, flat_pred, dx,
         surface_weight, surface_sigma_vox, depth_floor_vox, outside_margin_vox,
-        flat_thickness,
+        flat_thickness, min_thickness_vox,
     )
     valid = gap >= float(min_gap_vox) * float(dx)
     out[consider_idx[valid]] = (rel[valid] * sw[valid])

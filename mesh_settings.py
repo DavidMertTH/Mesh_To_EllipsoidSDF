@@ -8,9 +8,14 @@ Two controls:
   * SDF Blowup — a single offset added uniformly to the SDF at every voxel
     (positive erodes / surface inward, negative dilates).  Shown live in the SDF
     slice and baked into the fit target.
+  * Mesh Blowup — an exploded view of the per-bone region submeshes (the carving
+    used by Bone-Separation mode): a toggle plus a slider that pushes each bone's
+    submesh radially outward so the regions can be inspected/verified.  Only
+    available when a rigged mesh is loaded.
 
-Pure UI: emits ``rotationChanged(rx, ry, rz)`` (degrees) and
-``blowupChanged(voxels)``; the MainWindow does the actual work.
+Pure UI: emits ``rotationChanged(rx, ry, rz)`` (degrees), ``blowupChanged(voxels)``,
+``regionPreviewToggled(on)`` and ``regionBlowupChanged(factor)``; the MainWindow
+does the actual work.
 """
 
 from __future__ import annotations
@@ -52,9 +57,13 @@ class MeshSettingsPanel(QtWidgets.QWidget):
 
     rotationChanged = QtCore.Signal(float, float, float)   # degrees
     blowupChanged = QtCore.Signal(float)                   # voxels (× dx by viewer)
+    regionPreviewToggled = QtCore.Signal(bool)             # exploded preview on/off
+    regionBlowupChanged = QtCore.Signal(float)             # explosion factor
 
     _BLOWUP_STEPS = 10          # slider int → /10 voxels
     _BLOWUP_RANGE = 100         # ±10.0 voxels
+    _REGION_STEPS = 100         # slider int → /100 explosion factor
+    _REGION_RANGE = 300         # 0.0 … 3.0× explosion
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -111,6 +120,31 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         self._btn_reset_blowup.clicked.connect(self.reset_blowup)
         bform.addRow(self._btn_reset_blowup)
         outer.addWidget(blow_box)
+
+        # ── Mesh blowup group (exploded per-bone region preview) ──
+        self._region_box = QtWidgets.QGroupBox("Mesh Blowup (Bone Regions)")
+        self._region_box.setToolTip(
+            "Explode the per-bone region submeshes (the Bone-Separation carving)\n"
+            "to verify them: each bone's region is pushed radially outward and\n"
+            "tinted a distinct colour.  Requires a rigged mesh.")
+        gform = QtWidgets.QFormLayout(self._region_box)
+        self._chk_region = QtWidgets.QCheckBox("Preview bone regions (explode)")
+        self._chk_region.toggled.connect(self._on_region_toggled)
+        gform.addRow(self._chk_region)
+        self._region = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._region.setRange(0, self._REGION_RANGE)
+        self._region.setValue(0)
+        self._region.setToolTip(
+            "How far to push each bone region apart (0 = in place).")
+        self._lbl_region = QtWidgets.QLabel("0.00×")
+        self._lbl_region.setMinimumWidth(56)
+        self._region.valueChanged.connect(self._on_region_blowup)
+        grow = QtWidgets.QHBoxLayout()
+        grow.addWidget(self._region)
+        grow.addWidget(self._lbl_region)
+        gform.addRow("Spread:", grow)
+        self._region_box.setEnabled(False)   # until a rigged mesh is loaded
+        outer.addWidget(self._region_box)
         outer.addStretch(1)
 
     # ── rotation sync (slider ↔ number) ──
@@ -137,6 +171,15 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         self._lbl_blowup.setText(f"{vox:+.1f} vox")
         self.blowupChanged.emit(vox)
 
+    def _on_region_toggled(self, on: bool) -> None:
+        self._region.setEnabled(on)
+        self.regionPreviewToggled.emit(bool(on))
+
+    def _on_region_blowup(self, v: int) -> None:
+        factor = v / float(self._REGION_STEPS)
+        self._lbl_region.setText(f"{factor:.2f}×")
+        self.regionBlowupChanged.emit(factor)
+
     # ── public API ──
 
     def rotation_deg(self) -> tuple[float, float, float]:
@@ -146,6 +189,36 @@ class MeshSettingsPanel(QtWidgets.QWidget):
 
     def blowup_voxels(self) -> float:
         return self._blowup.value() / float(self._BLOWUP_STEPS)
+
+    def region_preview_enabled(self) -> bool:
+        return self._chk_region.isChecked()
+
+    def region_blowup(self) -> float:
+        return self._region.value() / float(self._REGION_STEPS)
+
+    def set_region_available(self, available: bool) -> None:
+        """Enable/disable the Mesh-Blowup group (rigged meshes only).
+
+        Disabling also switches the preview off (emitting ``regionPreviewToggled``
+        so the host can drop any active preview) and zeroes the spread.
+        """
+        if not available and self._chk_region.isChecked():
+            self._chk_region.setChecked(False)   # emits toggled(False)
+        self._region_box.setEnabled(bool(available))
+        if not available:
+            self._region.blockSignals(True)
+            self._region.setValue(0)
+            self._region.blockSignals(False)
+            self._lbl_region.setText("0.00×")
+
+    def set_blowup_voxels(self, vox: float) -> None:
+        """Set the blowup slider without emitting (caller updates the viewer)."""
+        v = int(round(float(vox) * self._BLOWUP_STEPS))
+        v = max(-self._BLOWUP_RANGE, min(self._BLOWUP_RANGE, v))
+        self._blowup.blockSignals(True)
+        self._blowup.setValue(v)
+        self._blowup.blockSignals(False)
+        self._lbl_blowup.setText(f"{v / float(self._BLOWUP_STEPS):+.1f} vox")
 
     def reset_rotation(self) -> None:
         for a in ("X", "Y", "Z"):
@@ -167,3 +240,7 @@ class MeshSettingsPanel(QtWidgets.QWidget):
                 w.blockSignals(True); w.setValue(0); w.blockSignals(False)
         self._blowup.blockSignals(True); self._blowup.setValue(0); self._blowup.blockSignals(False)
         self._lbl_blowup.setText("0.0 vox")
+        self._chk_region.blockSignals(True); self._chk_region.setChecked(False); self._chk_region.blockSignals(False)
+        self._region.blockSignals(True); self._region.setValue(0); self._region.blockSignals(False)
+        self._region.setEnabled(False)
+        self._lbl_region.setText("0.00×")

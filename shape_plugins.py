@@ -29,15 +29,19 @@ from __future__ import annotations
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
+from widgets import RangeSlider
+
 
 # ── Shared widget get/set/observe helpers (used by plugins AND MainWindow) ─────
-# ``kind`` ∈ {"bool", "int", "float", "combo_data"}.
+# ``kind`` ∈ {"bool", "int", "float", "combo_data", "range"}.
 
 def widget_value(w, kind):
     if kind == "bool":
         return w.isChecked()
     if kind == "combo_data":
         return w.currentData()
+    if kind == "range":
+        return list(w.values())          # [low, high] — JSON-friendly
     return w.value()
 
 
@@ -53,6 +57,9 @@ def set_widget_value(w, kind, v) -> None:
             idx = w.findData(v)
             if idx >= 0:
                 w.setCurrentIndex(idx)
+        elif kind == "range":
+            lo, hi = int(v[0]), int(v[1])
+            w.setValues(lo, hi, emit=True)   # emit → connected labels refresh
     except Exception:
         pass            # ignore a stale / out-of-range persisted value
 
@@ -154,55 +161,110 @@ class _OptimizedPrimitiveShape(ShapePlugin):
         v.addWidget(box)
         return form
 
+    @staticmethod
+    def _build_window_group(
+        v: QtWidgets.QVBoxLayout,
+        title: str,
+        chk_text: str,
+        chk_tip: str,
+        window_default: tuple[int, int],
+        every_default: int,
+        every_tip: str,
+        *,
+        checked: bool,
+    ) -> tuple:
+        """Build one uniform *window* control block.
+
+        Layout (shared by Densification and Local fit so they look identical):
+
+            [x] <enable checkbox>
+            Window:  ⟨◖────────◗⟩   lo % – hi %
+            Every:   [ N steps ]
+
+        The two-handle :class:`RangeSlider` sets *from when* (low %) and *until
+        when* (high %) of training the phase runs; the spinbox sets how often
+        (every N steps).  Enabling the checkbox enables the slider + spinbox.
+
+        Returns ``(checkbox, range_slider, range_label, every_spin)``.
+        """
+        form = _OptimizedPrimitiveShape._group(v, title)
+
+        chk = QtWidgets.QCheckBox(chk_text)
+        chk.setChecked(checked)
+        chk.setToolTip(chk_tip)
+        form.addRow(chk)
+
+        lo0, hi0 = window_default
+        rng = RangeSlider(0, 100)
+        rng.setValues(lo0, hi0)
+        rng.setToolTip(
+            "Training window: the two handles set from when (left) until when\n"
+            "(right) of the run this phase is active, as a fraction of total steps.")
+        lbl = QtWidgets.QLabel(f"{lo0} % – {hi0} %")
+        lbl.setMinimumWidth(72)
+        lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        win_row = QtWidgets.QWidget()
+        win_h = QtWidgets.QHBoxLayout(win_row)
+        win_h.setContentsMargins(0, 0, 0, 0)
+        win_h.setSpacing(6)
+        win_h.addWidget(rng, 1)
+        win_h.addWidget(lbl)
+        rng.valueChanged.connect(
+            lambda lo, hi: lbl.setText(f"{lo} % – {hi} %"))
+        form.addRow("Window:", win_row)
+
+        every = QtWidgets.QSpinBox()
+        every.setRange(10, 10000)
+        every.setValue(every_default)
+        every.setSingleStep(10)
+        every.setSuffix(" steps")
+        every.setToolTip(every_tip)
+        form.addRow("Every:", every)
+
+        def _set_enabled(on: bool) -> None:
+            rng.setEnabled(on)
+            lbl.setEnabled(on)
+            every.setEnabled(on)
+        _set_enabled(checked)
+        chk.toggled.connect(_set_enabled)
+
+        return chk, rng, lbl, every
+
     def _build_common_groups(self, v: QtWidgets.QVBoxLayout) -> None:
-        """Build the SuperFit + Maintenance groups shared by all fitted shapes."""
-        # ── SuperFit (adaptive density) ──
-        sf = self._group(v, "SuperFit")
-        self._chk_superfit = QtWidgets.QCheckBox("SuperFit (adaptive density)")
-        self._chk_superfit.setChecked(True)
-        self._chk_superfit.setToolTip(
+        """Build the Densification + Local-fit + Maintenance groups shared by
+        all fitted shapes.  Densification and Local fit use the *same* uniform
+        window-block layout (enable + range-slider window + frequency)."""
+        # ── Densification (adaptive density / SuperFit) ──
+        (self._chk_superfit, self._rng_densify, self._lbl_densify,
+         self._spin_superfit_every) = self._build_window_group(
+            v, "Densification",
+            "SuperFit (adaptive density)",
             "Residual-driven growth: periodically maintain the population\n"
-            "(merge / spawn / split) and grow it up to Max.")
-        self._spin_superfit_every = QtWidgets.QSpinBox()
-        self._spin_superfit_every.setRange(10, 10000)
-        self._spin_superfit_every.setValue(150)
-        self._spin_superfit_every.setSingleStep(10)
-        self._spin_superfit_every.setToolTip(
-            "Adaptive density-control rate: every N steps a maintenance round\n"
-            "(merge / spawn / split) runs.  Smaller = more frequent.")
-        self._spin_densify_until = QtWidgets.QSpinBox()
-        self._spin_densify_until.setRange(0, 100)
-        self._spin_densify_until.setValue(75)
-        self._spin_densify_until.setSingleStep(5)
-        self._spin_densify_until.setSuffix(" %")
-        self._spin_densify_until.setToolTip(
-            "Densify stop: density control runs only up to this fraction of\n"
-            "training; afterwards pure Adam refinement of the fixed population\n"
-            "(cleaner snapping, à la Gaussian Splatting).")
-        self._chk_superfit.toggled.connect(self._spin_superfit_every.setEnabled)
-        self._chk_superfit.toggled.connect(self._spin_densify_until.setEnabled)
-        sf.addRow(self._chk_superfit)
-        sf.addRow("Density rate:", self._spin_superfit_every)
-        sf.addRow("Densify until:", self._spin_densify_until)
+            "(merge / spawn / split) and grow it up to Max.  The window sets\n"
+            "from when until when of training density control runs; afterwards\n"
+            "pure Adam refinement of the fixed population.",
+            (0, 75), 150,
+            "Density-control rate: every N steps a maintenance round\n"
+            "(merge / spawn / split) runs.  Smaller = more frequent.",
+            checked=True,
+        )
 
-        self._chk_local_fit = QtWidgets.QCheckBox("Local Fit")
-        self._chk_local_fit.setChecked(False)
-        self._chk_local_fit.setToolTip(
-            "Re-fit each maintained region against a fresh high-res SDF box.")
-        self._spin_local_fit_start = QtWidgets.QSpinBox()
-        self._spin_local_fit_start.setRange(0, 100)
-        self._spin_local_fit_start.setValue(25)
-        self._spin_local_fit_start.setSingleStep(5)
-        self._spin_local_fit_start.setSuffix(" %")
-        self._spin_local_fit_start.setToolTip(
-            "Local-fit start: the high-res per-region fit only kicks in after\n"
-            "this fraction of training has elapsed (default 25 %).  Earlier steps\n"
-            "settle the global layout first.")
-        self._spin_local_fit_start.setEnabled(self._chk_local_fit.isChecked())
-        self._chk_local_fit.toggled.connect(self._spin_local_fit_start.setEnabled)
-        sf.addRow(self._chk_local_fit)
-        sf.addRow("Local fit start:", self._spin_local_fit_start)
+        # ── Local fit (high-res per-region refit) ──
+        (self._chk_local_fit, self._rng_local_fit, self._lbl_local_fit,
+         self._spin_local_fit_every) = self._build_window_group(
+            v, "Local fit",
+            "Local Fit",
+            "Re-fit the worst regions against a fresh high-res SDF box.\n"
+            "The window sets from when until when of training the per-region\n"
+            "fit is active.",
+            (25, 100), 150,
+            "Local-fit rate: every N steps one high-res per-region fit runs\n"
+            "inside the window.  Smaller = more frequent.",
+            checked=False,
+        )
 
+        # ── Soft union (experimental) ──
+        su = self._group(v, "Union")
         self._chk_soft_union = QtWidgets.QCheckBox("Soft min (experimental)")
         self._chk_soft_union.setChecked(False)
         self._chk_soft_union.setToolTip(
@@ -211,7 +273,7 @@ class _OptimizedPrimitiveShape(ShapePlugin):
             "(gradient spread across several nearby primitives → denser gradients).\n"
             "In tests the result tended to look WORSE than the hard min;\n"
             "only enable it and compare on your own mesh.")
-        sf.addRow(self._chk_soft_union)
+        su.addRow(self._chk_soft_union)
 
         # ── Maintenance moves ──
         mv = self._group(v, "Maintenance moves")
@@ -227,34 +289,49 @@ class _OptimizedPrimitiveShape(ShapePlugin):
         self._chk_split.setChecked(True)
         self._chk_split.setToolTip(
             "Split oversized / bridging primitives and the nearest one to a gap.")
+        self._chk_prune = QtWidgets.QCheckBox("Prune")
+        self._chk_prune.setChecked(True)
+        self._chk_prune.setToolTip(
+            "Remove redundant primitives: fuse fully-overlapping ones and drop\n"
+            "those whose coverage is already provided by their neighbours.\n"
+            "Safety deletes (degenerate / far-outside primitives) stay on.")
         mv.addRow(self._chk_merge)
         mv.addRow(self._chk_spawn)
         mv.addRow(self._chk_split)
+        mv.addRow(self._chk_prune)
 
     def _common_specs(self) -> list:
         return [
-            ("superfit",       self._chk_superfit,        "bool"),
-            ("superfit_every", self._spin_superfit_every, "int"),
-            ("densify_until",  self._spin_densify_until,  "int"),
-            ("local_fit",      self._chk_local_fit,       "bool"),
-            ("local_fit_start", self._spin_local_fit_start, "int"),
-            ("soft_union",     self._chk_soft_union,      "bool"),
-            ("merge",          self._chk_merge,           "bool"),
-            ("spawn",          self._chk_spawn,           "bool"),
-            ("split",          self._chk_split,           "bool"),
+            ("superfit",        self._chk_superfit,         "bool"),
+            ("superfit_every",  self._spin_superfit_every,  "int"),
+            ("densify_window",  self._rng_densify,          "range"),
+            ("local_fit",       self._chk_local_fit,        "bool"),
+            ("local_fit_every", self._spin_local_fit_every, "int"),
+            ("local_fit_window", self._rng_local_fit,       "range"),
+            ("soft_union",      self._chk_soft_union,       "bool"),
+            ("merge",           self._chk_merge,            "bool"),
+            ("spawn",           self._chk_spawn,            "bool"),
+            ("split",           self._chk_split,            "bool"),
+            ("prune",           self._chk_prune,            "bool"),
         ]
 
     def _common_fit_kwargs(self) -> dict:
+        d_lo, d_hi = self._rng_densify.values()
+        l_lo, l_hi = self._rng_local_fit.values()
         return {
             "superfit":             self._chk_superfit.isChecked(),
             "superfit_every":       self._spin_superfit_every.value(),
-            "densify_until_frac":   self._spin_densify_until.value() / 100.0,
+            "densify_start_frac":   d_lo / 100.0,
+            "densify_until_frac":   d_hi / 100.0,
             "local_fit":            self._chk_local_fit.isChecked(),
-            "local_fit_start_frac": self._spin_local_fit_start.value() / 100.0,
+            "local_fit_every":      self._spin_local_fit_every.value(),
+            "local_fit_start_frac": l_lo / 100.0,
+            "local_fit_end_frac":   l_hi / 100.0,
             "soft_union":           self._chk_soft_union.isChecked(),
             "merge_enabled":        self._chk_merge.isChecked(),
             "spawn_enabled":        self._chk_spawn.isChecked(),
             "split_enabled":        self._chk_split.isChecked(),
+            "prune_enabled":        self._chk_prune.isChecked(),
         }
 
     def viewer_eps(self):

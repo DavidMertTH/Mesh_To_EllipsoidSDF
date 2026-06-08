@@ -15,18 +15,32 @@ would be over-flagged near its surface.  We instead want a quantity that is
 Local thickness (Hildebrand & Rüegsegger)
 -----------------------------------------
 The local thickness at an interior point ``p`` is the diameter of the *largest
-inscribed sphere of the shape that contains p*.  Every maximal inscribed sphere
-is centred on the medial axis (the ridge of the distance field) with radius
-equal to the interior distance there.  So:
+inscribed sphere of the shape that contains p*.  By definition
 
-    1.  D(q)        = interior distance-to-surface  (= -sdf, q inside).
-    2.  ridge       = local maxima of D  (medial-axis voxels).
-    3.  thickness(p)= 2 · max{ D(q) : q on ridge, |p-q| ≤ D(q) }.
+    thickness(p) = 2 · max{ D(q) : q interior, |p−q| ≤ D(q) },   D(q) = −sdf(q).
 
-Implementation: splat a sphere of radius D(q) and value 2·D(q) from every ridge
-voxel, processed largest-radius-first, keeping the per-voxel maximum.  Centres
-already covered by a bigger sphere are skipped — this keeps it fast enough for a
-one-off preprocessing pass.
+Implementation: splat a sphere of radius D(q) and value 2·D(q) from every
+interior voxel, processed largest-radius-first, keeping the per-voxel maximum.
+A voxel already covered by a bigger sphere is skipped, so the expensive splats
+happen only for the maximal spheres (the medial axis emerges from the skip rule
+itself) — no separate, discretisation-fragile ridge detection is needed.
+
+Precision
+---------
+Two refinements push the result from the ~1.5–2 voxel low bias of the naïve
+voxel-sampled version down to sub-0.5 voxel:
+
+  * **Sub-voxel peak depth** — the medial axis generally falls *between* voxel
+    centres, so the deepest sampled ``D`` is short of the true inscribed radius
+    (e.g. a cylinder axis at a voxel corner samples ``R−√2/2`` instead of ``R``).
+    Near a distance-field ridge the central-difference gradient magnitude drops
+    below 1; that per-axis deficit is the sub-voxel distance to the true ridge
+    and is added back to ``D`` (``_refine_peak_depth``).
+  * **Float-radius coverage** — spheres are rasterised at their exact (refined)
+    radius instead of an integer-rounded one, so thin features keep their true
+    diameter.
+
+Both are one-off costs in the SDF preprocessing pass (~2 s on a 256³ grid).
 """
 
 from __future__ import annotations
@@ -57,42 +71,62 @@ def dilate_zeros(field: np.ndarray, iters: int = 2) -> np.ndarray:
     return f
 
 
-def _sphere_offset_cache():
+def _sphere_offset_cache(quant_vox: float = 1.0 / 16.0):
+    """Cache of integer voxel offsets inside a sphere of (float) radius ``r``.
+
+    Radii are quantised to ``quant_vox`` (sub-voxel) so the cache stays small
+    while coverage error from quantisation is well below a tenth of a voxel.
+    """
     cache: dict[int, np.ndarray] = {}
 
-    def offsets(r_int: int) -> np.ndarray:
-        cached = cache.get(r_int)
+    def offsets(r: float) -> np.ndarray:
+        key = int(round(float(r) / quant_vox))
+        cached = cache.get(key)
         if cached is not None:
             return cached
-        rng = np.arange(-r_int, r_int + 1)
-        zz, yy, xx = np.meshgrid(rng, rng, rng, indexing="ij")
-        mask = (xx * xx + yy * yy + zz * zz) <= r_int * r_int
-        offs = np.stack([zz[mask], yy[mask], xx[mask]], axis=1).astype(np.int32)
-        cache[r_int] = offs
+        rq = key * quant_vox
+        ext = int(np.ceil(rq))
+        if ext < 1:
+            offs = np.zeros((1, 3), dtype=np.int32)  # centre voxel only
+        else:
+            rng = np.arange(-ext, ext + 1)
+            zz, yy, xx = np.meshgrid(rng, rng, rng, indexing="ij")
+            mask = (xx * xx + yy * yy + zz * zz) <= rq * rq
+            offs = np.stack([zz[mask], yy[mask], xx[mask]], axis=1).astype(np.int32)
+        cache[key] = offs
         return offs
 
     return offsets
 
 
-def _medial_ridge(Dv: np.ndarray) -> np.ndarray:
-    """Boolean mask of distance-field local maxima (medial-axis proxy).
+def _refine_peak_depth(Dv: np.ndarray) -> np.ndarray:
+    """Sub-voxel-refined interior depth (voxel units).
 
-    A voxel is kept if its depth is >= all 6 face-neighbours (plateaus kept).
-    Only interior voxels (Dv > 0) qualify.
+    The medial axis of a feature generally lies between voxel centres, so the
+    deepest *sampled* ``D`` underestimates the true inscribed radius.  In a true
+    distance field ``|∇D| = 1`` everywhere except on the medial ridge, where the
+    central-difference magnitude collapses; that per-axis deficit equals the
+    sub-voxel distance from the voxel centre to the ridge, so adding it back
+    recovers the peak (exact for slabs, ≲0.5 vox for cylinders/spheres).
+
+    Only voxels that are a local maximum along an axis (concave there) receive a
+    gain, each per-axis gain is capped at half a voxel, and the per-axis gains
+    are combined *Euclidean* (not summed): the gain is the length of the
+    sub-voxel offset vector to the ridge, so an isotropic point ridge (sphere
+    centre) is not over-counted the way a plain sum would be.
     """
-    interior = Dv > 0.0
-    ridge = interior.copy()
-    # Compare against each 6-neighbour using padded shifts so borders (outside
-    # the mesh) never wrongly suppress an interior ridge voxel.
-    pad = np.pad(Dv, 1, mode="constant", constant_values=0.0)
-    c = pad[1:-1, 1:-1, 1:-1]
-    ridge &= c >= pad[0:-2, 1:-1, 1:-1]
-    ridge &= c >= pad[2:, 1:-1, 1:-1]
-    ridge &= c >= pad[1:-1, 0:-2, 1:-1]
-    ridge &= c >= pad[1:-1, 2:, 1:-1]
-    ridge &= c >= pad[1:-1, 1:-1, 0:-2]
-    ridge &= c >= pad[1:-1, 1:-1, 2:]
-    return ridge
+    sq = np.zeros_like(Dv)
+    for ax in range(3):
+        a = np.roll(Dv, 1, axis=ax)
+        c = np.roll(Dv, -1, axis=ax)
+        grad = 0.5 * (c - a)                 # central difference along axis
+        concave = (a - 2.0 * Dv + c) < -1e-6  # voxel is a ridge peak on this axis
+        gain = np.where(concave, np.clip(np.abs(grad), 0.0, 0.5), 0.0)
+        sq = sq + gain * gain
+    ref = Dv + np.sqrt(sq).astype(Dv.dtype)
+    # Refinement is meaningful only strictly inside the shape.
+    ref[Dv <= 0.0] = 0.0
+    return ref
 
 
 def local_thickness(
@@ -105,17 +139,22 @@ def local_thickness(
     Interior voxels get the diameter of the largest inscribed sphere containing
     them; exterior voxels get 0.  A floor of ``thickness_floor_vox`` voxels is
     applied to every interior voxel so the value is never sub-voxel.
+
+    Precise but one-off: every interior voxel is a candidate sphere centre and
+    spheres are rasterised at their exact sub-voxel-refined radius.  The
+    largest-first ordering plus the skip-already-covered test keep the expensive
+    splats limited to the maximal spheres (~thousands even on a 256³ grid).
     """
     Dv = np.maximum(-target_grid / float(dx), 0.0).astype(np.float32)  # radius, voxels
     nz, ny, nx = Dv.shape
     thick = np.zeros_like(Dv)  # holds diameter in voxel units
 
-    ridge = _medial_ridge(Dv)
-    idx = np.argwhere(ridge)
+    interior = Dv > 0.0
+    idx = np.argwhere(interior)
     if idx.size == 0:
         return thick.astype(np.float32)
 
-    radii = Dv[ridge]
+    radii = _refine_peak_depth(Dv)[interior]   # sub-voxel-refined inscribed radii
     order = np.argsort(-radii)
     idx = idx[order]
     radii = radii[order]
@@ -126,12 +165,7 @@ def local_thickness(
         diam = 2.0 * float(r)
         if thick[z, y, x] >= diam:
             continue  # already covered by a larger inscribed sphere
-        r_int = int(round(r))
-        if r_int < 1:
-            if thick[z, y, x] < diam:
-                thick[z, y, x] = diam
-            continue
-        offs = offsets(r_int)
+        offs = offsets(float(r))
         zz = z + offs[:, 0]
         yy = y + offs[:, 1]
         xx = x + offs[:, 2]
@@ -142,7 +176,6 @@ def local_thickness(
         thick[zz[upd], yy[upd], xx[upd]] = diam
 
     # Floor every interior voxel and convert to world units.
-    interior = Dv > 0.0
     floor = float(thickness_floor_vox)
     thick[interior] = np.maximum(thick[interior], floor)
     return (thick * float(dx)).astype(np.float32)
@@ -151,29 +184,35 @@ def local_thickness(
 # ── self-test ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Synthetic SDF: a thin slab (thickness 4 vox) joined to a thick block
-    # (thickness ~20 vox). Local thickness should recover ~those diameters.
-    n = 64
-    dx = 1.0
-    grid = np.full((n, n, n), 10.0, dtype=np.float32)  # outside (+)
+    # Accuracy regression on *true Euclidean* SDFs (warp produces these), where
+    # the analytic local thickness is known exactly.  The deep-interior median
+    # must land within ~0.5 voxel of the true diameter — the sub-voxel peak
+    # refinement is what makes that possible (the naïve version was ~1.5–2 low).
+    n, dx = 96, 1.0
+    rng = (np.arange(n) + 0.5) * dx
+    zz, yy, xx = np.meshgrid(rng, rng, rng, indexing="ij")
+    c = n * dx / 2.0
 
-    def fill_box(g, z0, z1, y0, y1, x0, x1):
-        # crude interior SDF inside the box: -distance to nearest box face
-        for z in range(z0, z1):
-            for y in range(y0, y1):
-                for x in range(x0, x1):
-                    d = min(z - z0, z1 - 1 - z, y - y0, y1 - 1 - y, x - x0, x1 - 1 - x) + 1
-                    g[z, y, x] = -float(d)
+    def sphere(R):
+        return (np.sqrt((xx - c) ** 2 + (yy - c) ** 2 + (zz - c) ** 2) - R).astype(np.float32)
 
-    # thick block: 20 vox tall in z
-    fill_box(grid, 10, 30, 20, 44, 20, 44)
-    # thin slab: 4 vox tall in z, attached
-    fill_box(grid, 24, 28, 20, 44, 44, 60)
+    def cylinder(R):  # infinite along z
+        return (np.sqrt((xx - c) ** 2 + (yy - c) ** 2) - R).astype(np.float32)
 
-    th = local_thickness(grid, dx)
-    block_vals = th[15:25, 25:39, 25:39]
-    slab_vals = th[24:28, 25:39, 48:58]
-    print(f"thick block local thickness (expect ~20): "
-          f"median={np.median(block_vals[block_vals > 0]):.1f}  max={block_vals.max():.1f}")
-    print(f"thin slab  local thickness (expect ~4) : "
-          f"median={np.median(slab_vals[slab_vals > 0]):.1f}  max={slab_vals.max():.1f}")
+    def slab(half):   # infinite in y, z
+        return (np.abs(xx - c) - half).astype(np.float32)
+
+    cases = [("sphere R=12", sphere(12.0), -6.0, 24.0),
+             ("cylinder R=8", cylinder(8.0), -4.0, 16.0),
+             ("cylinder R=2.5", cylinder(2.5), -0.5, 5.0),
+             ("slab half=4", slab(4.0), -2.0, 8.0),
+             ("slab half=1.5", slab(1.5), -0.3, 3.0)]
+    worst = 0.0
+    for label, g, thr, truth in cases:
+        th = local_thickness(g, dx)
+        med = float(np.median(th[g < thr]))
+        err = abs(med - truth)
+        worst = max(worst, err)
+        flag = "OK " if err < 0.5 else "!! "
+        print(f"{flag}{label:16s} median={med:7.3f}  truth={truth:5.2f}  |err|={err:.3f}")
+    print(f"worst |err| = {worst:.3f} voxel  ({'PASS' if worst < 0.5 else 'FAIL'})")

@@ -122,6 +122,21 @@ SETTINGS_SPEC = [
              "Reserve more of the surface-band samples for thin features\n"
              "(1.0 = default 30 %, 0 = off)."),
         ]),
+        ("Under-representation", [
+            ("underrep_rel_threshold", "Detection threshold", "float", 0.05, 2.0, 0.05, 2, 0.6,
+             "Relative miss (gap / local thickness) a region must reach to count\n"
+             "as under-represented (drives spawn/split + the overlay).\n"
+             "Lower = more sensitive (flags smaller gaps), higher = only gross misses."),
+            ("underrep_min_gap_vox", "Min gap (vox)", "float", 0.0, 3.0, 0.1, 1, 0.5,
+             "Absolute miss floor in voxels — kills sub-voxel surface noise.\n"
+             "Lower = more sensitive."),
+            ("underrep_min_thickness_vox", "Min feature thickness (vox)", "float", 0.0, 12.0, 0.5, 1, 4.0,
+             "Floor (in voxels) on the local feature thickness used as the\n"
+             "relative-miss scale.  Thin structures (fingers) below the grid\n"
+             "resolution otherwise inflate the relative error without bound, so\n"
+             "spawn fires endlessly and carpets them with tiny spheres.  Higher =\n"
+             "fewer tiny ellipsoids on thin features; 0 = old (unbounded) behaviour."),
+        ]),
     ]),
 
     ("Sampling", [

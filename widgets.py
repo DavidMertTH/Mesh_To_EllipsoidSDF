@@ -11,7 +11,7 @@ from typing import Optional
 
 import numpy as np
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
@@ -342,3 +342,157 @@ class SdfSlicePanel(QtWidgets.QWidget):
 
     def _on_compute_clicked(self):
         self.computeRequested.emit(self.requested_n)
+
+
+# ── two-handle range slider ───────────────────────────────────────────────────
+
+class RangeSlider(QtWidgets.QWidget):
+    """A horizontal slider with **two** handles selecting a [low, high] span.
+
+    Integer-valued like ``QSlider`` (default range 0…100, read as percent by the
+    caller).  The two handles cannot cross; the highlighted track between them is
+    the selected window.  Emits ``valueChanged(low, high)`` continuously while
+    either handle is dragged.
+
+    Public API mirrors ``QSlider`` where it makes sense: ``setRange`` /
+    ``minimum`` / ``maximum`` plus ``setValues`` / ``values`` for the pair.
+    """
+
+    valueChanged = QtCore.Signal(int, int)   # (low, high)
+
+    _HANDLE_R = 7          # handle radius (px)
+    _GROOVE_H = 4          # groove thickness (px)
+
+    def __init__(self, minimum: int = 0, maximum: int = 100, parent=None):
+        super().__init__(parent)
+        self._min = int(minimum)
+        self._max = int(max(maximum, minimum + 1))
+        self._low = self._min
+        self._high = self._max
+        self._drag: str | None = None     # 'low' | 'high' | None
+        self.setMinimumHeight(2 * self._HANDLE_R + 8)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                           QtWidgets.QSizePolicy.Fixed)
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
+
+    # ── public API ──
+    def minimum(self) -> int:
+        return self._min
+
+    def maximum(self) -> int:
+        return self._max
+
+    def setRange(self, minimum: int, maximum: int) -> None:
+        self._min = int(minimum)
+        self._max = int(max(maximum, minimum + 1))
+        self._low = max(self._min, min(self._low, self._max))
+        self._high = max(self._low, min(self._high, self._max))
+        self.update()
+
+    def values(self) -> tuple[int, int]:
+        return self._low, self._high
+
+    def setValues(self, low: int, high: int, *, emit: bool = False) -> None:
+        low = int(round(low)); high = int(round(high))
+        low = max(self._min, min(low, self._max))
+        high = max(self._min, min(high, self._max))
+        if high < low:
+            low, high = high, low
+        changed = (low != self._low or high != self._high)
+        self._low, self._high = low, high
+        self.update()
+        if emit and changed:
+            self.valueChanged.emit(self._low, self._high)
+
+    def low(self) -> int:
+        return self._low
+
+    def high(self) -> int:
+        return self._high
+
+    # ── geometry helpers ──
+    def _track_rect(self) -> QtCore.QRect:
+        m = self._HANDLE_R + 1
+        return QtCore.QRect(m, self.height() // 2 - self._GROOVE_H // 2,
+                            max(1, self.width() - 2 * m), self._GROOVE_H)
+
+    def _value_to_x(self, value: int) -> float:
+        tr = self._track_rect()
+        span = max(1, self._max - self._min)
+        return tr.left() + (value - self._min) / span * tr.width()
+
+    def _x_to_value(self, x: float) -> int:
+        tr = self._track_rect()
+        span = max(1, self._max - self._min)
+        frac = (x - tr.left()) / max(1, tr.width())
+        return int(round(self._min + frac * span))
+
+    def _handle_center(self, which: str) -> QtCore.QPointF:
+        v = self._low if which == 'low' else self._high
+        return QtCore.QPointF(self._value_to_x(v), self.height() / 2.0)
+
+    # ── interaction ──
+    def mousePressEvent(self, ev):
+        if ev.button() != QtCore.Qt.LeftButton:
+            return
+        pos = ev.position() if hasattr(ev, "position") else QtCore.QPointF(ev.pos())
+        d_low = abs(pos.x() - self._handle_center('low').x())
+        d_high = abs(pos.x() - self._handle_center('high').x())
+        # Pick the nearer handle; on a tie favour the one the click is toward.
+        if d_low < d_high or (d_low == d_high and pos.x() < self._handle_center('low').x()):
+            self._drag = 'low'
+        else:
+            self._drag = 'high'
+        self._move_to(pos.x())
+        ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        if self._drag is None:
+            return
+        pos = ev.position() if hasattr(ev, "position") else QtCore.QPointF(ev.pos())
+        self._move_to(pos.x())
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        self._drag = None
+        ev.accept()
+
+    def _move_to(self, x: float) -> None:
+        v = max(self._min, min(self._x_to_value(x), self._max))
+        if self._drag == 'low':
+            self._low = min(v, self._high)
+        elif self._drag == 'high':
+            self._high = max(v, self._low)
+        else:
+            return
+        self.update()
+        self.valueChanged.emit(self._low, self._high)
+
+    # ── painting ──
+    def paintEvent(self, _ev):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        pal = self.palette()
+        tr = self._track_rect()
+
+        # groove
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(pal.color(QtGui.QPalette.Mid))
+        p.drawRoundedRect(tr, self._GROOVE_H / 2.0, self._GROOVE_H / 2.0)
+
+        # selected span
+        x_lo = self._value_to_x(self._low)
+        x_hi = self._value_to_x(self._high)
+        span = QtCore.QRectF(x_lo, tr.top(), max(0.0, x_hi - x_lo), tr.height())
+        p.setBrush(pal.color(QtGui.QPalette.Highlight))
+        p.drawRoundedRect(span, self._GROOVE_H / 2.0, self._GROOVE_H / 2.0)
+
+        # handles
+        p.setBrush(pal.color(QtGui.QPalette.Button).lighter(115)
+                   if self.isEnabled() else pal.color(QtGui.QPalette.Button))
+        p.setPen(QtGui.QPen(pal.color(QtGui.QPalette.Dark), 1))
+        r = self._HANDLE_R
+        for which in ('low', 'high'):
+            c = self._handle_center(which)
+            p.drawEllipse(c, r, r)
+        p.end()

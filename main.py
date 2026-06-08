@@ -1,15 +1,11 @@
 
 
+import argparse
 import os
 import sys
 import time
 from pathlib import Path
 
-# When launched via Start.bat (pythonw.exe, double-click) there is no console,
-# so sys.stdout / sys.stderr are None.  Libraries imported below (e.g. Warp)
-# print startup banners, and writing to a None stream raises AttributeError and
-# crashes the app silently.  Redirect those streams to a sink so the writes are
-# harmless.  No-op when a real console is attached (running via python.exe).
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
 if sys.stderr is None:
@@ -19,13 +15,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 import theme
 
-# NB: pyqtgraph is *not* imported here.  It pulls in numpy + its own modules
-# (~0.5 s on top of Qt) and is only needed once we build MainWindow — so we
-# defer it until after the splash is on screen, letting the loading screen
-# pop up about half a second sooner.
-
-# 'Syne' is the display/heading font used on davidmertth.github.io.  Bundled as
-# a TTF so we don't depend on it being installed system-wide.
 _FONT_FILE = Path(__file__).with_name("assets") / "fonts" / "Syne-Bold.ttf"
 
 
@@ -202,7 +191,23 @@ def _make_splash() -> SplashScreen:
     return SplashScreen(sharp, blurry)
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="EllipSDF — Mesh → Ellipsoid SDF")
+    parser.add_argument(
+        "--server", action="store_true",
+        help="Start the embedded HTTP API so Unity (or any client) can push a "
+             "mesh in and pull fitted ellipsoids out. The window still opens.")
+    parser.add_argument(
+        "--port", type=int, default=8765,
+        help="Port for the HTTP API (default: 8765).")
+    # Ignore unknown args so launching via tools that append extras won't crash.
+    args, _ = parser.parse_known_args()
+    return args
+
+
 def main():
+    args = _parse_args()
+
     # Create the QApplication with bare PySide6 (cheap) and get the splash on
     # screen *before* touching the heavy imports.  Everything below the
     # splash.show() runs while the loading screen is already visible.
@@ -237,6 +242,11 @@ def main():
     win = MainWindow(
         progress=lambda f, m="": splash.set_progress(0.35 + 0.62 * f, m or None))
     win.resize(1400, 1000)
+
+    # Start the Unity/HTTP API if requested, now that the window exists.
+    if args.server:
+        win.start_api_server(port=args.port)
+
     # Windowed fullscreen (maximised, not exclusive): fills the screen but keeps
     # the title bar/taskbar and — importantly — lets combo-box popups show on top.
     win.showMaximized()
