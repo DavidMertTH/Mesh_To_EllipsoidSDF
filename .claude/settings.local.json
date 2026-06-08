@@ -201,7 +201,8 @@
       "Bash(.venv/Scripts/python.exe -c \"import optimization; print\\('compile + import OK'\\)\")",
       "Bash(.venv/Scripts/python.exe -m py_compile pose_optimizer.py main_window.py rig_panel.py)",
       "Bash(git *)",
-      "Bash(echo \"exit=$?\")"
+      "Bash(echo \"exit=$?\")",
+      "Bash(.venv/Scripts/python.exe -m py_compile widgets.py main.py)"
     ]
   }
 }

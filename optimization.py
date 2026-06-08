@@ -15,6 +15,8 @@ MINI-BATCH + CONSERVATIVE POPULATION MANAGEMENT:
          sampling (same as before).
 """
 
+import contextlib
+
 import warp as wp
 import warp.optim
 import numpy as np
@@ -1468,6 +1470,13 @@ class OptimizationWorker(QtCore.QThread):
         # so requiring a surface region to reach rel ≈ 0.6 (the points-detector
         # ``rel_threshold``) before it counts means a floor of 0.6·(1+sw_max).
         self._analysis_min_severity = 0.6 * (1.0 + float(self._surface_weight))
+        # SuperFit region detection (the only n³ cost per cycle) runs on a
+        # resolution-capped copy of the target grid so its cost is independent
+        # of the global grid n.  Longest axis of the detection grid ≤ this cap;
+        # the predicted-grid build + relative-underrep scan then scale with the
+        # cap, not with n.  The local fit already uses ``region_res`` (n-free).
+        self._region_detect_cap = 64
+        self._det_cache: dict | None = None
         self._spawn_per_round = spawn_per_round
         self._spawn_underrep = spawn_underrep
         self._split_enabled = split_enabled
@@ -2283,6 +2292,65 @@ class OptimizationWorker(QtCore.QThread):
     # ══════════════════════════════════════════════════════════════════
     # SUPERFIT — residual-region detection + isolated local fitting
     # ══════════════════════════════════════════════════════════════════
+
+    def _build_detection_grid(self) -> dict | None:
+        """Resolution-capped copy of the target/thickness grids for region
+        detection, cached across cycles (the target grid never changes).
+
+        Returns ``None`` when the grid is already at/under the cap (no
+        downsampling needed → detection runs on the full grid as before).
+        The coarse grid keeps voxel-centre alignment with the fine grid so
+        ``seed_world`` stays in the same world frame.
+        """
+        longest = max(self._shape)
+        f = int(np.ceil(longest / float(self._region_detect_cap)))
+        if f <= 1:
+            return None
+        if self._det_cache is not None and self._det_cache['f'] == f:
+            return self._det_cache
+
+        target = np.ascontiguousarray(self._sdf_target_np[::f, ::f, ::f])
+        thickness = (np.ascontiguousarray(self._thickness_np[::f, ::f, ::f])
+                     if self._thickness_np is not None else None)
+        dx = float(self._dx) * f
+        # coarse centre(i) == fine centre(i·f)  ⇒  origin shifts by −½·dx·(f−1)
+        origin = (self._origin.astype(np.float64)
+                  - 0.5 * float(self._dx) * (f - 1)).astype(self._origin.dtype)
+        self._det_cache = dict(
+            f=f, target=target, thickness=thickness, dx=dx, origin=origin,
+        )
+        return self._det_cache
+
+    @contextlib.contextmanager
+    def _detection_grid_scope(self):
+        """Temporarily swap the grid geometry to the capped detection grid so
+        ``_detect_worst_regions`` (and the predicted-grid build inside it) run
+        in O(cap³) instead of O(n³).  Restores everything on exit.
+
+        ``region_radius_vox`` is rescaled by 1/f so the world-space suppression
+        radius between successive seeds is unchanged by the downsampling.
+        """
+        det = self._build_detection_grid()
+        if det is None:
+            yield
+            return
+        saved = (self._sdf_target_np, self._thickness_np, self._origin,
+                 self._dx, self._n, self._nz, self._ny, self._nx, self._shape,
+                 self._region_radius_vox)
+        try:
+            self._sdf_target_np = det['target']
+            self._thickness_np = det['thickness']
+            self._origin = det['origin']
+            self._dx = det['dx']
+            self._nz, self._ny, self._nx = det['target'].shape
+            self._shape = det['target'].shape
+            self._n = max(self._shape)
+            self._region_radius_vox = self._region_radius_vox / det['f']
+            yield
+        finally:
+            (self._sdf_target_np, self._thickness_np, self._origin,
+             self._dx, self._n, self._nz, self._ny, self._nx, self._shape,
+             self._region_radius_vox) = saved
 
     def _pred_grid_from_params(self, centers, radii, rotations) -> np.ndarray:
         ell_set = EllipsoidSet(device=device)
@@ -3754,9 +3822,14 @@ class OptimizationWorker(QtCore.QThread):
         # results (no detector runs twice).
         viz_bridge = self._detect_bridging_ellipsoids(centers, radii, rotations)
         viz_protr = self._detect_protruding_ellipsoids(centers, radii, rotations)
-        viz_regions = self._detect_worst_regions(
-            centers, radii, rotations, self._analysis_region_k,
-            min_severity=self._analysis_min_severity)
+        # Region detection is the only O(n³) step in SuperFit; run it on the
+        # resolution-capped detection grid so the per-cycle cost stays constant
+        # as the global grid n grows.  Outputs are world-space (seed_world /
+        # seed_depth), so downstream split/spawn is unaffected.
+        with self._detection_grid_scope():
+            viz_regions = self._detect_worst_regions(
+                centers, radii, rotations, self._analysis_region_k,
+                min_severity=self._analysis_min_severity)
         if not self.signalsBlocked():
             bridge_set = set(int(i) for i in viz_bridge)
             region_r_world = float(self._region_radius_vox) * float(self._dx)

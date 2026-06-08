@@ -226,6 +226,14 @@ def main():
     from main_window import MainWindow
     splash.set_progress(0.35, "Modules loaded")
 
+    # Stop the mouse wheel from accidentally editing spin boxes / combo boxes /
+    # sliders while scrolling the settings panels.  Kept as an attribute so the
+    # filter object outlives this function.  (Imported here, after the heavy
+    # modules, so it doesn't delay the splash.)
+    from widgets import WheelGuard
+    app._wheel_guard = WheelGuard(app)
+    app.installEventFilter(app._wheel_guard)
+
     win = MainWindow(
         progress=lambda f, m="": splash.set_progress(0.35 + 0.62 * f, m or None))
     win.resize(1400, 1000)

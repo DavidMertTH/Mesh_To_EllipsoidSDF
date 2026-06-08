@@ -19,6 +19,44 @@ import theme
 from sdf_colormap import make_sdf_lut, colorize_sdf_slice
 
 
+# ── wheel-scroll guard ───────────────────────────────────────────────────────
+
+class WheelGuard(QtCore.QObject):
+    """Application-wide event filter that stops the mouse wheel from editing
+    value widgets (spin boxes, combo boxes, sliders).
+
+    Scrolling a settings panel would otherwise accidentally change whatever
+    field the cursor happens to be over.  Instead the wheel event is forwarded
+    to the enclosing scroll area so the panel keeps scrolling, while the
+    widget's value is left untouched.  Open combo-box pop-ups are unaffected
+    (their list view is a separate widget), and so are the scroll bars
+    themselves (``QScrollBar`` is not in the target list).
+    """
+
+    # QSlider, not QAbstractSlider, so we never swallow QScrollBar wheel events.
+    _TARGETS = (QtWidgets.QAbstractSpinBox,
+                QtWidgets.QComboBox,
+                QtWidgets.QSlider)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QtCore.QEvent.Type.Wheel and isinstance(obj, self._TARGETS):
+            area = self._scroll_area(obj)
+            if area is not None:
+                # Re-dispatch the scroll to the panel so it still scrolls.
+                QtWidgets.QApplication.sendEvent(area.viewport(), ev)
+            return True  # swallow it for the value widget itself
+        return False
+
+    @staticmethod
+    def _scroll_area(widget):
+        p = widget.parentWidget()
+        while p is not None:
+            if isinstance(p, QtWidgets.QAbstractScrollArea):
+                return p
+            p = p.parentWidget()
+        return None
+
+
 # ── 3-D viewport with drag-and-drop ──────────────────────────────────────────
 
 class DropGLView(gl.GLViewWidget):
