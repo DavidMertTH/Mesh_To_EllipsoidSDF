@@ -43,6 +43,46 @@ def ellipsoid_color() -> np.ndarray:
     return theme.rgba_array(theme.YELLOW, _ELLIPSOID_ALPHA)
 
 
+def _ellipsoid_metric_heatmap(values: np.ndarray, alpha: float = _ELLIPSOID_ALPHA) -> np.ndarray:
+    """Map scalar per-ellipsoid metric values to a smooth blue-to-red ramp."""
+    v = np.asarray(values, dtype=np.float32).reshape(-1)
+    finite = np.isfinite(v)
+    if not np.any(finite):
+        t = np.zeros_like(v, dtype=np.float32)
+    else:
+        lo = float(np.nanmin(v[finite]))
+        hi = float(np.nanmax(v[finite]))
+        if hi <= lo + 1e-12:
+            t = np.zeros_like(v, dtype=np.float32)
+        else:
+            t = np.clip((v - lo) / (hi - lo), 0.0, 1.0)
+            t[~finite] = 0.0
+
+    stops = np.array([
+        [0.08, 0.16, 0.95],   # deep blue: low
+        [0.04, 0.36, 1.00],
+        [0.00, 0.72, 1.00],   # cyan
+        [0.00, 0.86, 0.72],
+        [0.00, 0.85, 0.35],   # green
+        [0.56, 0.93, 0.16],
+        [1.00, 0.92, 0.10],   # yellow
+        [1.00, 0.70, 0.04],
+        [1.00, 0.48, 0.00],   # orange
+        [1.00, 0.25, 0.02],
+        [1.00, 0.06, 0.04],   # red: high
+    ], dtype=np.float32)
+    x = t * (len(stops) - 1)
+    i = np.floor(x).astype(np.int32)
+    i = np.clip(i, 0, len(stops) - 2)
+    f = (x - i)[:, None]
+    # Quintic smootherstep: keeps interpolation continuous and removes visible
+    # kinks at neighbouring colour stops.
+    f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0)
+    rgb = (1.0 - f) * stops[i] + f * stops[i + 1]
+    a = np.full((len(v), 1), float(alpha), dtype=np.float32)
+    return np.concatenate([rgb, a], axis=1).astype(np.float32)
+
+
 # ── Precomputed unit icosphere ────────────────────────────────────────────────
 
 def _make_unit_icosphere(subdivisions: int = 3):
@@ -179,11 +219,10 @@ def build_concatenated_mesh(
         all_verts[vs:vs + V] = v
         all_faces[fs:fs + F] = _UNIT_FACES + vs
 
-        # All ellipsoids share one uniform colour.  An explicitly supplied
-        # colour (e.g. rig/bone tinting) still wins; otherwise everything uses
-        # the current brand secondary colour rather than cycling a palette.
+        # Use per-ellipsoid colours when supplied (heatmaps / rig tinting);
+        # otherwise everything uses the current brand secondary colour.
         if colors is not None and len(colors) > 0:
-            c = colors[0]
+            c = colors[min(i, len(colors) - 1)]
         else:
             c = ell_color
         all_face_colors[fs:fs + F] = c
@@ -584,6 +623,7 @@ class ViewportOverlay(QtWidgets.QFrame):
 
     visibilityChanged = QtCore.Signal(str, bool)
     renderModeChanged = QtCore.Signal(str, str)
+    ellipsoidMetricChanged = QtCore.Signal(str)
     # SDF slice plane (movable texture pushed through the volume)
     sliceToggled = QtCore.Signal(bool)         # on / off
     slicePlaneChanged = QtCore.Signal(str)     # "XY" | "XZ" | "YZ"
@@ -617,6 +657,16 @@ class ViewportOverlay(QtWidgets.QFrame):
         "ellipsoids": RENDER_TRANSPARENT,
     }
 
+    _ELLIPSOID_METRICS = (
+        ("Default", "default"),
+        ("Bridging", "bridging"),
+        ("Too Large", "too_large"),
+        ("Too Small", "too_small"),
+        ("Redundant", "redundant"),
+        ("Coverage", "coverage"),
+        ("Unique", "unique_coverage"),
+    )
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.apply_theme()
@@ -647,6 +697,18 @@ class ViewportOverlay(QtWidgets.QFrame):
             if has_combo:
                 grid.addWidget(self._make_combo(key), i, 1)
 
+        metric_row = len(rows) + 1
+        grid.addWidget(QtWidgets.QLabel("Metric"), metric_row, 0)
+        self._combo_ell_metric = QtWidgets.QComboBox()
+        for label, metric in self._ELLIPSOID_METRICS:
+            self._combo_ell_metric.addItem(label, metric)
+        self._combo_ell_metric.setToolTip(
+            "Color ellipsoids by the selected per-ellipsoid fitting metric.")
+        self._combo_ell_metric.activated.connect(
+            lambda _i: self.ellipsoidMetricChanged.emit(
+                self._combo_ell_metric.currentData()))
+        grid.addWidget(self._combo_ell_metric, metric_row, 1)
+
         # SuperFit operation gizmos: colour-coded boxes marking where each
         # merge / split / spawn / fuse / delete happened (fade out over ~50 steps).
         self._checks["operations"].setToolTip(
@@ -663,7 +725,7 @@ class ViewportOverlay(QtWidgets.QFrame):
         self.set_skeleton_available(False)
 
         # ── raymarch blend (only shown in the Raymarch ellipsoid mode) ──
-        next_row = len(rows) + 1
+        next_row = metric_row + 1
         self._build_raymarch_controls(grid, next_row)
 
         # ── SDF slice plane ───────────────────────────────────────────
@@ -837,6 +899,9 @@ class SceneViewer3D(_BaseViewer):
         self._ell_radii: Optional[np.ndarray] = None
         self._ell_rotations: Optional[np.ndarray] = None
         self._ell_colors: Optional[np.ndarray] = None
+        self._ell_base_colors: Optional[np.ndarray] = None
+        self._ell_metric_mode = "default"
+        self._ell_metric_values: dict[str, np.ndarray] = {}
 
         self._bone_positions: Optional[np.ndarray] = None
         self._bone_parents: Optional[np.ndarray] = None
@@ -898,6 +963,7 @@ class SceneViewer3D(_BaseViewer):
         self._overlay = ViewportOverlay()
         self._overlay.visibilityChanged.connect(self._on_visibility_changed)
         self._overlay.renderModeChanged.connect(self._on_render_mode_changed)
+        self._overlay.ellipsoidMetricChanged.connect(self._on_ellipsoid_metric_changed)
         self._overlay.sliceToggled.connect(self._on_slice_toggled)
         self._overlay.slicePlaneChanged.connect(self._on_slice_plane_changed)
         self._overlay.sliceSourceChanged.connect(self._on_slice_source_changed)
@@ -1029,6 +1095,17 @@ class SceneViewer3D(_BaseViewer):
                 if was_rm:
                     self._exit_raymarch()
                 self._rebuild_ellipsoids()
+
+    def _on_ellipsoid_metric_changed(self, metric: str) -> None:
+        self._ell_metric_mode = metric or "default"
+        self._apply_ellipsoid_metric_colors()
+        self._rebuild_ellipsoids()
+
+    def ellipsoid_metric_mode(self) -> str:
+        return getattr(self, "_ell_metric_mode", "default")
+
+    def connect_ellipsoid_metric_changed(self, slot) -> None:
+        self._overlay.ellipsoidMetricChanged.connect(slot)
 
     def _on_raymarch_blend_changed(self, frac: float) -> None:
         self._rm_blend = max(0.0, float(frac))
@@ -1264,10 +1341,11 @@ class SceneViewer3D(_BaseViewer):
         self._ell_centers = centers
         self._ell_radii = radii
         self._ell_rotations = rotations
-        self._ell_colors = colors
+        self._ell_base_colors = colors
         self._ell_sq_eps = sq_eps      # per-primitive (N,2) roundness, or None
         self._ell_sq_bend = sq_bend    # per-primitive (N,2) bend, or None
         self._ell_primitive = primitive  # e.g. "capsule", or None for ellipsoid
+        self._apply_ellipsoid_metric_colors()
         self._rm_dirty = True          # population changed → re-upload for raymarch
         self._rebuild_ellipsoids()
         # Live slice refresh while the ellipsoid-union SDF is the slice source.
@@ -1285,6 +1363,8 @@ class SceneViewer3D(_BaseViewer):
 
     def clear_ellipsoids(self) -> None:
         self._ell_centers = None
+        self._ell_base_colors = None
+        self._ell_colors = None
         self._rm_dirty = True
         if self._ell_item is not None:
             self._view.removeItem(self._ell_item)
@@ -1292,6 +1372,38 @@ class SceneViewer3D(_BaseViewer):
             self._ell_item_mode = None
         if self._ell_render_mode == RENDER_RAYMARCH:
             self._rm_label.clear()
+
+    def set_ellipsoid_metrics(self, metrics: dict | None) -> None:
+        """Store current per-ellipsoid quality metrics for viewport heatmaps."""
+        clean: dict[str, np.ndarray] = {}
+        for key, values in (metrics or {}).items():
+            try:
+                arr = np.asarray(values, dtype=np.float32).reshape(-1)
+            except Exception:
+                continue
+            clean[str(key)] = arr
+        self._ell_metric_values = clean
+        self._apply_ellipsoid_metric_colors()
+        if self._ell_centers is not None:
+            self._rebuild_ellipsoids()
+
+    def clear_ellipsoid_metrics(self) -> None:
+        self._ell_metric_values = {}
+        self._apply_ellipsoid_metric_colors()
+        if self._ell_centers is not None:
+            self._rebuild_ellipsoids()
+
+    def _apply_ellipsoid_metric_colors(self) -> None:
+        mode = getattr(self, "_ell_metric_mode", "default")
+        n = 0 if self._ell_centers is None else len(self._ell_centers)
+        if mode == "default" or n == 0:
+            self._ell_colors = self._ell_base_colors
+            return
+        values = self._ell_metric_values.get(mode)
+        if values is None or len(values) != n:
+            self._ell_colors = self._ell_base_colors
+            return
+        self._ell_colors = _ellipsoid_metric_heatmap(values)
 
     def _rebuild_ellipsoids(self) -> None:
         # Raymarch mode draws the SDF directly into the overlay image instead of

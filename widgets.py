@@ -290,6 +290,15 @@ class SdfSlicePanel(QtWidgets.QWidget):
         self.img_xy.ui.menuBtn.hide()
         self.img_xy.ui.histogram.hide()          # we pre-colour; no histogram
         self.img_xy.getImageItem().setAutoDownsample(True)
+        # Hidden is not enough: HistogramLUTItem remains connected to the
+        # ImageItem and still recomputes histograms on every RGBA update.  With
+        # large uint8 RGBA slices this can recurse deep inside pyqtgraph/numpy.
+        # We show pre-coloured pixels, so detach that machinery completely.
+        try:
+            self.img_xy.getImageItem().sigImageChanged.disconnect(
+                self.img_xy.ui.histogram.imageChanged)
+        except (TypeError, RuntimeError):
+            pass
 
         layout.addWidget(QtWidgets.QLabel("XY (Z fixed)"))
         layout.addWidget(self.img_xy, 1)

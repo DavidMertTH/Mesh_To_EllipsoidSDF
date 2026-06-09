@@ -26,6 +26,7 @@ Right:   a scrollable options column — every selectable control, including
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 import warp as wp
 
+import branding
 import theme
 import app_settings
 from settings_dialog import SettingsDialog
@@ -61,9 +63,10 @@ from run_tracker import RunTrackerPanel
 from dashboard import DashboardPanel
 from mesh_settings import MeshSettingsPanel, rotate_mesh
 from rig_panel import RigModePanel, try_load_rigged
+from rig_loader import RiggedMesh
 from skinning import deform_mesh
 from bone_ellipsoid_mapper import BoneEllipsoidMapper, BoneLocalEllipsoids
-from skeleton import Pose
+from skeleton import Bone, Pose, Skeleton, mat4_compose
 
 # Supported mesh file extensions (trimesh + glTF for rigged)
 MESH_EXTENSIONS = {".obj", ".stl", ".ply", ".glb", ".gltf", ".off", ".dae", ".fbx"}
@@ -123,6 +126,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mesh_dir = Path(mesh_dir) if mesh_dir else DEFAULT_MESH_DIR
         self._mesh_dir.mkdir(parents=True, exist_ok=True)
 
+        # Meshes loaded this session from *outside* the mesh dir (drag-and-drop
+        # of an external file, or a mesh pushed in over the Unity/HTTP API).
+        # They are added to the selector so they stay selectable; this list lets
+        # a folder rescan re-add them instead of dropping them.
+        #   _extra_mesh_paths : {normalised-key → original path} of dropped
+        #     external files (the original path preserves the display casing)
+        #   _special_mesh_loaders : data-key → callable that re-displays a
+        #     non-file mesh (e.g. the in-memory Unity mesh)
+        self._extra_mesh_paths: dict = {}
+        self._special_mesh_loaders: dict = {}
+        self._special_mesh_labels: dict = {}
+        self._unity_mesh_cache: dict = {}
+
         wp.init()
         self._device = best_device()
         _tick(0.20, "Initializing GPU …")
@@ -160,6 +176,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # mesh's grid, slice view or viewport volume.
         self._region_sdf: SdfComputer | None = None
         self._region_sdf_worker: SdfWorker | None = None
+        # Sequential per-bone fit (reverted from the batched all-bones loop): one
+        # bone is fitted fully on its own region SDF with the single-bone
+        # ``OptimizationWorker`` before the next bone's SDF is computed.
+        self._region_fit_worker: OptimizationWorker | None = None
+        self._region_fit_active: bool = False
+        self._region_last_params = None            # (centers, radii, rotations)
+        # Ellipsoids of the bones already fitted this run, kept so the viewport
+        # shows the GROWING union (finished bones + current bone in progress)
+        # instead of resetting to just the current bone every frame.
+        self._bonesep_done_c: list = []
+        self._bonesep_done_r: list = []
+        self._bonesep_done_q: list = []
 
         # Mesh-Blowup preview: cached per-bone submeshes + their centroids for
         # the exploded region view (None when no preview is active).
@@ -170,6 +198,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Single unified viewport: mesh + skeleton + ellipsoids together.
         self._viewer = SceneViewer3D()
+        self._viewer.connect_ellipsoid_metric_changed(self._on_view_ellipsoid_metric_changed)
+        self._active_ellipsoid_metric = self._viewer.ellipsoid_metric_mode()
         # SDF slice is shown for the mesh only.  Without a CUDA GPU the n³ SDF
         # runs on the CPU, so start at a much smaller default grid (64 vs 512).
         self._cpu_only = not str(self._device).startswith("cuda")
@@ -283,6 +313,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._visual_timer = QtCore.QTimer(self)
         self._visual_timer.setInterval(45)               # ~22 FPS GUI refresh
         self._visual_timer.timeout.connect(self._flush_visual)
+        self._brand_icon_timer = QtCore.QTimer(self)
+        self._brand_icon_timer.setSingleShot(True)
+        self._brand_icon_timer.setInterval(250)
+        self._brand_icon_timer.timeout.connect(self._update_brand_icon)
+        self._color_dialog_active = False
+        self._applying_theme = False
+        self._last_theme_signature = None
         self._multipose_worker = None  # MultiPoseOptimizationWorker
         self._current_mesh_name: str = ""
         self._current_sdf_mode: int = SDF_QUILEZ
@@ -393,11 +430,7 @@ class MainWindow(QtWidgets.QMainWindow):
         default = self._mesh_dir / "T-Pose.fbx"
         if not default.is_file():
             return
-        idx = self._mesh_combo.findData(str(default))
-        if idx >= 1:
-            self._mesh_combo.blockSignals(True)
-            self._mesh_combo.setCurrentIndex(idx)
-            self._mesh_combo.blockSignals(False)
+        # _load_mesh selects it in the combo (via _select_loaded_mesh) itself.
         self._load_mesh(str(default))
 
     # ── option widgets + right-hand options column ────────────────────────
@@ -681,11 +714,75 @@ class MainWindow(QtWidgets.QMainWindow):
         h.addStretch()
         return w
 
+    def _make_appearance_mode_row(self) -> QtWidgets.QWidget:
+        """Light/dark selector + a 'Sync with OS' checkbox for the Settings tab.
+
+        Changes apply live (and persist) — toggling re-themes the whole UI via
+        Qt's colour-scheme hint, which fires the palette-change handler.
+        """
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+
+        self._chk_sync_os = QtWidgets.QCheckBox("Sync with OS")
+        self._chk_sync_os.setToolTip(
+            "Follow the operating system's light/dark setting.")
+        v.addWidget(self._chk_sync_os)
+
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(18, 0, 0, 0)
+        h.setSpacing(12)
+        self._rb_light = QtWidgets.QRadioButton("Light")
+        self._rb_dark = QtWidgets.QRadioButton("Dark")
+        self._mode_btn_group = QtWidgets.QButtonGroup(w)
+        self._mode_btn_group.addButton(self._rb_light)
+        self._mode_btn_group.addButton(self._rb_dark)
+        h.addWidget(self._rb_light)
+        h.addWidget(self._rb_dark)
+        h.addStretch()
+        v.addWidget(row)
+
+        # Initialise from the persisted mode.
+        mode = theme.MODE
+        self._chk_sync_os.setChecked(mode == "system")
+        # When syncing, reflect the *current* effective scheme in the radios.
+        effective_light = (mode == "light") or (
+            mode == "system" and not theme.is_dark_mode())
+        self._rb_light.setChecked(effective_light)
+        self._rb_dark.setChecked(not effective_light)
+        self._update_mode_controls_enabled()
+
+        self._chk_sync_os.toggled.connect(self._on_appearance_mode_changed)
+        self._rb_light.toggled.connect(self._on_appearance_mode_changed)
+        return w
+
+    def _update_mode_controls_enabled(self) -> None:
+        """Grey out the Light/Dark radios while 'Sync with OS' is active."""
+        sync = self._chk_sync_os.isChecked()
+        self._rb_light.setEnabled(not sync)
+        self._rb_dark.setEnabled(not sync)
+
+    def _on_appearance_mode_changed(self, *_) -> None:
+        """Apply + persist the chosen appearance mode (live re-theme)."""
+        self._update_mode_controls_enabled()
+        if self._chk_sync_os.isChecked():
+            mode = "system"
+        else:
+            mode = "light" if self._rb_light.isChecked() else "dark"
+        theme.apply_mode(mode)
+        theme.save_mode()
+        # _apply_theme() is normally triggered by the palette-change event, but
+        # call it directly too so the refresh is immediate and reliable.
+        self._apply_theme()
+
     def _open_settings_dialog(self) -> None:
         """Open (or reopen) the Settings window and commit/persist on OK."""
         if self._settings_dialog is None:
             self._settings_dialog = SettingsDialog(
-                self._settings, self._make_color_row(), self)
+                self._settings, self._make_color_row(),
+                self._make_appearance_mode_row(), self)
         else:
             self._settings_dialog.load_values(self._settings)
         if self._settings_dialog.exec() == QtWidgets.QDialog.Accepted:
@@ -715,6 +812,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("lr_init",         self._spin_lr_init,        "float"),
             ("lr_final",        self._spin_lr_final,       "float"),
             ("lr_decay",        self._spin_lr_decay,       "float"),
+            ("fit_scope",       self._cmb_fit_scope,       "combo_data"),
         ]
 
     def _init_panel_persistence(self) -> None:
@@ -735,6 +833,17 @@ class MainWindow(QtWidgets.QMainWindow):
             for key, w, kind in self._shared_setting_specs():
                 if key in shared:
                     set_widget_value(w, kind, shared[key])
+        # SDF blowup lives on the Mesh-settings panel (not a shared widget) and is
+        # reset to 0 on every mesh load.  The startup mesh has already loaded by
+        # now (see __init__ order), so restoring the persisted value here makes it
+        # survive into the session.
+        if isinstance(shared, dict) and "blowup" in shared:
+            try:
+                vox = float(shared["blowup"])
+                self._mesh_settings.set_blowup_voxels(vox)
+                self._viewer.set_sdf_blowup(vox)
+            except Exception:
+                pass
         if isinstance(shapes_state, dict):
             for shape in self._shapes:
                 st = shapes_state.get(shape.id)
@@ -755,6 +864,7 @@ class MainWindow(QtWidgets.QMainWindow):
         kick = lambda *_: self._panel_save_timer.start()
         for _key, w, kind in self._shared_setting_specs():
             widget_change_signal(w, kind).connect(kick)
+        self._mesh_settings.blowupChanged.connect(kick)   # persist SDF blowup too
         for shape in self._shapes:
             shape.options_widget()          # ensure widgets exist before wiring
             shape.connect_changed(lambda: self._panel_save_timer.start())
@@ -762,6 +872,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _save_panel_settings(self) -> None:
         shared = {key: widget_value(w, kind)
                   for key, w, kind in self._shared_setting_specs()}
+        shared["blowup"] = self._mesh_settings.blowup_voxels()
         shapes_state = {s.id: s.panel_state() for s in self._shapes if s.available}
         app_settings.save_panel({
             "shape": self._shape.id,
@@ -819,27 +930,63 @@ class MainWindow(QtWidgets.QMainWindow):
         # The OS / Qt switching colour scheme delivers an ApplicationPaletteChange
         # to every widget; re-colour our custom-styled ones (standard widgets
         # follow the palette automatically).
+        super().changeEvent(event)
         if event.type() in (
             QtCore.QEvent.Type.ApplicationPaletteChange,
             QtCore.QEvent.Type.PaletteChange,
-        ):
+        ) and not getattr(self, "_applying_theme", False):
             self._apply_theme()
-        super().changeEvent(event)
 
     def _apply_theme(self) -> None:
         if not hasattr(self, "_btn_primary"):
             return                      # window not fully built yet
-        # pyqtgraph defaults for any widgets created afterwards.
-        if theme.is_dark_mode():
-            pg.setConfigOptions(foreground="d", background="k")
-        else:
-            pg.setConfigOptions(foreground="k", background="w")
-        self._viewer.apply_theme()
-        self._mesh_sdf_panel.apply_theme()
-        self._run_tracker.apply_theme()
-        self._dashboard.apply_theme()
-        self._refresh_color_swatches()
-        self._style_progress_bar()
+        is_dark = theme.is_dark_mode()
+        signature = (theme.BLUE, theme.YELLOW, is_dark)
+        if getattr(self, "_last_theme_signature", None) == signature:
+            return
+        self._last_theme_signature = signature
+        if getattr(self, "_applying_theme", False):
+            return
+        self._applying_theme = True
+        try:
+            # pyqtgraph defaults for any widgets created afterwards.
+            if is_dark:
+                pg.setConfigOptions(foreground="d", background="k")
+            else:
+                pg.setConfigOptions(foreground="k", background="w")
+            self._viewer.apply_theme()
+            self._mesh_sdf_panel.apply_theme()
+            self._run_tracker.apply_theme()
+            self._dashboard.apply_theme()
+            if not getattr(self, "_color_dialog_active", False):
+                self._schedule_brand_icon_update()
+                self._clear_custom_ui_style()
+            self._refresh_color_swatches()
+            self._style_progress_bar()
+        finally:
+            self._applying_theme = False
+
+    def _schedule_brand_icon_update(self) -> None:
+        if hasattr(self, "_brand_icon_timer"):
+            self._brand_icon_timer.start()
+
+    def _update_brand_icon(self) -> None:
+        # Do not set a new QIcon while the native/non-native QColorDialog is
+        # actively emitting live colour changes; on Windows that can destabilise
+        # the dialog/window-icon plumbing.  Reschedule until the dialog closes.
+        if getattr(self, "_color_dialog_active", False):
+            self._schedule_brand_icon_update()
+            return
+        icon = branding.make_sdf_icon()
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
+        self.setWindowIcon(icon)
+
+    def _clear_custom_ui_style(self) -> None:
+        """Use Qt's native widget styling; branding stays in logo/progress/view."""
+        if self.styleSheet():
+            self.setStyleSheet("")
 
     # ── status-bar progress bar (themed + animated) ───────────────────────
 
@@ -973,6 +1120,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = QtWidgets.QColorDialog(QtGui.QColor(*original), self)
         dlg.setOption(
             QtWidgets.QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        self._color_dialog_active = True
 
         def _live(c: QtGui.QColor) -> None:
             if not c.isValid():
@@ -986,15 +1134,28 @@ class MainWindow(QtWidgets.QMainWindow):
 
         dlg.currentColorChanged.connect(_live)
         dlg.rejected.connect(_revert)
-        # Remember the final choice across restarts (fires after accept/revert).
-        dlg.finished.connect(lambda _r: theme.save_colors())
+        # Remember the final choice across restarts (fires after accept/revert),
+        # then update the dynamic icon once the colour dialog is gone.
+        def _finished(_result: int) -> None:
+            self._color_dialog_active = False
+            theme.save_colors()
+            self._last_theme_signature = None
+            self._apply_theme()
+            self._update_brand_icon()
+
+        dlg.finished.connect(_finished)
         dlg.open()
 
     # ── mesh directory scanning ───────────────────────────────────────────
 
+    @staticmethod
+    def _norm_path(p) -> str:
+        """Normalised absolute path used as the combo's per-file data key."""
+        return os.path.normcase(os.path.abspath(str(p)))
+
     def _scan_mesh_dir(self):
         self._mesh_combo.blockSignals(True)
-        prev_text = self._mesh_combo.currentText()
+        prev_data = self._mesh_combo.currentData()
         self._mesh_combo.clear()
         self._mesh_combo.addItem("— select mesh —")
 
@@ -1004,19 +1165,56 @@ class MainWindow(QtWidgets.QMainWindow):
                 if f.is_file() and f.suffix.lower() in MESH_EXTENSIONS
             )
             for f in files:
-                self._mesh_combo.addItem(f.name, str(f))
+                self._mesh_combo.addItem(f.name, self._norm_path(f))
 
-        idx = self._mesh_combo.findText(prev_text)
-        if idx >= 1:
-            self._mesh_combo.setCurrentIndex(idx)
+        # Re-add session meshes loaded from outside the dir so a rescan doesn't
+        # drop them from the selector.  External files that no longer exist are
+        # forgotten; the special (in-memory) loaders are always re-added.
+        self._extra_mesh_paths = {
+            k: orig for k, orig in self._extra_mesh_paths.items()
+            if os.path.isfile(orig)}
+        for key, orig in self._extra_mesh_paths.items():
+            if self._mesh_combo.findData(key) < 0:
+                self._mesh_combo.addItem(Path(orig).name, key)
+        for key, label in self._special_mesh_labels.items():
+            if self._mesh_combo.findData(key) < 0:
+                self._mesh_combo.addItem(label, key)
+
+        if prev_data is not None:
+            idx = self._mesh_combo.findData(prev_data)
+            if idx >= 1:
+                self._mesh_combo.setCurrentIndex(idx)
+        self._mesh_combo.blockSignals(False)
+
+    def _register_file_in_combo(self, path: str) -> int:
+        """Ensure *path* has a selector entry (adding external files); return idx."""
+        key = self._norm_path(path)
+        idx = self._mesh_combo.findData(key)
+        if idx < 0:
+            # A file from outside the mesh dir — add it and remember it (with its
+            # original path, to preserve display casing) so a later folder rescan
+            # keeps it selectable.
+            self._extra_mesh_paths[key] = str(path)
+            self._mesh_combo.addItem(Path(path).name, key)
+            idx = self._mesh_combo.findData(key)
+        return idx
+
+    def _select_loaded_mesh(self, path: str) -> None:
+        """Register *path* if needed and show it as the current selection."""
+        idx = self._register_file_in_combo(path)
+        self._mesh_combo.blockSignals(True)
+        self._mesh_combo.setCurrentIndex(idx if idx >= 1 else 0)
         self._mesh_combo.blockSignals(False)
 
     def _on_combo_selected(self, idx: int):
         if idx < 1:
             return
-        path = self._mesh_combo.itemData(idx)
-        if path:
-            self._load_mesh(path)
+        data = self._mesh_combo.itemData(idx)
+        if data in self._special_mesh_loaders:
+            self._special_mesh_loaders[data]()
+            return
+        if data:
+            self._load_mesh(data)
 
     def _open_mesh_dir(self):
         path = str(self._mesh_dir.resolve())
@@ -1052,14 +1250,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sdf.set_mesh(verts, faces)
             self._current_mesh_name = Path(path).name
 
-            name = Path(path).name
-            idx = self._mesh_combo.findText(name)
-            self._mesh_combo.blockSignals(True)
-            if idx >= 1:
-                self._mesh_combo.setCurrentIndex(idx)
-            else:
-                self._mesh_combo.setCurrentIndex(0)
-            self._mesh_combo.blockSignals(False)
+            self._select_loaded_mesh(path)
 
             self._status.showMessage(
                 f"Loaded: {path} | verts={len(verts)} faces={len(faces)} | device={self._device}"
@@ -1071,6 +1262,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_rigged_mesh(self, path: str, rigged):
         """Load a rigged mesh and activate rig mode."""
+        self._precomputed_meshes = {}
+        self._pending_pose_mesh = None
         self._rig_panel.setVisible(True)  # Reveal rig/FBX options
         self._rig_panel.setChecked(True)
         self._rig_panel.set_rigged_mesh(rigged)
@@ -1091,13 +1284,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._show_skeleton_for_pose(rigged, None)
 
         name = Path(path).name
-        idx = self._mesh_combo.findText(name)
-        self._mesh_combo.blockSignals(True)
-        if idx >= 1:
-            self._mesh_combo.setCurrentIndex(idx)
-        else:
-            self._mesh_combo.setCurrentIndex(0)
-        self._mesh_combo.blockSignals(False)
+        self._select_loaded_mesh(path)
 
         self._status.showMessage(
             f"Rigged mesh: {name} | verts={len(verts)} faces={len(faces)} | "
@@ -1627,7 +1814,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_stop_clicked(self):
         self._rig_panel.set_auto_pipeline_running(False)
-        # Cancel the parallel bone-separation pipeline (controller + workers).
+        # Cancel the bone-separation pipeline (controller + workers).
         if self._bonesep_ctl is not None:
             self._bonesep_ctl.cancel()
         if (self._batched_worker is not None
@@ -1635,37 +1822,46 @@ class MainWindow(QtWidgets.QMainWindow):
             self._visual_timer.stop()
             self._batched_worker.request_stop()
             self._batched_worker.wait()
+        # Sequential per-bone fit: stop the current bone's OptimizationWorker.
+        if (self._region_fit_worker is not None
+                and self._region_fit_worker.isRunning()):
+            self._visual_timer.stop()
+            self._region_fit_worker.request_stop()
+            self._region_fit_worker.wait()
+        self._region_fit_worker = None
+        self._region_fit_active = False
         self._batched_worker = None
         self._bonesep_ctl = None
         self._overall_end()             # hide the overall bone-separation bar
         self.stop_optimization()
         self._stop_multipose()
 
-    # ── Bone Separation: parallel (batched) fitting ──────────────────────
+    # ── Bone Separation: sequential per-bone fitting ─────────────────────
     #
     # The skinned mesh is carved into one compact submesh per bone
-    # (``partition_mesh_by_bone``).  Instead of fitting bones one after another
-    # (which starves the GPU — a tiny finger fills a fraction of the device per
-    # step), the pipeline runs in two clean phases, orchestrated by
-    # :class:`BoneSeparationController`:
+    # (``partition_mesh_by_bone``).  Each bone is then handled on its own,
+    # one after another, orchestrated by :class:`BoneSeparationController`:
     #
-    #   1. PRECOMPUTE — every fit-bone's isolated region SDF is computed (still
-    #      one at a time, but SDF is the cheap phase) and turned into a
-    #      :class:`batched_fit.BoneFitJob` carrying its own world-space sample
-    #      pool + region-SDF targets.
-    #   2. BATCHED FIT — ALL jobs are handed to :class:`batched_fit.BatchedFitWorker`,
-    #      which fits every bone in a SINGLE Adam loop (each against its own SDF
-    #      via per-sample / per-ellipsoid group ids), so the GPU runs full and the
-    #      slow phase happens once instead of N times.
+    #   for each fit-bone:
+    #     1. compute its isolated region SDF (``compute_region_sdf``), then
+    #     2. fit it with the single-bone ``OptimizationWorker`` against THAT
+    #        SDF (``run_region_fit``) — so every bone gets the full maintenance /
+    #        densify / local-fit / symmetry treatment, never seeing any other
+    #        bone's SDF.
+    #
+    # (This replaces an earlier GPU-batched all-bones-in-one-Adam-loop engine,
+    # ``batched_fit.BatchedFitWorker``, which converged poorly; that module is
+    # left in the tree but is no longer used by this pipeline.)
     #
     # Symmetry is handled by the controller: paired (left/right) bones are
-    # mirrored from their fitted source; on-plane (centre) bones are symmetrised
-    # inside the batched worker.
+    # mirrored from their fitted source; on-plane (centre) bones are fitted with
+    # the single-bone optimizer's own symmetry enforcement.
     #
     # This MainWindow is the controller's *host* (see ``BoneSepHost``): it owns
-    # the async SDF + batched-fit workers and calls back into the controller's
-    # ``on_sdf_ready`` / ``on_sdf_failed`` / ``fit_progress`` / ``on_fit_finished``
-    # on the GUI thread.  ``accum`` handed to the completion callback is
+    # the async SDF + per-bone fit workers and calls back into the controller's
+    # ``on_sdf_ready`` / ``on_sdf_failed`` / ``fit_progress`` /
+    # ``on_region_fit_finished`` on the GUI thread.  ``accum`` handed to the
+    # completion callback is
     # ``(world_centers, world_radii, world_rotations, bone_indices)``.
 
     def _has_skin_for_bonesep(self) -> bool:
@@ -1730,6 +1926,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bonesep_on_complete = on_complete
         self._bonesep_is_api = bool(is_api)
         self._bonesep_fit_kwargs = dict(base_kwargs)
+        # Reset the growing-union display accumulator for this run.
+        self._bonesep_done_c = []
+        self._bonesep_done_r = []
+        self._bonesep_done_q = []
 
         self._btn_fit.setEnabled(False)
         self._btn_stop.setEnabled(True)
@@ -1786,27 +1986,63 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._bonesep_ctl is not None:
             self._bonesep_ctl.on_sdf_failed(msg)
 
-    def run_batched_fit(self, jobs) -> None:
-        """Fit ALL bone jobs in a single Adam loop on a background thread."""
-        fk = self._bonesep_fit_kwargs
-        worker = BatchedFitWorker(
-            jobs,
-            device=str(self._device),
-            num_steps=int(fk.get("num_steps", 1200)),
-            report_every=int(self._report_every),
-            lr_init=float(fk.get("lr_init", 0.01)),
-            lr_final=float(fk.get("lr_final", 0.0002)),
-            lr_decay_k=float(fk.get("lr_decay_k", 7.0)),
-            rng=np.random.default_rng(),
+    def run_region_fit(self, result, part, symmetry) -> None:
+        """Fit ONE bone on its own region SDF with the single-bone optimizer.
+
+        This is the reverted *sequential* path: each bone gets the full
+        single-bone ``OptimizationWorker`` treatment (maintenance / densify /
+        local fit / symmetry) against its isolated region SDF, one bone at a
+        time.  ``self._region_sdf`` (the computer that produced ``result``) is
+        reused as the worker's ``sdf_computer`` so the local fit can decode the
+        region grid.  On completion the fitted ellipsoids are handed back to the
+        controller via ``on_region_fit_finished``.
+        """
+        # Hard guarantee: never run two optimizer threads at once.  Warp's
+        # autodiff tape is process-global, so an overlap raises "entering a tape
+        # while one is already active".  If the previous bone's worker has not
+        # been joined yet, join it here before starting this one.
+        prev = self._region_fit_worker
+        if prev is not None:
+            if prev.isRunning():
+                prev.wait()
+            self._region_fit_worker = None
+
+        fk = dict(self._bonesep_fit_kwargs)
+        # Map the gathered fit kwargs to OptimizationWorker kwargs.  All keys
+        # already match except the two renames handled below; ``symmetry`` and
+        # ``advanced`` are popped (replaced / merged explicitly).
+        advanced = fk.pop("advanced", None)
+        fk.pop("symmetry", None)
+        spawn = fk.pop("spawn_enabled", True)
+
+        worker_kwargs = dict(fk)
+        worker_kwargs.update(
+            sdf_target_np=np.asarray(result.grid, dtype=np.float32),
+            origin=result.origin,
+            dx=result.dx,
+            n=result.n,
+            thickness_np=getattr(result, "thickness", None),
+            sdf_computer=self._region_sdf,
+            num_ellipsoids=int(part.budget),
+            max_ellipsoids=int(part.max_budget),
+            spawn_underrep=bool(spawn),
+            symmetry_enabled=bool(symmetry is not None),
             parent=self,
         )
-        self._batched_worker = worker
-        self._batched_total_steps = int(fk.get("num_steps", 1200))
+        if advanced:
+            worker_kwargs.update(advanced)
+
+        worker = OptimizationWorker(**worker_kwargs)
+        worker.set_live_metric(getattr(self, "_active_ellipsoid_metric", "default"))
+        self._region_fit_worker = worker
+        self._region_fit_active = True
+        self._region_last_params = None
         self._pending_visual = None
         self._visual_timer.start()          # decouple GUI refresh from step rate
-        worker.step_visual.connect(self._on_batched_step)
-        worker.prep_progress.connect(self._on_batched_prep)
-        worker.fit_finished.connect(self._on_batched_finished)
+        worker.step_visual.connect(self._on_region_fit_step)
+        worker.ellipsoid_metrics.connect(self._on_opt_ellipsoid_metrics)
+        worker.prep_progress.connect(self._on_region_fit_prep)
+        worker.finished.connect(self._on_region_fit_finished)
         worker.start()
 
     def report_overall(self, frac: float, msg: str) -> None:
@@ -1823,6 +2059,8 @@ class MainWindow(QtWidgets.QMainWindow):
         on_complete = self._bonesep_on_complete
         self._bonesep_ctl = None
         self._batched_worker = None
+        self._region_fit_worker = None
+        self._region_fit_active = False
         self._bonesep_on_complete = None
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._btn_stop.setEnabled(False)
@@ -1836,6 +2074,8 @@ class MainWindow(QtWidgets.QMainWindow):
         is_api = self._bonesep_is_api
         self._bonesep_ctl = None
         self._batched_worker = None
+        self._region_fit_worker = None
+        self._region_fit_active = False
         self._bonesep_on_complete = None
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._btn_stop.setEnabled(False)
@@ -1846,28 +2086,66 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._status.showMessage(f"Bone Separation: {msg}")
 
-    # ── batched-fit worker handlers ──────────────────────────────────────
+    # ── sequential per-bone fit worker handlers ──────────────────────────
 
-    def _on_batched_step(self, step: int, loss: float,
-                         centers: np.ndarray, radii: np.ndarray,
-                         rotations: np.ndarray) -> None:
-        """Hot path: stash the latest combined frame + forward fit progress."""
+    def _on_region_fit_step(self, step: int, loss: float,
+                            centers: np.ndarray, radii: np.ndarray,
+                            rotations: np.ndarray,
+                            eps: np.ndarray | None = None) -> None:
+        """Hot path: stash the latest frame + record it as this bone's result.
+
+        The CURRENT bone's params alone are kept in ``_region_last_params`` (that
+        is what gets handed back to the controller).  The DISPLAYED frame, though,
+        is the union of all already-fitted bones plus this bone in progress, so
+        the viewport shows the skeleton filling in rather than resetting to a
+        single bone each time.
+        """
+        self._region_last_params = (centers, radii, rotations)
+        disp_c, disp_r, disp_q = centers, radii, rotations
+        # Prepend finished bones (ellipsoid mode only — superquadric eps arrays
+        # can't be unioned without their own eps, which we don't retain).
+        if eps is None and self._bonesep_done_c:
+            disp_c = np.vstack([*self._bonesep_done_c, centers])
+            disp_r = np.vstack([*self._bonesep_done_r, radii])
+            disp_q = np.vstack([*self._bonesep_done_q, rotations])
         self._pending_visual = (int(step), float(loss),
-                                centers, radii, rotations, None)
+                                disp_c, disp_r, disp_q, eps)
         if self._bonesep_ctl is not None:
-            total = max(1, int(getattr(self, "_batched_total_steps", 1)))
+            total = max(1, int(self._bonesep_fit_kwargs.get("num_steps", 1)))
             self._bonesep_ctl.fit_progress(step / total)
 
-    def _on_batched_prep(self, frac: float, label: str) -> None:
-        self._progress_set(float(frac) * 100.0, f"Batched-Fit · {label}")
+    def _on_region_fit_prep(self, frac: float, label: str) -> None:
+        self._progress_set(float(frac) * 100.0, f"Bone-Fit · {label}")
 
-    def _on_batched_finished(self) -> None:
-        """Worker done: flush the final frame and hand results to the controller."""
+    def _on_region_fit_finished(self) -> None:
+        """One bone done: flush its final frame, hand its ellipsoids back."""
         self._visual_timer.stop()
+        # Fully join the finished worker BEFORE advancing.  Warp's autodiff tape
+        # is process-global, so the next bone's worker must not enter its tape
+        # while this one's thread is still tearing down — otherwise Warp raises
+        # "entering a tape while one is already active".
+        worker = self._region_fit_worker
+        self._region_fit_worker = None
+        if worker is not None:
+            worker.wait()
         self._flush_visual()
-        worker = self._batched_worker
-        if self._bonesep_ctl is not None and worker is not None:
-            self._bonesep_ctl.on_fit_finished(worker.results)
+        self._pending_visual = None     # drop any stray frame a late timer tick
+        self._region_fit_active = False
+        params = self._region_last_params
+        if params is None:
+            c = np.zeros((0, 3), np.float32)
+            r = np.zeros((0, 3), np.float32)
+            q = np.zeros((0, 4), np.float32)
+        else:
+            c, r, q = params
+        self._region_last_params = None
+        # Keep this bone on screen while later bones fit (growing-union display).
+        if len(c):
+            self._bonesep_done_c.append(np.asarray(c, np.float32).reshape(-1, 3))
+            self._bonesep_done_r.append(np.asarray(r, np.float32).reshape(-1, 3))
+            self._bonesep_done_q.append(np.asarray(q, np.float32).reshape(-1, 4))
+        if self._bonesep_ctl is not None:
+            self._bonesep_ctl.on_region_fit_finished(c, r, q)
 
     def _bonesep_complete_gui(self, accum, rm) -> None:
         """GUI completion: show the assembled ellipsoids + bone-local mapping."""
@@ -2128,6 +2406,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if advanced:
             worker_kwargs.update(advanced)
         self._opt_worker = OptimizationWorker(**worker_kwargs)
+        self._opt_worker.set_live_metric(
+            getattr(self, "_active_ellipsoid_metric", "default"))
         self._opt_phase = "global"
         self._pending_visual = None
         self._visual_timer.start()         # decouple GUI refresh from step rate
@@ -2139,9 +2419,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._opt_worker.prep_progress.connect(self._on_opt_prep_progress)
         self._opt_worker.op_events.connect(self._on_opt_op_events)
         self._opt_worker.analysis_regions.connect(self._on_opt_analysis_regions)
+        self._opt_worker.ellipsoid_metrics.connect(self._on_opt_ellipsoid_metrics)
         self._opt_worker.finished.connect(self._on_opt_finished)
         self._viewer.clear_op_gizmos()      # drop markers from a previous run
         self._viewer.clear_analysis_regions()
+        self._viewer.clear_ellipsoid_metrics()
         self._opt_worker.start()
 
         sdf_name = SDF_METHOD_NAMES.get(sdf_mode, "?")
@@ -2229,6 +2511,20 @@ class MainWindow(QtWidgets.QMainWindow):
                     loss=loss, count=int(len(centers)))
             return
 
+        # Sequential Bone Separation: the per-bone OptimizationWorker drives the
+        # render above; the controller owns the progress bars + status line, so
+        # skip the global-fit progress/dashboard bookkeeping below (the dashboard
+        # is never begin()-ed for bone separation → would divide by zero).  Guard
+        # on the controller being live so the gaps BETWEEN bones (when no region
+        # worker is active) are covered too, not just ``_region_fit_active``.
+        if self._region_fit_active or self._bonesep_ctl is not None:
+            if (self._bonesep_is_api and self._api_server is not None
+                    and self._api_job_id is not None):
+                self._api_server.registry.update(
+                    self._api_job_id, step=step, loss=loss,
+                    count=int(len(centers)))
+            return
+
         # Training progress in the status-bar progress bar (step / total).
         phase = getattr(self, "_opt_phase", "global")
         total = getattr(self, "_opt_total_steps", 0)
@@ -2291,6 +2587,23 @@ class MainWindow(QtWidgets.QMainWindow):
         """Show the current densify analysis (over/under/bridging) as
         transparent spheres; toggle with the "Analysis" checkbox."""
         self._viewer.set_analysis_regions(regions)
+
+    def _on_opt_ellipsoid_metrics(self, step: int, metrics) -> None:
+        """Color source for the viewport's per-ellipsoid metric heatmaps."""
+        self._viewer.set_ellipsoid_metrics(metrics)
+
+    def _on_view_ellipsoid_metric_changed(self, metric: str) -> None:
+        """Tell the active optimizer which heatmap metric needs fresh values."""
+        self._active_ellipsoid_metric = metric or "default"
+        for worker in (self._opt_worker, self._region_fit_worker):
+            if worker is not None:
+                try:
+                    worker.set_live_metric(self._active_ellipsoid_metric)
+                except Exception:
+                    pass
+        # Switching to Default should immediately restore the normal material.
+        if self._active_ellipsoid_metric == "default":
+            self._viewer.clear_ellipsoid_metrics()
 
     def _on_opt_region_changed(self, box) -> None:
         """Mark (or clear) the high-res region boxes currently being optimised.
@@ -2433,10 +2746,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ensure_sdf_idle()
         self._sdf.set_mesh(nverts, nfaces)
 
-        # Show the posted rig's skeleton overlaid on the mesh (it would
-        # otherwise be invisible in the Python UI).  The fit itself still runs
-        # flat; bones are re-attached when the result is assembled.
-        self._api_show_rig_bones(self._api_rig, transform)
+        # If Unity supplied rig + skinning, expose it through the normal Rig Mode
+        # panel so saved pose-library clips deform the live Unity mesh itself.
+        # Without skinning data we fall back to a skeleton-only overlay.
+        self._activate_unity_rig_panel(nverts, nfaces, self._api_rig, transform)
+
+        # Make the Unity-pushed mesh appear (and become selected) in the mesh
+        # selector, so the user can switch away and come back to it like a file.
+        self._register_unity_mesh_in_combo(nverts, nfaces, self._api_rig, transform)
 
         self._api_server.registry.update(job_id, state="running")
         self._api_stage = "sdf"
@@ -2471,6 +2788,140 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:                       # malformed rig → skip overlay
             self._viewer.remove_skeleton()
             self._status.showMessage(f"API rig overlay skipped: {e}")
+
+    def _api_build_rigged_mesh(self, verts, faces, rig: dict | None, transform):
+        """Build a RiggedMesh from the live Unity payload in normalized space.
+
+        Unity posts bind-pose vertices in its original mesh space and
+        ``load_and_prepare_arrays`` normalizes them for the viewer/optimizer.
+        The rig panel can only apply saved poses correctly if its skeleton and
+        rest vertices live in that same normalized coordinate frame.  Convert
+        each posted bind-world bone transform into normalized world space, then
+        derive the local bind transform from the posted parent hierarchy.
+        """
+        if not (rig and rig.get("bones")):
+            return None
+        try:
+            joints = np.asarray(rig["boneIndices"]).reshape(len(verts), -1).astype(np.int32)
+            weights = np.asarray(rig["boneWeights"], dtype=np.float32).reshape(len(verts), -1)
+        except Exception as e:
+            raise ValueError(f"bad Unity skinning arrays: {e}") from e
+        if joints.shape != weights.shape:
+            raise ValueError(
+                f"boneIndices {joints.shape} and boneWeights {weights.shape} differ")
+
+        src_bones = list(rig.get("bones") or [])
+        if not src_bones:
+            return None
+        if int(joints.max(initial=0)) >= len(src_bones):
+            raise ValueError("boneIndices reference a missing bone")
+
+        world_norm: list[np.ndarray] = []
+        parents: list[int] = []
+        for i, b in enumerate(src_bones):
+            parent = int(b.get("parent", -1))
+            if parent < 0 or parent >= len(src_bones):
+                parent = -1
+            parents.append(parent)
+
+            pos = np.asarray(b["position"], dtype=np.float64).reshape(3)
+            rot = np.asarray(b["rotation"], dtype=np.float64).reshape(4)
+            pos_norm = (pos - transform.center) * float(transform.scale)
+            world_norm.append(mat4_compose(
+                pos_norm, rot, np.ones(3, dtype=np.float64)))
+
+        bones: list[Bone] = []
+        for i, b in enumerate(src_bones):
+            parent = parents[i]
+            world = world_norm[i]
+            if parent >= 0:
+                local = np.linalg.inv(world_norm[parent]) @ world
+            else:
+                local = world
+            bones.append(Bone(
+                name=str(b.get("name", f"Bone_{i}")),
+                index=i,
+                parent_index=parent,
+                local_bind_transform=local.astype(np.float64),
+                inverse_bind_matrix=np.linalg.inv(world).astype(np.float64),
+            ))
+
+        return RiggedMesh(
+            vertices=np.asarray(verts, dtype=np.float32),
+            faces=np.asarray(faces, dtype=np.int32),
+            skeleton=Skeleton(bones),
+            skin_weights=weights,
+            skin_joints=joints,
+            poses=[Pose.t_pose()],
+            mesh_name="Unity (live)",
+        )
+
+    def _activate_unity_rig_panel(self, verts, faces, rig, transform) -> bool:
+        """Expose Unity live rig to the rig panel so saved poses skin this mesh."""
+        try:
+            rigged = self._api_build_rigged_mesh(verts, faces, rig, transform)
+        except Exception as e:
+            self._status.showMessage(f"Unity rig panel skipped: {e}")
+            rigged = None
+        if rigged is None:
+            self._rig_panel.setChecked(False)
+            self._rig_panel.setVisible(False)
+            self._grp_rig.setVisible(False)
+            self._mesh_settings.set_region_available(False)
+            self._bone_centers = None
+            self._api_show_rig_bones(rig, transform)
+            return False
+
+        self._precomputed_meshes = {}
+        self._pending_pose_mesh = None
+        self._pose_sdf_timer.stop()
+        self._rig_panel.setVisible(True)
+        self._rig_panel.setChecked(True)
+        self._rig_panel.blockSignals(True)
+        self._rig_panel.set_rigged_mesh(rigged)
+        self._rig_panel.blockSignals(False)
+        self._grp_rig.setVisible(True)
+        self._mesh_settings.set_region_available(True)
+        self._bone_centers = self._compute_bone_centers(rigged)
+        self._show_skeleton_for_pose(rigged, None)
+        return True
+
+    def _register_unity_mesh_in_combo(self, verts, faces, rig, transform) -> None:
+        """Add (and select) the in-memory Unity mesh in the mesh selector.
+
+        The mesh isn't a file, so it gets a fixed data key and a loader that
+        re-displays the cached geometry/rig when the user picks it again.  Only
+        the most recent Unity push is kept under this single entry.
+        """
+        key = "::unity-live::"
+        label = "Unity (live)"
+        self._unity_mesh_cache = {
+            "verts": np.asarray(verts), "faces": np.asarray(faces),
+            "rig": rig, "transform": transform,
+        }
+        self._special_mesh_loaders[key] = self._redisplay_unity_mesh
+        self._special_mesh_labels[key] = label
+        idx = self._mesh_combo.findData(key)
+        self._mesh_combo.blockSignals(True)
+        if idx < 0:
+            self._mesh_combo.addItem(label, key)
+            idx = self._mesh_combo.findData(key)
+        self._mesh_combo.setCurrentIndex(idx if idx >= 1 else 0)
+        self._mesh_combo.blockSignals(False)
+
+    def _redisplay_unity_mesh(self) -> None:
+        """Re-show the cached Unity mesh (no re-fit) when re-selected."""
+        c = self._unity_mesh_cache
+        if not c:
+            return
+        verts, faces = c["verts"], c["faces"]
+        self._set_base_mesh(verts, faces)
+        self._viewer.show_mesh(verts, faces)
+        self._ensure_sdf_idle()
+        self._sdf.set_mesh(verts, faces)
+        self._current_mesh_name = "unity-api"
+        self._activate_unity_rig_panel(verts, faces, c.get("rig"), c.get("transform"))
+        self._on_compute_all()
 
     def _api_start_fit(self) -> None:
         """Begin the optimization for the active API job (post SDF compute).

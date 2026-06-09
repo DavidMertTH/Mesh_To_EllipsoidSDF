@@ -52,7 +52,7 @@ class RigModePanel(QtWidgets.QGroupBox):
     autoPipelineRequested = QtCore.Signal()
     exportUnityRequested = QtCore.Signal()
 
-    # Sentinel stored as combo data for the FBX's own animation entry.
+    # Sentinel stored as combo data for the current mesh file's own animation.
     NATIVE = -1
 
     def __init__(self, parent=None, pose_dir: Optional[Path] = None):
@@ -68,7 +68,11 @@ class RigModePanel(QtWidgets.QGroupBox):
         # Pose-library state: poses loaded from disk.
         self._pose_dir: Path = Path(pose_dir) if pose_dir \
             else pose_library.DEFAULT_POSE_DIR
-        self._library_poses: List[Pose] = []
+        self._library_clips: List[pose_library.PoseClip] = []
+        # Library animations/poses are mesh-independent.  Keep the selected
+        # library clip by name so a newly loaded mesh receives the same motion
+        # after the pose files are remapped onto its skeleton.
+        self._selected_library_clip_name: str | None = None
 
         self._build_ui()
 
@@ -96,13 +100,14 @@ class RigModePanel(QtWidgets.QGroupBox):
     def active_poses(self) -> List[Pose]:
         """The pose list currently driving the timeline.
 
-        ``[native Animation]`` selected → the FBX's own animation frames.
+        ``[Mesh Animation]`` selected → the current file's own animation frames.
         A saved pose selected → just that single (one-frame) pose.
         """
         data = self._cmb_source.currentData()
         if data is not None and data != self.NATIVE:
-            if 0 <= data < len(self._library_poses):
-                return [self._library_poses[data]]
+            for clip in self._library_clips:
+                if clip.name == data:
+                    return clip.poses
             return [Pose.t_pose()]
         if self._rigged_mesh is not None:
             return self._rigged_mesh.poses
@@ -139,8 +144,8 @@ class RigModePanel(QtWidgets.QGroupBox):
         src_row.addWidget(QtWidgets.QLabel("Source:"))
         self._cmb_source = QtWidgets.QComboBox()
         self._cmb_source.setToolTip(
-            "Play the animation baked into the FBX, or apply one of the "
-            "saved single-frame poses from the poses/ folder."
+            "Use the current file's baked animation, or apply a mesh-independent "
+            "saved pose from the poses/ folder."
         )
         self._cmb_source.currentIndexChanged.connect(self._on_source_changed)
         src_row.addWidget(self._cmb_source, 1)
@@ -183,6 +188,14 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._btn_save_pose.setEnabled(False)
         self._btn_save_pose.clicked.connect(self._on_save_pose_clicked)
         lib_row.addWidget(self._btn_save_pose)
+
+        self._btn_save_anim = QtWidgets.QPushButton("💾 Save Animation")
+        self._btn_save_anim.setToolTip(
+            "Save the current source as a mesh-independent animation clip."
+        )
+        self._btn_save_anim.setEnabled(False)
+        self._btn_save_anim.clicked.connect(self._on_save_animation_clicked)
+        lib_row.addWidget(self._btn_save_anim)
 
         self._btn_reload_lib = QtWidgets.QPushButton("⟳ Reload Library")
         self._btn_reload_lib.setToolTip("Re-scan the poses/ folder from disk.")
@@ -262,24 +275,29 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._mapper = BoneEllipsoidMapper(rigged_mesh.skeleton)
         self._bone_local = None
 
-        # Load saved poses for this skeleton and rebuild the source dropdown,
-        # defaulting to the FBX's own animation.
-        self._library_poses = pose_library.load_all_poses(
+        # Load saved poses for this skeleton and rebuild the source dropdown.
+        # Library poses are selected by name so the user's current independent
+        # animation/pose choice survives loading a different mesh.
+        self._library_clips = pose_library.load_all_clips(
             rigged_mesh.skeleton, self._pose_dir,
         )
-        self._populate_source_combo(select=self.NATIVE)
+        select = self._selected_library_clip_name
+        if select is not None and not any(c.name == select for c in self._library_clips):
+            select = self.NATIVE
+        self._populate_source_combo(select=select if select is not None else self.NATIVE)
 
         n_bones = rigged_mesh.skeleton.num_bones
 
         self._btn_assign.setEnabled(True)
         self._btn_auto.setEnabled(True)
         self._btn_save_pose.setEnabled(True)
+        self._btn_save_anim.setEnabled(True)
         self._btn_reload_lib.setEnabled(True)
 
         self._lbl_status.setText(
             f"Rig: {rigged_mesh.mesh_name} | "
-            f"{n_bones} bones | {len(rigged_mesh.poses)} FBX poses | "
-            f"{len(self._library_poses)} saved"
+            f"{n_bones} bones | {len(rigged_mesh.poses)} mesh frames | "
+            f"{len(self._library_clips)} library clips"
         )
         self._lbl_status.setStyleSheet("color: green; font-size: 11px;")
 
@@ -363,7 +381,7 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._on_pose_changed(0)
 
     def _populate_source_combo(self, select=None):
-        """Rebuild the source dropdown: [native Animation] + saved poses.
+        """Rebuild the source dropdown: [Mesh Animation] + saved poses.
 
         *select* is the combo data to re-select afterwards (defaults to the
         previously selected entry, falling back to native).
@@ -372,14 +390,17 @@ class RigModePanel(QtWidgets.QGroupBox):
             select = self._cmb_source.currentData()
         self._cmb_source.blockSignals(True)
         self._cmb_source.clear()
-        self._cmb_source.addItem("[native Animation]", self.NATIVE)
-        for i, p in enumerate(self._library_poses):
-            self._cmb_source.addItem(p.name, i)
+        self._cmb_source.addItem("[Mesh Animation]", self.NATIVE)
+        for clip in self._library_clips:
+            label = clip.name if len(clip.poses) == 1 else f"{clip.name} ({len(clip.poses)} frames)"
+            self._cmb_source.addItem(label, clip.name)
         target = self._cmb_source.findData(select)
         self._cmb_source.setCurrentIndex(max(0, target))
         self._cmb_source.blockSignals(False)
 
     def _on_source_changed(self, _index: int):
+        data = self._cmb_source.currentData()
+        self._selected_library_clip_name = None if data == self.NATIVE else str(data)
         self._refresh_slider_for_source()
 
     def reload_library(self):
@@ -387,7 +408,7 @@ class RigModePanel(QtWidgets.QGroupBox):
         if self._rigged_mesh is None:
             return
         prev = self._cmb_source.currentData()
-        self._library_poses = pose_library.load_all_poses(
+        self._library_clips = pose_library.load_all_clips(
             self._rigged_mesh.skeleton, self._pose_dir,
         )
         self._populate_source_combo(select=prev)
@@ -418,12 +439,40 @@ class RigModePanel(QtWidgets.QGroupBox):
             return
         self.reload_library()
         # Select the freshly saved pose in the dropdown.
-        for i, p in enumerate(self._library_poses):
+        for p in (clip.poses[0] for clip in self._library_clips if clip.poses):
             if p.name == name.strip():
-                self._populate_source_combo(select=i)
+                self._populate_source_combo(select=p.name)
                 self._refresh_slider_for_source()
                 break
         self._lbl_bones.setText(f"Saved pose → {path.name}")
+
+    def _on_save_animation_clicked(self):
+        if self._rigged_mesh is None:
+            return
+        poses = list(self.active_poses)
+        if not poses:
+            return
+        default_name = self._cmb_source.currentText().strip()
+        if not default_name or default_name.startswith("["):
+            default_name = f"{self._rigged_mesh.mesh_name}_animation"
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Save Animation", "Animation name:", text=default_name,
+        )
+        if not ok or not name.strip():
+            return
+        try:
+            path = pose_library.save_animation(
+                poses, self._rigged_mesh.skeleton,
+                name.strip(), self._pose_dir,
+            )
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self, "Save Animation", f"Failed to save animation:\n{e}")
+            return
+        self.reload_library()
+        self._populate_source_combo(select=name.strip())
+        self._refresh_slider_for_source()
+        self._lbl_bones.setText(f"Saved animation → {path.name}")
 
     def _on_pose_changed(self, idx: int):
         if self._rigged_mesh is None:

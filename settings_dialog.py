@@ -20,6 +20,7 @@ import app_settings
 class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, values: dict,
                  color_row: QtWidgets.QWidget | None = None,
+                 mode_row: QtWidgets.QWidget | None = None,
                  parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
@@ -56,15 +57,22 @@ class SettingsDialog(QtWidgets.QDialog):
             scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
             tabs.addTab(scroll, tab_title)
 
-        # Appearance tab (theme colours) — embeds the caller's swatch row.
-        if color_row is not None:
+        # Appearance tab — light/dark mode controls + the theme-colour swatches.
+        if color_row is not None or mode_row is not None:
             page = QtWidgets.QWidget()
             pv = QtWidgets.QVBoxLayout(page)
             pv.setContentsMargins(8, 8, 8, 8)
-            box = QtWidgets.QGroupBox("Theme colors")
-            bl = QtWidgets.QVBoxLayout(box)
-            bl.addWidget(color_row)
-            pv.addWidget(box)
+            pv.setSpacing(8)
+            if mode_row is not None:
+                mbox = QtWidgets.QGroupBox("Mode")
+                ml = QtWidgets.QVBoxLayout(mbox)
+                ml.addWidget(mode_row)
+                pv.addWidget(mbox)
+            if color_row is not None:
+                box = QtWidgets.QGroupBox("Theme colors")
+                bl = QtWidgets.QVBoxLayout(box)
+                bl.addWidget(color_row)
+                pv.addWidget(box)
             pv.addStretch(1)
             tabs.addTab(page, "Appearance")
 

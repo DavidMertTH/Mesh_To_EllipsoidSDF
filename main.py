@@ -13,23 +13,8 @@ if sys.stderr is None:
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+import branding
 import theme
-
-_FONT_FILE = Path(__file__).with_name("assets") / "fonts" / "Syne-Bold.ttf"
-
-
-def _load_display_font() -> str:
-    """Register the bundled Syne font and return its family name.
-
-    Falls back to a generic bold sans family name if the file is missing or
-    Qt refuses to load it.
-    """
-    fid = QtGui.QFontDatabase.addApplicationFont(str(_FONT_FILE))
-    if fid != -1:
-        families = QtGui.QFontDatabase.applicationFontFamilies(fid)
-        if families:
-            return families[0]
-    return "Segoe UI"
 
 
 # Logical splash size (device-independent pixels); rendered at SS× for crispness.
@@ -40,6 +25,7 @@ _BLUR_RADIUS = 14  # blur strength (in supersampled px) of the not-yet-loaded pa
 
 def _render_splash_pixmap() -> QtGui.QPixmap:
     """Render the sharp 'EllipSDF' splash artwork to a supersampled pixmap."""
+    return branding.render_splash_pixmap(_SPLASH_W, _SPLASH_H, _SS)
     w, h = _SPLASH_W * _SS, _SPLASH_H * _SS
     pix = QtGui.QPixmap(w, h)
     dark = theme.is_dark_mode()
@@ -208,10 +194,23 @@ def _parse_args() -> argparse.Namespace:
 def main():
     args = _parse_args()
 
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "EllipSDF.MeshToEllipsoidSDF")
+        except Exception:
+            pass
+
     # Create the QApplication with bare PySide6 (cheap) and get the splash on
     # screen *before* touching the heavy imports.  Everything below the
     # splash.show() runs while the loading screen is already visible.
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    app.setWindowIcon(branding.make_sdf_icon())
+
+    # Apply the saved appearance mode (light / dark / sync-with-OS) before the
+    # splash and any widgets are built, so everything starts in the right scheme.
+    theme.apply_mode()
 
     splash = _make_splash()
     splash.show()
@@ -241,6 +240,7 @@ def main():
 
     win = MainWindow(
         progress=lambda f, m="": splash.set_progress(0.35 + 0.62 * f, m or None))
+    win.setWindowIcon(branding.make_sdf_icon())
     win.resize(1400, 1000)
 
     # Start the Unity/HTTP API if requested, now that the window exists.

@@ -228,7 +228,20 @@
       "Bash(.venv/Scripts/python.exe tune_fit_settings.py)",
       "Bash(rm -f _test_merge_collinear.py)",
       "Bash(./.venv/Scripts/python.exe -c \"import optimization; print\\('optimization imports clean'\\)\")",
-      "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('tune_fit_settings.py', encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax ok'\\)\")"
+      "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('tune_fit_settings.py', encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax ok'\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import PySide6; from PySide6 import QtCore; print\\('PySide6', PySide6.__version__\\); print\\('Qt', QtCore.__version__\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('main_window.py', encoding='utf-8-sig'\\).read\\(\\)\\); print\\('main_window syntax ok'\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import py_compile; [py_compile.compile\\(f, doraise=True\\) for f in \\('theme.py','main.py','settings_dialog.py','main_window.py'\\)]; print\\('all compile OK'\\)\")",
+      "Bash(QT_QPA_PLATFORM=offscreen ./.venv/Scripts/python.exe -c ' *)",
+      "Bash(./.venv/Scripts/python.exe -c \"import bonesep_controller, batched_fit; print\\('controller + batched_fit import OK'\\); print\\('host protocol methods present'\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import main_window; mw = main_window.MainWindow; print\\('main_window import OK'\\); print\\('run_region_fit:', hasattr\\(mw, 'run_region_fit'\\)\\); print\\('_on_region_fit_finished:', hasattr\\(mw, '_on_region_fit_finished'\\)\\); print\\('run_batched_fit removed:', not hasattr\\(mw, 'run_batched_fit'\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('optimization.py', encoding='utf-8-sig'\\).read\\(\\)\\); print\\('optimization syntax ok'\\)\")",
+      "Bash(./.venv/Scripts/python.exe _seq_test.py)",
+      "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('optimization.py', encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax ok'\\)\")",
+      "Bash(./.venv/Scripts/python.exe _seq_test2.py)",
+      "Bash(./.venv/Scripts/python.exe -c \"import py_compile; py_compile.compile\\('main_window.py', doraise=True\\); print\\('main_window compiles OK'\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import py_compile; [py_compile.compile\\(f, doraise=True\\) for f in \\('main_window.py','theme.py','main.py','settings_dialog.py'\\)]; print\\('all compile OK'\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import main_window; print\\('import OK'\\)\")"
     ]
   }
 }

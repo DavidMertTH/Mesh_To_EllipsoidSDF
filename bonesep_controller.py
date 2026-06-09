@@ -1,27 +1,29 @@
 """
-bonesep_controller.py — orchestration for parallel (batched) Bone-Separation.
+bonesep_controller.py — orchestration for sequential per-bone Bone-Separation.
 
-The old flow trained bones strictly one-after-another (SDF → fit, SDF → fit …),
-which left the GPU idle most of the time because each small bone underfills it.
-This controller restructures the flow into two clean phases:
+Each bone is fitted on its own, one after another:
 
-    1. PRECOMPUTE  — compute every fit-bone's isolated region SDF (still one at a
-       time, but SDF is the cheap phase) and turn each into a :class:`BoneFitJob`.
-    2. BATCHED FIT — hand ALL jobs to :class:`batched_fit.BatchedFitWorker`, which
-       fits every bone in a single Adam loop (each against its own SDF), so the
-       GPU runs full and the slow phase happens once instead of N times.
+    for each fit-bone:
+        1. compute its isolated region SDF (the cheap phase), then
+        2. fit it with the single-bone ``OptimizationWorker`` against THAT SDF —
+           full maintenance / densify / local-fit / symmetry, never seeing any
+           other bone's SDF.
 
-Symmetry is exploited exactly as before, but cleanly separated here:
+(An earlier revision fitted ALL bones in a single GPU-batched Adam loop via
+``batched_fit.BatchedFitWorker``; it converged poorly and was reverted to this
+sequential flow.  ``batched_fit`` remains in the tree only for ``reflect_ellipsoids``.)
+
+Symmetry:
     * paired (left/right) bones → only the *source* is fitted; the partner is
       derived by reflecting the source's fitted ellipsoids (no SDF, no fit);
-    * on-plane (centre) bones → fitted in the batch, then their result is
-      symmetrised (handled inside the batched worker via ``BoneFitJob.symmetry``).
+    * on-plane (centre) bones → fitted with the single-bone optimizer's own
+      symmetry enforcement enabled.
 
 The controller is deliberately Qt-free: it talks to the application through a
 small *host* object (duck-typed, see :class:`BoneSepHost`) so it can be unit
 tested without a GUI.  The host drives the actual async SDF worker and the
-batched-fit worker and calls back into ``on_sdf_ready`` / ``on_sdf_failed`` /
-``on_fit_finished``.
+per-bone fit worker and calls back into ``on_sdf_ready`` / ``on_sdf_failed`` /
+``fit_progress`` / ``on_region_fit_finished``.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from typing import Protocol
 import numpy as np
 
 from bone_symmetry import detect_mirror_plane, pair_bone_parts
-from batched_fit import BoneFitJob, make_bone_fit_job, reflect_ellipsoids
+from batched_fit import reflect_ellipsoids
 
 
 class BoneSepHost(Protocol):
@@ -39,12 +41,12 @@ class BoneSepHost(Protocol):
 
     All methods are called on the GUI thread.  The async workers the host starts
     must call back into the controller (``on_sdf_ready`` / ``on_sdf_failed`` /
-    ``on_fit_finished``) on the GUI thread too.
+    ``fit_progress`` / ``on_region_fit_finished``) on the GUI thread too.
     """
 
     def compute_region_sdf(self, vertices: np.ndarray, faces: np.ndarray,
                            symmetry: bool) -> None: ...
-    def run_batched_fit(self, jobs: list[BoneFitJob]) -> None: ...
+    def run_region_fit(self, result, part, symmetry) -> None: ...
     def report_overall(self, frac: float, msg: str) -> None: ...
     def report_current(self, frac: float, msg: str) -> None: ...
     def set_status(self, msg: str) -> None: ...
@@ -78,7 +80,6 @@ class BoneSeparationController:
         # Which part indices actually get an SDF + fit (sources + centre + lone).
         self._fit_indices: list[int] = []
         self._cursor = 0                         # progress through _fit_indices
-        self._jobs: list[BoneFitJob] = []        # parallel to _fit_indices
         self._fitted: dict[int, tuple] = {}      # part_index → (c, r, q)
         self._done = False
 
@@ -129,13 +130,16 @@ class BoneSeparationController:
     def _start_next_sdf(self) -> None:
         n = len(self._fit_indices)
         if self._cursor >= n:
-            self._launch_batched_fit()
+            self._finalize()
             return
-        # Precompute spans the first ~40 % of the overall bar; the fit the rest.
-        self._host.report_overall(0.4 * self._cursor / max(1, n),
-                                  f"Gesamt · SDF {self._cursor + 1}/{n}")
+        # Sequential: each bone owns an equal slice of the overall bar.  The SDF
+        # is the cheap head of the slice; the fit (driven by ``fit_progress``)
+        # fills the rest.  One bone is fully fitted before the next bone's SDF is
+        # computed (the GPU-batched all-bones loop was reverted).
         pidx = self._fit_indices[self._cursor]
         part = self._parts[pidx]
+        self._host.report_overall(self._cursor / max(1, n),
+                                  f"Gesamt · Bone {self._cursor + 1}/{n}")
         self._host.report_current(0.0,
                                  f"Region-SDF · Bone {part.bone_index}")
         sym = self._want_symmetry and (pidx in self._center)
@@ -143,23 +147,17 @@ class BoneSeparationController:
 
     # called by the host when the async SDF worker finishes
     def on_sdf_ready(self, result) -> None:
+        """SDF for the current bone is ready → fit THIS bone on its own SDF."""
         if self._done:
             return
         pidx = self._fit_indices[self._cursor]
         part = self._parts[pidx]
         sym = (self._plane if (self._want_symmetry and pidx in self._center)
                else None)
-        job = make_bone_fit_job(
-            bone_index=part.bone_index,
-            grid=result.grid, origin=result.origin, dx=result.dx,
-            nx=result.nx, ny=result.ny, nz=result.nz,
-            budget=int(part.max_budget),
-            thickness=getattr(result, "thickness", None),
-            symmetry=sym, rng=self._rng,
-        )
-        self._jobs.append(job)
-        self._cursor += 1
-        self._start_next_sdf()
+        self._host.set_status(
+            f"Bone Separation: fitting bone {part.bone_index} "
+            f"({self._cursor + 1}/{len(self._fit_indices)}) …")
+        self._host.run_region_fit(result, part, sym)
 
     def on_sdf_failed(self, msg: str) -> None:
         if self._done:
@@ -167,40 +165,32 @@ class BoneSeparationController:
         self._done = True
         self._host.bonesep_failed(f"region SDF failed: {msg}")
 
-    # ── phase 2: batched fit ────────────────────────────────────────────
-    def _launch_batched_fit(self) -> None:
-        if not self._jobs:
-            self._done = True
-            self._host.bonesep_failed("no fittable bone regions")
-            return
-        self._host.report_overall(0.4, "Gesamt · Fit (alle Bones)")
-        self._host.report_current(0.0, "Batched-Fit · alle Bones")
-        self._host.set_status(
-            f"Bone Separation: fitting {len(self._jobs)} bone(s) in parallel …")
-        self._host.run_batched_fit(self._jobs)
-
+    # ── phase 2: sequential per-bone fit ────────────────────────────────
     def fit_progress(self, frac: float) -> None:
-        """Host forwards the batched worker's step fraction (0..1)."""
+        """Host forwards the CURRENT bone's fit step fraction (0..1)."""
+        n = len(self._fit_indices)
         frac = float(np.clip(frac, 0.0, 1.0))
-        self._host.report_overall(0.4 + 0.6 * frac, "Gesamt · Fit (alle Bones)")
-        self._host.report_current(frac, "Batched-Fit · alle Bones")
+        self._host.report_overall((self._cursor + frac) / max(1, n),
+                                  f"Gesamt · Bone {self._cursor + 1}/{n}")
+        self._host.report_current(frac, "Bone-Fit")
 
-    # called by the host when the batched worker finishes
-    def on_fit_finished(self, results: list[tuple]) -> None:
-        """``results`` = ordered ``[(bone_index, c, r, q), ...]`` from the worker.
+    # called by the host when the current bone's OptimizationWorker finishes
+    def on_region_fit_finished(self, centers, radii, rots) -> None:
+        """Store the current bone's fitted ellipsoids, then fit the next bone."""
+        if self._done:
+            return
+        pidx = self._fit_indices[self._cursor]
+        self._fitted[pidx] = (np.asarray(centers, np.float32).reshape(-1, 3),
+                              np.asarray(radii, np.float32).reshape(-1, 3),
+                              np.asarray(rots, np.float32).reshape(-1, 4))
+        self._cursor += 1
+        self._start_next_sdf()
 
-        Worker order matches ``self._jobs`` order, which matches
-        ``self._fit_indices`` order, so we can map each result back to its part.
-        """
+    def _finalize(self) -> None:
+        """All fit-bones done: reflect mirror partners and hand back the union."""
         if self._done:
             return
         self._done = True
-
-        for k, (_, c, r, q) in enumerate(results):
-            pidx = self._fit_indices[k]
-            self._fitted[pidx] = (np.asarray(c, np.float32).reshape(-1, 3),
-                                  np.asarray(r, np.float32).reshape(-1, 3),
-                                  np.asarray(q, np.float32).reshape(-1, 4))
 
         acc_c, acc_r, acc_q, acc_b = [], [], [], []
         for pidx, part in enumerate(self._parts):

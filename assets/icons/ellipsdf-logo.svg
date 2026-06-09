@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 220" role="img" aria-label="EllipSDF logo">
+  <defs>
+    <linearGradient id="bg" x1="20" y1="20" x2="180" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#171b25"/>
+      <stop offset="1" stop-color="#252b38"/>
+    </linearGradient>
+    <linearGradient id="ellipsoid" x1="107" y1="63" x2="174" y2="153" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffe66b"/>
+      <stop offset="0.58" stop-color="#ffc22e"/>
+      <stop offset="1" stop-color="#ff9f1a"/>
+    </linearGradient>
+    <linearGradient id="mesh" x1="38" y1="64" x2="116" y2="150" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2bd3ff"/>
+      <stop offset="1" stop-color="#396cff"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="18" y="18" width="184" height="184" rx="40" fill="url(#bg)"/>
+  <path d="M52 72 L96 54 L116 91 L98 142 L49 156 L34 110 Z"
+        fill="none" stroke="url(#mesh)" stroke-width="9" stroke-linejoin="round"/>
+  <path d="M52 72 L98 142 M96 54 L49 156 M34 110 L116 91"
+        fill="none" stroke="#7de7ff" stroke-width="4.5" stroke-linecap="round" opacity="0.82"/>
+  <circle cx="52" cy="72" r="6.5" fill="#76eaff"/>
+  <circle cx="96" cy="54" r="6" fill="#76eaff"/>
+  <circle cx="116" cy="91" r="6.5" fill="#76eaff"/>
+  <circle cx="98" cy="142" r="6.5" fill="#76eaff"/>
+  <circle cx="49" cy="156" r="6" fill="#76eaff"/>
+  <circle cx="34" cy="110" r="6" fill="#76eaff"/>
+  <ellipse cx="140" cy="108" rx="42" ry="64" transform="rotate(25 140 108)"
+           fill="url(#ellipsoid)" stroke="#fff2a6" stroke-width="5"/>
+  <ellipse cx="140" cy="108" rx="17" ry="61" transform="rotate(25 140 108)"
+           fill="none" stroke="#fff4b8" stroke-width="3.2" opacity="0.65"/>
+  <path d="M102 86 C125 71 158 73 181 92 M99 112 C129 96 165 101 188 123 M106 137 C132 126 163 129 181 148"
+        fill="none" stroke="#fff4b8" stroke-width="3.2" stroke-linecap="round" opacity="0.48"/>
+
+  <text x="238" y="135" font-family="Syne, Segoe UI, Arial, sans-serif"
+        font-size="72" font-weight="800" letter-spacing="0" fill="#2bd3ff">Ellip</text>
+  <text x="425" y="135" font-family="Syne, Segoe UI, Arial, sans-serif"
+        font-size="72" font-weight="800" letter-spacing="0" fill="#ffc22e">SDF</text>
+  <text x="242" y="166" font-family="Segoe UI, Arial, sans-serif"
+        font-size="20" font-weight="500" fill="#8893a7">Mesh to Ellipsoid SDF</text>
+</svg>

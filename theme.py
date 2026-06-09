@@ -85,14 +85,87 @@ def set_secondary(rgb: tuple) -> None:
 
 
 # ── Light / dark mode ─────────────────────────────────────────────────────────
+#
+# The appearance MODE is one of:
+#   "system" — follow the operating system's light/dark setting (the default);
+#   "dark"   — force dark;
+#   "light"  — force light.
+#
+# It is applied to the running app through Qt's colour-scheme hint
+# (``QStyleHints.setColorScheme``), which makes the native style rebuild the
+# palette.  Every widget that reads :func:`is_dark_mode` (the 3-D viewport, the
+# plots, the colormaps, the custom-styled widgets) then re-themes via the
+# ``ApplicationPaletteChange`` event handled in ``MainWindow.changeEvent``.
 
-def is_dark_mode() -> bool:
-    """True if the app palette is dark.  Defaults to dark if no app exists yet."""
-    from PySide6 import QtGui, QtWidgets
+VALID_MODES = ("system", "dark", "light")
+MODE = "system"
+_MODE_FILE = Path(__file__).with_name("theme_mode.json")
+
+
+def apply_mode(mode: str | None = None) -> None:
+    """Apply (and optionally set) the appearance *mode* on the running app.
+
+    Safe to call before a ``QApplication`` exists — it just records the mode so
+    the next :func:`apply_mode` (once the app is up) takes effect.
+    """
+    global MODE
+    if mode is not None:
+        MODE = mode if mode in VALID_MODES else "system"
+    from PySide6 import QtCore, QtWidgets
     app = QtWidgets.QApplication.instance()
     if app is None:
-        return True
+        return
+    scheme = {
+        "dark": QtCore.Qt.ColorScheme.Dark,
+        "light": QtCore.Qt.ColorScheme.Light,
+        "system": QtCore.Qt.ColorScheme.Unknown,
+    }.get(MODE, QtCore.Qt.ColorScheme.Unknown)
+    try:
+        app.styleHints().setColorScheme(scheme)
+    except Exception:
+        pass
+
+
+def is_dark_mode() -> bool:
+    """True if the *effective* appearance is dark.
+
+    Prefers Qt's resolved colour scheme (which turns OS-sync into the real
+    current scheme); falls back to the palette lightness, then to the saved
+    MODE when no app exists yet."""
+    from PySide6 import QtCore, QtGui, QtWidgets
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return MODE != "light"          # default dark unless light was chosen
+    try:
+        scheme = app.styleHints().colorScheme()
+        if scheme == QtCore.Qt.ColorScheme.Dark:
+            return True
+        if scheme == QtCore.Qt.ColorScheme.Light:
+            return False
+    except Exception:
+        pass
     return app.palette().color(QtGui.QPalette.Window).lightness() < 128
+
+
+def save_mode() -> None:
+    """Persist the current appearance MODE to disk (best effort)."""
+    try:
+        _MODE_FILE.write_text(json.dumps({"mode": MODE}), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_mode() -> str:
+    """Restore the saved appearance MODE (called at import); returns it."""
+    global MODE
+    try:
+        data = json.loads(_MODE_FILE.read_text(encoding="utf-8"))
+        m = data.get("mode")
+        if m in VALID_MODES:
+            MODE = m
+    except Exception:
+        pass
+    return MODE
 
 
 def bg(dark: tuple = (0, 0, 0)) -> tuple:
@@ -137,3 +210,8 @@ def load_colors() -> None:
 # Apply any persisted colours as soon as the module is imported, so every widget
 # is built with the user's choice from the start.
 load_colors()
+
+# Restore the saved appearance mode too (light/dark/system).  It can only be
+# *applied* once a QApplication exists, so the startup code calls apply_mode()
+# right after creating the app; here we just load the stored value.
+load_mode()

@@ -9,6 +9,7 @@ Robust loading with fallback strategies:
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import trimesh
@@ -49,6 +50,10 @@ def _load_robust(path: str) -> trimesh.Trimesh | trimesh.Scene:
     Strategy 2: force="mesh"   — uses built-in per-format loaders (PLY, STL, OBJ, …)
     Strategy 3: no force       — let trimesh auto-detect
     """
+    p = Path(path)
+    if p.suffix.lower() == ".fbx":
+        return _load_fbx_static_mesh(p)
+
     errors: list[str] = []
 
     # Strategy 1: scene (best for multi-geometry)
@@ -72,6 +77,33 @@ def _load_robust(path: str) -> trimesh.Trimesh | trimesh.Scene:
     raise ValueError(
         f"Could not load mesh from '{path}'.\n"
         + "\n".join(f"  - {err}" for err in errors)
+    )
+
+
+def _load_fbx_static_mesh(path: Path) -> trimesh.Trimesh:
+    """Load FBX mesh geometry through the local parser.
+
+    trimesh does not provide an FBX loader in this environment. Rigged FBX
+    files are handled before this path by rig_loader; this fallback keeps
+    static or partially rigged FBX assets usable.
+    """
+    try:
+        from fbx_parser import extract_rig_data
+
+        rig = extract_rig_data(path)
+    except Exception as e:
+        raise ValueError(f"Could not parse FBX '{path}': {e}") from e
+
+    if rig.mesh is None or len(rig.mesh.vertices) == 0 or len(rig.mesh.faces) == 0:
+        raise ValueError(
+            f"No triangle mesh found in '{path}'. "
+            "Try re-exporting as binary FBX with mesh geometry."
+        )
+
+    return trimesh.Trimesh(
+        vertices=rig.mesh.vertices.astype(np.float32, copy=False),
+        faces=rig.mesh.faces.astype(np.int32, copy=False),
+        process=False,
     )
 
 

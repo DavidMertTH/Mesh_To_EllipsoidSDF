@@ -216,7 +216,8 @@ class Pose:
 class Skeleton:
     """Ordered bone hierarchy with forward kinematics.
 
-    Bones must be in topological order (parent before child).
+    Bone indices are stable and may come from external runtimes such as Unity.
+    Parent indices do not have to be topologically sorted.
     """
 
     def __init__(self, bones: List[Bone]):
@@ -249,18 +250,39 @@ class Skeleton:
         """
         B = self.num_bones
         world = np.zeros((B, 4, 4), dtype=np.float64)
+        done = np.zeros(B, dtype=bool)
+        visiting = np.zeros(B, dtype=bool)
 
-        for i, bone in enumerate(self.bones):
+        def _local_for(i: int) -> np.ndarray:
+            bone = self.bones[i]
             # Local transform: pose override or bind default
             if pose is not None and i in pose.bone_locals:
-                local = pose.bone_locals[i].astype(np.float64)
-            else:
-                local = bone.local_bind_transform.astype(np.float64)
+                return pose.bone_locals[i].astype(np.float64)
+            return bone.local_bind_transform.astype(np.float64)
 
-            if bone.parent_index < 0:
+        def _compute(i: int) -> np.ndarray:
+            if done[i]:
+                return world[i]
+            if visiting[i]:
+                # Malformed/cyclic hierarchy: keep the bone usable as a root
+                # instead of poisoning the whole pose.
+                world[i] = _local_for(i)
+                done[i] = True
+                return world[i]
+            visiting[i] = True
+            bone = self.bones[i]
+            local = _local_for(i)
+            pi = int(bone.parent_index)
+            if pi < 0 or pi >= B or pi == i:
                 world[i] = local
             else:
-                world[i] = world[bone.parent_index] @ local
+                world[i] = _compute(pi) @ local
+            visiting[i] = False
+            done[i] = True
+            return world[i]
+
+        for i in range(B):
+            _compute(i)
 
         return world
 

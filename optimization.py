@@ -1341,6 +1341,7 @@ class OptimizationWorker(QtCore.QThread):
     prep_progress    = QtCore.Signal(float, str)  # (0..1, label) pre-training setup
     op_events        = QtCore.Signal(int, object)  # (step, [(op:str, center:(3,), radius:float), ...])
     analysis_regions = QtCore.Signal(int, object)  # (step, {'over'|'under'|'bridge': [(center, radius), ...]})
+    ellipsoid_metrics = QtCore.Signal(int, object)  # (step, {metric_name: np.ndarray(N,)})
     finished         = QtCore.Signal()
 
     DEFAULT_BATCH_FRACTION = 0.125
@@ -1482,6 +1483,26 @@ class OptimizationWorker(QtCore.QThread):
         # before it counts means a floor of rel_threshold·(1+sw_max).
         self._analysis_min_severity = (
             self._underrep_rel_threshold * (1.0 + float(self._surface_weight)))
+        self._live_metric = "default"
+        self._last_metric_emit_step = -10**9
+        # Local fit refines the worst-fitting regions.  When SuperFit is the
+        # driver it reuses the densify/analysis regions (severity ≥ the floor
+        # above).  But local fit can be enabled WITHOUT SuperFit, or run after the
+        # densify window has closed — in those cases there are no densify regions,
+        # so local fit detects its OWN worst regions here.  The floor is ~0 (any
+        # voxel missed by ≥ half a voxel qualifies) so it always picks the top-K
+        # worst regions and therefore fires throughout its window regardless of
+        # when the window opens — not only early in training when the still-coarse
+        # global fit happens to leave a high-severity region.  ``k`` bounds the
+        # per-cycle high-res box fits.  Without this, local fit silently no-ops as
+        # soon as the global fit has converged below the analysis severity floor.
+        self._local_fit_region_k = 8
+        self._local_fit_min_severity = 0.0
+        # Local fit should spend its expensive high-res boxes on delicate
+        # structures.  The value is the exponent for a thickness-based ranking
+        # boost in ``_detect_worst_regions``: thin regions rise, thick torso-like
+        # regions fall back unless their miss is overwhelmingly worse.
+        self._local_fit_thin_preference = 2.0
         # SuperFit region detection (the only n³ cost per cycle) runs on a
         # resolution-capped copy of the target grid so its cost is independent
         # of the global grid n.  Longest axis of the detection grid ≤ this cap;
@@ -1497,6 +1518,7 @@ class OptimizationWorker(QtCore.QThread):
         self._split_size_factor = split_size_factor
         self._min_split_radius_vox = min_split_radius_vox
         self._bridge_min_outside = bridge_min_outside
+        self._bridge_margin_thickness_frac = 0.08
         self._fuse_per_round = fuse_per_round
         self._fuse_overlap_frac = fuse_overlap_frac
         self._fuse_samples = fuse_samples
@@ -1535,6 +1557,8 @@ class OptimizationWorker(QtCore.QThread):
         self._thin_max_factor = thin_max_factor
         self._thin_sample_bias = thin_sample_bias
         self._thickness_flat = None     # dilated flat thickness (built lazily)
+        self._thickness_margin_np = None
+        self._thickness_margin_source_id = None
         self._flat_weight = flat_weight
         self._flat_min_ratio = flat_min_ratio
         # Hard-delete thresholds for degenerate shapes during SuperFit (axis
@@ -1632,12 +1656,45 @@ class OptimizationWorker(QtCore.QThread):
     def request_stop(self):
         self._stop_flag = True
 
+    @staticmethod
+    def _reset_stale_tape():
+        """Drop a leftover process-global Warp autodiff tape, if any.
+
+        Warp's tape lives on ``context.runtime.tape`` (one per process).  If a
+        previous worker was torn down while a tape was active, the next worker's
+        first ``with tape:`` raises "entering a tape while one is already
+        active" — and stays broken for the rest of the session.  We serialise
+        workers (only one runs at a time), so a tape found active *here* is
+        always stale and safe to clear, which self-heals such a session.
+        """
+        try:
+            import warp as wp
+            rt = None
+            for base in (wp, getattr(wp, "_src", None)):
+                ctx = getattr(base, "context", None) if base is not None else None
+                if ctx is not None and getattr(ctx, "runtime", None) is not None:
+                    rt = ctx.runtime
+                    break
+            if rt is not None and getattr(rt, "tape", None) is not None:
+                rt.tape = None
+        except Exception:
+            pass
+
     def run(self):
-        if self._method == "adam":
-            self._run_adam()
-        else:
-            self._run_naive()
-        self.finished.emit()
+        # Always emit ``finished`` (even on error) so the host's pipeline — e.g.
+        # sequential Bone-Separation — advances instead of hanging on a failed
+        # bone.  Clear any stale global tape before starting (see above).
+        try:
+            self._reset_stale_tape()
+            if self._method == "adam":
+                self._run_adam()
+            else:
+                self._run_naive()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.finished.emit()
 
     # ── shape constraint (sphere) ─────────────────────────────────────
 
@@ -1699,6 +1756,7 @@ class OptimizationWorker(QtCore.QThread):
                 b_np = pred_bend.numpy().reshape(-1, 2).copy()
                 e_np = np.concatenate([e_np, b_np], axis=1)
         self.step_visual.emit(step, loss_val, c_np, r_np, q_np, e_np)
+        self._emit_live_metric_if_needed(step, c_np, r_np, q_np)
 
         # NB: the per-step ellipsoid-SDF grid + under-rep used to be computed
         # here and emitted via ``step_sdf`` for an ellipsoid slice view.  That
@@ -1706,6 +1764,42 @@ class OptimizationWorker(QtCore.QThread):
         # is a no-op — computing the n³ grid every report_every·10 steps was
         # pure wasted work (costly on CPU especially) and has been dropped.
         # The spawn/maintenance path computes its own under-rep independently.
+
+    def set_live_metric(self, metric: str) -> None:
+        self._live_metric = str(metric or "default")
+
+    def _emit_live_metric_if_needed(
+        self,
+        step: int,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        rotations: np.ndarray,
+    ) -> None:
+        metric = getattr(self, "_live_metric", "default")
+        if metric == "default" or self.signalsBlocked():
+            return
+        cheap = {"bridging", "too_large", "redundant", "coverage", "unique_coverage"}
+        if metric in cheap:
+            every = max(1, int(self._report_every))
+            regions = None
+        elif metric == "too_small":
+            # Region detection builds an SDF prediction; keep it live, but not
+            # every frame.  Still typically much more frequent than maintenance.
+            every = max(50, int(self._report_every) * 3)
+            if step - getattr(self, "_last_metric_emit_step", -10**9) < every:
+                return
+            with self._detection_grid_scope():
+                regions = self._detect_worst_regions(
+                    centers, radii, rotations, self._analysis_region_k,
+                    min_severity=self._analysis_min_severity)
+        else:
+            return
+        if step - getattr(self, "_last_metric_emit_step", -10**9) < every:
+            return
+        metrics = self._compute_ellipsoid_quality_metrics(
+            centers, radii, rotations, regions, only={metric})
+        self._last_metric_emit_step = int(step)
+        self.ellipsoid_metrics.emit(step, {metric: metrics.get(metric)})
 
     # ── buffer allocation ─────────────────────────────────────────────
 
@@ -2381,7 +2475,8 @@ class OptimizationWorker(QtCore.QThread):
             shape=(self._nx, self._ny, self._nz))
 
     def _detect_worst_regions(self, centers, radii, rotations, k,
-                              min_severity: float = 0.0):
+                              min_severity: float = 0.0,
+                              thin_preference: float = 0.0):
         """Find up to ``k`` *spatially-separated* under-represented regions.
 
         Greedy peak picking on the severity grid: take the argmax, record its
@@ -2392,12 +2487,20 @@ class OptimizationWorker(QtCore.QThread):
           - ``pool_flat``   : flat voxel indices of the local interior pool
           - ``seed_depth``  : local feature thickness at the seed (|target|)
           - ``severity``    : peak severity value
+          - ``rank_score``  : score used for greedy picking
+          - ``seed_thickness``: local feature thickness at the seed, if known
 
         ``min_severity`` stops the search as soon as the next-worst peak falls
         below it (severity = relative miss × surface emphasis).  The grid assigns
         a non-zero severity to *any* voxel missed by ≥ half a voxel, so without a
         floor the picker keeps surfacing marginal, essentially-covered regions;
         the floor restricts it to genuinely under-represented ones.
+
+        ``thin_preference`` only changes the ranking, not the underlying
+        severity threshold.  With a thickness grid present, scores are multiplied
+        by ``(median_thickness / local_thickness) ** thin_preference``.  This
+        pushes local fit toward fingers, tails, ears, etc. and away from large
+        thick masses such as a torso/belly.
         """
         nx, ny, nz = self._nx, self._ny, self._nz
         dx, origin = self._dx, self._origin
@@ -2411,8 +2514,21 @@ class OptimizationWorker(QtCore.QThread):
             thickness_grid=self._thickness_np,
             min_thickness_vox=self._underrep_min_thickness_vox,
         )
-        flat_sev = sev.ravel()                 # view: suppression below edits sev
+        flat_sev = sev.ravel()
         flat_target = self._sdf_target_np.ravel()
+        flat_thick = (self._thickness_np.ravel()
+                      if self._thickness_np is not None else None)
+        pick_grid = sev.copy()
+        flat_pick = pick_grid.ravel()          # view: suppression below edits pick_grid
+        if flat_thick is not None and float(thin_preference) > 0.0:
+            valid = (flat_thick > 0.0) & (flat_target < 0.0)
+            if np.any(valid):
+                ref = float(np.median(flat_thick[valid]))
+                if ref > 1e-12:
+                    thick = np.maximum(flat_thick, float(dx))
+                    boost = (ref / thick) ** float(thin_preference)
+                    boost = np.clip(boost, 0.05, 8.0).astype(np.float32)
+                    flat_pick *= boost
         radius = float(self._region_radius_vox)
 
         def _ball_flat(cx, cy, cz, r):
@@ -2433,9 +2549,10 @@ class OptimizationWorker(QtCore.QThread):
         regions = []
         floor = max(0.0, float(min_severity))
         for _ in range(int(k)):
-            seed_flat = int(np.argmax(flat_sev))
+            seed_flat = int(np.argmax(flat_pick))
+            rank_peak = float(flat_pick[seed_flat])
             peak = float(flat_sev[seed_flat])
-            if peak <= floor:
+            if rank_peak <= 0.0 or peak <= floor:
                 break
             siz, siy, six = np.unravel_index(seed_flat, self._shape)
             seed_world = (origin.astype(np.float32)
@@ -2451,10 +2568,15 @@ class OptimizationWorker(QtCore.QThread):
                 pool_flat=pool_flat.astype(np.int32),
                 seed_depth=float(abs(flat_target[seed_flat])),
                 severity=peak,
+                rank_score=rank_peak,
+                seed_thickness=(None if flat_thick is None
+                                else float(flat_thick[seed_flat])),
             ))
 
             # Suppress a wider ball so the next seed is a different region.
-            flat_sev[_ball_flat(six, siy, siz, radius * 2.0)] = 0.0
+            sup = _ball_flat(six, siy, siz, radius * 2.0)
+            flat_sev[sup] = 0.0
+            flat_pick[sup] = 0.0
 
         return regions
 
@@ -2547,6 +2669,29 @@ class OptimizationWorker(QtCore.QThread):
         hi = np.array([self._nx - 1, self._ny - 1, self._nz - 1])
         ijk = np.clip(np.floor(q).astype(np.int64), 0, hi)
         return float(grid[ijk[2], ijk[1], ijk[0]])
+
+    def _bridge_margin_values(self, ijk: np.ndarray, base_margin: float) -> np.ndarray | float:
+        """Per-sample outside margin for bridging tests.
+
+        The floor is the old voxel-noise margin.  Where a local-thickness field
+        exists, thick regions get a proportionally wider tolerance, while thin
+        regions stay sensitive.  The thickness map is lightly dilated so samples
+        just outside the mesh inherit nearby feature thickness instead of zero.
+        """
+        thick = self._thickness_np
+        if thick is None:
+            return float(base_margin)
+        source_id = id(thick)
+        if (self._thickness_margin_np is None
+                or self._thickness_margin_np.shape != thick.shape
+                or self._thickness_margin_source_id != source_id):
+            self._thickness_margin_np = dilate_zeros(thick, iters=2).astype(np.float32)
+            self._thickness_margin_source_id = source_id
+        th = self._thickness_margin_np[ijk[:, 2], ijk[:, 1], ijk[:, 0]]
+        return np.maximum(
+            float(base_margin),
+            float(self._bridge_margin_thickness_frac) * th,
+        ).astype(np.float32)
 
     def _interior_ball_pool(self, world_center: np.ndarray, radius_vox: float) -> np.ndarray:
         """Flat indices of interior voxels within ``radius_vox`` of a world point."""
@@ -2665,7 +2810,8 @@ class OptimizationWorker(QtCore.QThread):
             ijk = np.clip(np.floor(q).astype(np.int64), 0,
                           np.array([self._nx - 1, self._ny - 1, self._nz - 1]))
             vals = target[ijk[:, 2], ijk[:, 1], ijk[:, 0]]
-            outside_frac = float(np.mean(vals > margin))
+            margins = self._bridge_margin_values(ijk, margin)
+            outside_frac = float(np.mean(vals > margins))
             if outside_frac < float(self._bridge_min_outside):
                 continue
             # Must be oversized vs. the local feature thickness, so a small
@@ -2686,6 +2832,109 @@ class OptimizationWorker(QtCore.QThread):
             return np.array([], dtype=int)
         order = np.argsort(-np.asarray(scores))
         return np.asarray(idx, dtype=int)[order]
+
+    def _compute_ellipsoid_quality_metrics(
+        self,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        rotations: np.ndarray,
+        regions: list | None = None,
+        only: set[str] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Per-ellipsoid scalar diagnostics used by the viewport heatmap.
+
+        Values are raw scores; the viewer normalises them for display.  Higher
+        means "more of this thing" for every metric.
+        """
+        n_ell = len(centers)
+        zeros = np.zeros(n_ell, dtype=np.float32)
+        requested = set(only) if only is not None else {
+            "bridging", "too_large", "too_small",
+            "redundant", "coverage", "unique_coverage",
+        }
+        if n_ell == 0:
+            return {k: zeros for k in requested}
+
+        target = self._sdf_target_np
+        dx = float(self._dx)
+        margin = float(self._split_margin_vox) * dx
+        min_r = float(self._min_split_radius_vox) * dx
+
+        bridging = np.zeros(n_ell, dtype=np.float32)
+        origin = self._origin.astype(np.float32)
+        hi = np.array([self._nx - 1, self._ny - 1, self._nz - 1])
+        if "bridging" in requested:
+            unit = self._unit_ball_samples()
+            for i in range(n_ell):
+                r = radii[i].astype(np.float32)
+                if float(np.max(r)) < min_r:
+                    continue
+                Rm = _quat_to_rot_matrix(rotations[i]).astype(np.float32)
+                pts = centers[i].astype(np.float32) + (unit * r) @ Rm.T
+                q = (pts - origin) / dx
+                ijk = np.clip(np.floor(q).astype(np.int64), 0, hi)
+                vals = target[ijk[:, 2], ijk[:, 1], ijk[:, 0]]
+                margins = self._bridge_margin_values(ijk, margin)
+                bridging[i] = float(np.mean(vals > margins))
+
+        too_large = np.zeros(n_ell, dtype=np.float32)
+        if "too_large" in requested:
+            f = max(float(self._split_size_factor), 1.0 + 1e-6)
+            rel_thresh = 1.0 - 1.0 / f
+            for i in range(n_ell):
+                c = centers[i].astype(np.float32)
+                r = radii[i].astype(np.float32)
+                if float(np.max(r)) < min_r:
+                    continue
+                Rm = _quat_to_rot_matrix(rotations[i]).astype(np.float32)
+                protr = 0.0
+                for k in range(3):
+                    rk = float(r[k])
+                    if rk <= 0.0:
+                        continue
+                    axis = Rm[:, k]
+                    for s in (1.0, -1.0):
+                        t = self._grid_value(target, c + s * rk * axis)
+                        if t > margin and (t / rk) > rel_thresh:
+                            protr = max(protr, t / rk)
+                too_large[i] = float(protr)
+
+        too_small = np.zeros(n_ell, dtype=np.float32)
+        if "too_small" in requested and regions and len(centers) > 0:
+            cen = np.asarray(centers, dtype=np.float32)
+            for reg in regions:
+                seed = np.asarray(reg.get("seed_world"), dtype=np.float32)
+                if seed.shape != (3,):
+                    continue
+                idx = int(np.argmin(np.linalg.norm(cen - seed[None, :], axis=1)))
+                too_small[idx] = max(too_small[idx], float(reg.get("severity", 0.0)))
+
+        redundant = np.zeros(n_ell, dtype=np.float32)
+        coverage = np.zeros(n_ell, dtype=np.float32)
+        unique = np.zeros(n_ell, dtype=np.float32)
+        if requested & {"redundant", "coverage", "unique_coverage"}:
+            try:
+                cov = self._compute_coverage_info(centers, radii, rotations)
+                if cov.get("valid"):
+                    sample_n = max(1, int(cov["is_inside"].shape[1]))
+                    total = cov["total_coverage"].astype(np.float32)
+                    uniq = cov["unique_coverage"].astype(np.float32)
+                    coverage = (total / sample_n).astype(np.float32)
+                    unique = (uniq / sample_n).astype(np.float32)
+                    redundant = (1.0 - (uniq / np.maximum(total, 1.0))).astype(np.float32)
+                    redundant[total <= 0.0] = 1.0
+            except Exception:
+                pass
+
+        out = {
+            "bridging": bridging,
+            "too_large": too_large,
+            "too_small": too_small,
+            "redundant": redundant,
+            "coverage": coverage,
+            "unique_coverage": unique,
+        }
+        return {k: out[k] for k in requested if k in out}
 
     def _split_ellipsoid(self, c, r, q):
         """Halve an ellipsoid along its longest axis → two child ellipsoids.
@@ -2798,6 +3047,190 @@ class OptimizationWorker(QtCore.QThread):
             rad = np.cbrt(rng.random(m)).astype(np.float32)[:, None]
             self._fuse_unit_pts = (dirs * rad).astype(np.float32)
         return self._fuse_unit_pts
+
+    def _grid_points_from_flat(self, flat_idx: np.ndarray) -> np.ndarray:
+        """World-space voxel centres for flat target-grid indices."""
+        flat_idx = np.asarray(flat_idx, dtype=np.int64).reshape(-1)
+        if flat_idx.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+        iz, iy, ix = np.unravel_index(flat_idx, self._shape)
+        return (self._origin.astype(np.float32)
+                + (np.stack([ix, iy, iz], axis=1).astype(np.float32) + 0.5)
+                * float(self._dx)).astype(np.float32)
+
+    def _critical_grid_points_for_indices(
+        self,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        rotations: np.ndarray,
+        indices,
+        max_points: int = 256,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Local target-grid samples that a merge/fuse is not allowed to hurt.
+
+        Candidate points are mesh interior + surface-band voxels inside the
+        affected ellipsoid(s).  Ranking prefers thin features, near-surface
+        voxels and points uniquely covered by the affected set.  This avoids the
+        old failure mode where random/local-volume checks were dominated by thick
+        body mass while fingers or other small features lost their owner.
+        """
+        idx = [int(i) for i in np.atleast_1d(indices)]
+        if not idx:
+            return (np.empty((0, 3), dtype=np.float32),
+                    np.empty((0,), dtype=np.float32))
+
+        max_r = np.max(np.abs(radii[idx]), axis=1)
+        lo = np.min(centers[idx].astype(np.float32) - max_r[:, None], axis=0)
+        hi = np.max(centers[idx].astype(np.float32) + max_r[:, None], axis=0)
+        pad = max(2.0 * float(self._dx), 0.25 * float(np.max(max_r)))
+        lo -= pad
+        hi += pad
+
+        q0 = np.floor((lo - self._origin) / float(self._dx)).astype(np.int64)
+        q1 = np.ceil((hi - self._origin) / float(self._dx)).astype(np.int64) + 1
+        q0 = np.clip(q0, 0, np.array([self._nx - 1, self._ny - 1, self._nz - 1]))
+        q1 = np.clip(q1, 1, np.array([self._nx, self._ny, self._nz]))
+        if np.any(q1 <= q0):
+            return (np.empty((0, 3), dtype=np.float32),
+                    np.empty((0,), dtype=np.float32))
+
+        span = np.maximum(q1 - q0, 1)
+        total_cells = int(np.prod(span.astype(np.int64)))
+        max_scan_cells = max(20000, int(max_points) * 64)
+        if total_cells > max_scan_cells:
+            # Large torso-sized candidates can span a huge chunk of the grid.
+            # Probe a deterministic subset before any expensive E×N SDF matrix.
+            seed = 2166136261
+            for v in idx:
+                seed = (seed ^ int(v)) * 16777619 & 0xFFFFFFFF
+            rng = np.random.default_rng(seed)
+            sample_n = int(max_scan_cells)
+            gx = rng.integers(q0[0], q1[0], size=sample_n, dtype=np.int64)
+            gy = rng.integers(q0[1], q1[1], size=sample_n, dtype=np.int64)
+            gz = rng.integers(q0[2], q1[2], size=sample_n, dtype=np.int64)
+            flat = (gz * (self._nx * self._ny) + gy * self._nx + gx).astype(np.int64)
+            flat = np.unique(flat)
+        else:
+            xs = np.arange(q0[0], q1[0], dtype=np.int64)
+            ys = np.arange(q0[1], q1[1], dtype=np.int64)
+            zs = np.arange(q0[2], q1[2], dtype=np.int64)
+            gx, gy, gz = np.meshgrid(xs, ys, zs, indexing="ij")
+            flat = (gz.ravel() * (self._nx * self._ny)
+                    + gy.ravel() * self._nx + gx.ravel()).astype(np.int64)
+        target_flat = self._sdf_target_np.ravel()
+        band = max(float(self._surface_band_vox), 1.0) * float(self._dx)
+        target_vals = target_flat[flat]
+        mesh_mask = target_vals < band
+        if not np.any(mesh_mask):
+            return (np.empty((0, 3), dtype=np.float32),
+                    np.empty((0,), dtype=np.float32))
+
+        flat = flat[mesh_mask]
+        target_vals = target_vals[mesh_mask].astype(np.float32)
+        score = np.ones(len(flat), dtype=np.float32)
+        score *= (1.0 + 3.0 * np.exp(
+            -(target_vals * target_vals) / max((1.5 * float(self._dx)) ** 2, 1e-12)))
+
+        thick = self._thickness_np
+        if thick is not None:
+            th = thick.ravel()[flat].astype(np.float32)
+            valid = th > 0.0
+            if np.any(valid):
+                ref = float(np.median(th[valid]))
+                if ref > 1e-12:
+                    score *= np.clip(ref / np.maximum(th, float(self._dx)),
+                                     0.25, 8.0).astype(np.float32)
+
+        max_affect_eval = max(2048, int(max_points) * 8)
+        if len(flat) > max_affect_eval:
+            order = np.argsort(-score, kind="stable")[:max_affect_eval]
+            flat = flat[order]
+            target_vals = target_vals[order]
+            score = score[order]
+
+        pts = self._grid_points_from_flat(flat)
+        aff_sdf = self._ellipsoid_sdf_np_batch(
+            centers[idx], radii[idx], rotations[idx], pts)
+        affected_inside = np.any(aff_sdf < 0.0, axis=0)
+        if not np.any(affected_inside):
+            return (np.empty((0, 3), dtype=np.float32),
+                    np.empty((0,), dtype=np.float32))
+
+        pts = pts[affected_inside]
+        target_vals = target_vals[affected_inside]
+        flat = flat[affected_inside]
+        score = score[affected_inside]
+
+        max_unique_eval = max(1024, int(max_points) * 4)
+        if len(pts) > max_unique_eval:
+            order = np.argsort(-score, kind="stable")[:max_unique_eval]
+            pts = pts[order]
+            target_vals = target_vals[order]
+            score = score[order]
+
+        all_sdf = self._ellipsoid_sdf_np_batch(centers, radii, rotations, pts)
+        cover = all_sdf < 0.0
+        cover_count = cover.sum(axis=0)
+        affected_only = np.any(cover[idx], axis=0)
+        unique_to_affected = affected_only & (cover_count == 1)
+        score[unique_to_affected] *= 4.0
+
+        if len(pts) > int(max_points):
+            order = np.argsort(-score, kind="stable")[:int(max_points)]
+            pts = pts[order]
+            target_vals = target_vals[order]
+        return pts.astype(np.float32), target_vals.astype(np.float32)
+
+    def _union_sdf_np(self, centers, radii, rotations, pts) -> np.ndarray:
+        if len(centers) == 0:
+            return np.full(len(pts), 1e6, dtype=np.float32)
+        return np.min(self._ellipsoid_sdf_np_batch(
+            centers, radii, rotations, pts), axis=0).astype(np.float32)
+
+    def _critical_replacement_worse(
+        self,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        rotations: np.ndarray,
+        remove_indices,
+        add_centers: np.ndarray | None = None,
+        add_radii: np.ndarray | None = None,
+        add_rotations: np.ndarray | None = None,
+        *,
+        rel_eps: float = 0.03,
+    ) -> bool:
+        """True when a candidate merge/fuse worsens critical local samples."""
+        remove = [int(i) for i in np.atleast_1d(remove_indices)]
+        pts, target = self._critical_grid_points_for_indices(
+            centers, radii, rotations, remove)
+        if len(pts) == 0:
+            return False
+
+        before = self._union_sdf_np(centers, radii, rotations, pts)
+        keep = np.ones(len(centers), dtype=bool)
+        keep[remove] = False
+        after_c = centers[keep]
+        after_r = radii[keep]
+        after_q = rotations[keep]
+        if add_centers is not None and len(add_centers) > 0:
+            after_c = np.vstack([after_c, np.asarray(add_centers, dtype=np.float32)])
+            after_r = np.vstack([after_r, np.asarray(add_radii, dtype=np.float32)])
+            after_q = np.vstack([after_q, np.asarray(add_rotations, dtype=np.float32)])
+        after = self._union_sdf_np(after_c, after_r, after_q, pts)
+
+        before_err = (before - target) ** 2
+        after_err = (after - target) ** 2
+        mean_before = float(np.mean(before_err))
+        mean_after = float(np.mean(after_err))
+        abs_floor = (0.05 * float(self._dx)) ** 2
+        if (mean_after - mean_before) > max(rel_eps * mean_before, abs_floor):
+            return True
+
+        # A small mean can hide a punched hole in a thin feature.  Also guard the
+        # upper tail of the error distribution.
+        p_before = float(np.percentile(before_err, 95))
+        p_after = float(np.percentile(after_err, 95))
+        return (p_after - p_before) > max(0.10 * p_before, (0.10 * float(self._dx)) ** 2)
 
     # ── merge step ──────────────────────────────────────────────────────
 
@@ -3059,6 +3492,10 @@ class OptimizationWorker(QtCore.QThread):
             if self._merge_increases_loss(i, j, c_m, r_m, q_m,
                                           centers, radii, rotations):
                 continue
+            if self._critical_replacement_worse(
+                    centers, radii, rotations, [i, j],
+                    c_m[None, :], r_m[None, :], q_m[None, :]):
+                continue
             consumed.add(i)
             consumed.add(j)
             merged_c.append(c_m)
@@ -3118,6 +3555,10 @@ class OptimizationWorker(QtCore.QThread):
                 if covered.all():
                     break
             if float(covered.mean()) >= thr:
+                if self._critical_replacement_worse(
+                        centers[alive], radii[alive], rotations[alive],
+                        np.where(np.flatnonzero(alive) == i)[0]):
+                    continue
                 alive[i] = False
                 removed.append(int(i))
 
@@ -3328,6 +3769,7 @@ class OptimizationWorker(QtCore.QThread):
                 q = pred_rot_flat.numpy().reshape(-1, 4).copy()
                 self.local_progress.emit(li + 1, self._local_steps)
                 self.step_visual.emit(int(gstep), float(loss.numpy()[0]), c, r, q, None)
+                self._emit_live_metric_if_needed(int(gstep), c, r, q)
 
         wp.synchronize_device(device)
         c = pred_centers.numpy().copy()
@@ -3533,17 +3975,22 @@ class OptimizationWorker(QtCore.QThread):
                 dx=float(res.dx), box_min=bmin, box_max=bmax,
                 extent=float((bmax - bmin).max())))
 
-        mr_all = np.max(np.abs(radii), axis=1)
+        # Tight world-axis half extents of each rotated ellipsoid.  Local fit may
+        # only edit an ellipsoid if this whole AABB is inside the local box.
+        ell_half_ext = np.empty_like(centers, dtype=np.float32)
+        for i in range(len(centers)):
+            Rm = _quat_to_rot_matrix(rotations[i]).astype(np.float32)
+            rr = np.abs(radii[i].astype(np.float32))
+            ell_half_ext[i] = np.sqrt(np.sum((Rm * rr[None, :]) ** 2, axis=1))
         assigned = np.full(len(centers), -1, dtype=int)
         for b, m in enumerate(boxes):
             bmin, bmax = m['box_min'], m['box_max']
-            # Trainable for this box: centre inside AND whole ellipsoid fits (so
-            # fitting against the box SDF will not clip its surface).  First box
-            # wins when boxes overlap.
-            center_in = np.all((centers >= bmin) & (centers <= bmax), axis=1)
-            fits = (np.all(centers - mr_all[:, None] >= bmin, axis=1)
-                    & np.all(centers + mr_all[:, None] <= bmax, axis=1))
-            cand = center_in & fits & (assigned < 0)
+            # Trainable for this box: the full ellipsoid must be inside the
+            # local problem box.  Overlapping/nearby ellipsoids remain frozen
+            # contributors so local fit cannot drag geometry across box borders.
+            fits = (np.all(centers - ell_half_ext >= bmin, axis=1)
+                    & np.all(centers + ell_half_ext <= bmax, axis=1))
+            cand = fits & (assigned < 0)
             assigned[cand] = b
         train_idx = np.where(assigned >= 0)[0]
         if train_idx.size == 0:
@@ -3784,6 +4231,8 @@ class OptimizationWorker(QtCore.QThread):
                     self.step_visual.emit(int(gstep), float(loss.numpy()[0]),
                                           vis_c.copy(), vis_r.copy(), vis_q.copy(),
                                           None)
+                    self._emit_live_metric_if_needed(
+                        int(gstep), vis_c.copy(), vis_r.copy(), vis_q.copy())
 
             # Pull trainables back (refresh world radii from log first).
             wp.launch(_exp_radii_kernel, dim=num_e,
@@ -3951,6 +4400,10 @@ class OptimizationWorker(QtCore.QThread):
                            region_r_world) for reg in viz_regions],
             }
             self.analysis_regions.emit(step, analysis)
+            self.ellipsoid_metrics.emit(
+                step,
+                self._compute_ellipsoid_quality_metrics(
+                    centers, radii, rotations, viz_regions))
 
         n_curr = len(centers)
         # Net additions allowed this cycle.  Zero outside the densify window (or
@@ -4057,16 +4510,37 @@ class OptimizationWorker(QtCore.QThread):
         rotations = np.concatenate([rotations] + child_q, axis=0)
 
         # Local fit with no fresh densify regions (e.g. local window extends past
-        # the densify window, or densify added nothing this cycle): source the
-        # worst regions from the analysis snapshot and re-fit the EXISTING
-        # geometry there.  ``_local_fit_regions`` assigns trainable ellipsoids by
+        # the densify window, densify added nothing this cycle, or SuperFit is
+        # off entirely): source the worst regions to re-fit the EXISTING geometry
+        # there.  ``_local_fit_regions`` assigns trainable ellipsoids by
         # region-box membership, so refitting in place needs no appended children.
-        if local_active and not region_sites and viz_regions:
-            r_radius_world = float(self._region_radius_vox) * float(self._dx)
-            for reg in viz_regions:
-                sc = np.asarray(reg['seed_world'], np.float32).copy()
-                region_sites.append((sc, r_radius_world))
-                pools.append(self._interior_ball_pool(sc, self._region_radius_vox))
+        if local_active and not region_sites:
+            # Local fit is expensive and intended for delicate details.  Do its
+            # own region ranking with a thickness boost instead of reusing the
+            # generic analysis/densify list, which can be dominated by large
+            # thick structures when their absolute miss is high.
+            with self._detection_grid_scope():
+                lf_regions = self._detect_worst_regions(
+                    centers, radii, rotations, self._local_fit_region_k,
+                    min_severity=self._local_fit_min_severity,
+                    thin_preference=self._local_fit_thin_preference)
+            if lf_regions and len(centers):
+                # Keep the box centred on the actual thin/problem region.  Do
+                # not snap it to the nearest ellipsoid centre: on characters
+                # that often means a large belly/torso primitive wins the
+                # nearest-centre test and the expensive local fit moves back to
+                # the thick middle of the body.
+                r_radius_world = float(self._region_radius_vox) * float(self._dx)
+                seen_sites: set[tuple] = set()
+                for reg in lf_regions:
+                    sc = np.asarray(reg['seed_world'], np.float32).copy()
+                    key = tuple(np.round(sc / max(float(self._dx), 1e-9)).astype(int))
+                    if key in seen_sites:
+                        continue
+                    seen_sites.add(key)
+                    region_sites.append((sc, r_radius_world))
+                    pools.append(self._interior_ball_pool(
+                        sc, self._region_radius_vox))
 
         # Under symmetry only the source (better-fitting) half survives the
         # post-maintenance ``_build_symmetric_layout``; the other half is
@@ -4754,15 +5228,17 @@ class OptimizationWorker(QtCore.QThread):
             wp.launch(_exp_radii_kernel, dim=num_e,
                       inputs=[pred_log_radii, pred_radii], device=device)
             wp.synchronize_device(device)
+            c_np = pred_centers.numpy().copy()
+            r_np = pred_radii.numpy().copy()
+            q_np = pred_rot_flat.numpy().reshape(-1, 4).copy()
+            e_np = (np.concatenate([pred_eps.numpy().reshape(-1, 2),
+                                    pred_bend.numpy().reshape(-1, 2)], axis=1).copy()
+                    if self._bent else
+                    (pred_eps.numpy().reshape(-1, 2).copy()
+                     if self._superquadric else None))
             self.step_visual.emit(
-                self._num_steps, float(loss.numpy()[0]),
-                pred_centers.numpy().copy(), pred_radii.numpy().copy(),
-                pred_rot_flat.numpy().reshape(-1, 4).copy(),
-                (np.concatenate([pred_eps.numpy().reshape(-1, 2),
-                                 pred_bend.numpy().reshape(-1, 2)], axis=1).copy()
-                 if self._bent else
-                 (pred_eps.numpy().reshape(-1, 2).copy()
-                  if self._superquadric else None)))
+                self._num_steps, float(loss.numpy()[0]), c_np, r_np, q_np, e_np)
+            self._emit_live_metric_if_needed(self._num_steps, c_np, r_np, q_np)
 
 
 # ── Demo helper ───────────────────────────────────────────────────────────────
