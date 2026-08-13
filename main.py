@@ -77,12 +77,6 @@ def _blur_pixmap(src: QtGui.QPixmap, radius: float) -> QtGui.QPixmap:
 
 
 class SplashScreen(QtWidgets.QWidget):
-    """Frameless loading screen whose progress bar doubles as a sharpness mask.
-
-    The artwork is blurry to the right of the bar and crisp to its left.  As
-    ``set_progress`` advances the bar from left → right, more of the image comes
-    into focus, until at 100 % the whole splash is sharp.
-    """
 
     def __init__(self, sharp: QtGui.QPixmap, blurry: QtGui.QPixmap):
         super().__init__(
@@ -180,9 +174,11 @@ def _make_splash() -> SplashScreen:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="EllipSDF — Mesh → Ellipsoid SDF")
     parser.add_argument(
-        "--server", action="store_true",
-        help="Start the embedded HTTP API so Unity (or any client) can push a "
-             "mesh in and pull fitted ellipsoids out. The window still opens.")
+        "--server", action="store_true", default=True,
+        help="Start the embedded HTTP API / Unity bridge. This is now the default.")
+    parser.add_argument(
+        "--no-server", dest="server", action="store_false",
+        help="Do not start the embedded HTTP API / Unity bridge.")
     parser.add_argument(
         "--port", type=int, default=8765,
         help="Port for the HTTP API (default: 8765).")

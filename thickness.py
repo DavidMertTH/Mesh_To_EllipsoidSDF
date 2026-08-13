@@ -99,7 +99,7 @@ def _sphere_offset_cache(quant_vox: float = 1.0 / 16.0):
     return offsets
 
 
-def _refine_peak_depth(Dv: np.ndarray) -> np.ndarray:
+def _refine_peak_depth(Dv: np.ndarray, progress_cb=None) -> np.ndarray:
     """Sub-voxel-refined interior depth (voxel units).
 
     The medial axis of a feature generally lies between voxel centres, so the
@@ -117,12 +117,16 @@ def _refine_peak_depth(Dv: np.ndarray) -> np.ndarray:
     """
     sq = np.zeros_like(Dv)
     for ax in range(3):
+        if progress_cb is not None:
+            progress_cb(ax / 3.0, f"Refining medial depths axis {ax + 1}/3")
         a = np.roll(Dv, 1, axis=ax)
         c = np.roll(Dv, -1, axis=ax)
         grad = 0.5 * (c - a)                 # central difference along axis
         concave = (a - 2.0 * Dv + c) < -1e-6  # voxel is a ridge peak on this axis
         gain = np.where(concave, np.clip(np.abs(grad), 0.0, 0.5), 0.0)
         sq = sq + gain * gain
+    if progress_cb is not None:
+        progress_cb(1.0, "Refining medial depths done")
     ref = Dv + np.sqrt(sq).astype(Dv.dtype)
     # Refinement is meaningful only strictly inside the shape.
     ref[Dv <= 0.0] = 0.0
@@ -133,6 +137,8 @@ def local_thickness(
     target_grid: np.ndarray,
     dx: float,
     thickness_floor_vox: float = 1.0,
+    max_resolution: int | None = None,
+    progress_cb=None,
 ) -> np.ndarray:
     """Return a (nz, ny, nx) local-thickness field in **world units**.
 
@@ -145,6 +151,48 @@ def local_thickness(
     largest-first ordering plus the skip-already-covered test keep the expensive
     splats limited to the maximal spheres (~thousands even on a 256³ grid).
     """
+    target_grid = np.asarray(target_grid, dtype=np.float32)
+    target_shape = tuple(int(s) for s in target_grid.shape)
+    if max_resolution is not None and int(max_resolution) > 0:
+        longest = max(target_shape)
+        factor = int(np.ceil(longest / float(max_resolution)))
+        if factor > 1:
+            if progress_cb is not None:
+                progress_cb(
+                    0.0,
+                    f"Preparing thickness field at 1/{factor} resolution",
+                )
+            coarse = np.ascontiguousarray(target_grid[::factor, ::factor, ::factor])
+
+            def _coarse_progress(frac, msg):
+                if progress_cb is not None:
+                    progress_cb(0.02 + 0.86 * float(frac), str(msg))
+
+            thick_small = local_thickness(
+                coarse,
+                float(dx) * float(factor),
+                thickness_floor_vox=thickness_floor_vox,
+                max_resolution=None,
+                progress_cb=_coarse_progress if progress_cb is not None else None,
+            )
+            if progress_cb is not None:
+                progress_cb(0.90, "Upsampling thickness field")
+            thick = thick_small
+            for ax in range(3):
+                thick = np.repeat(thick, factor, axis=ax)
+            thick = thick[
+                :target_shape[0], :target_shape[1], :target_shape[2],
+            ].astype(np.float32, copy=False)
+            # Keep the original exterior empty; surface-adjacent values are
+            # supplied later by the existing dilation step used by the loss/UI.
+            thick[target_grid >= 0.0] = 0.0
+            if progress_cb is not None:
+                progress_cb(1.0, "Thickness done")
+            return thick.astype(np.float32, copy=False)
+
+    if progress_cb is not None:
+        progress_cb(0.0, "Preparing thickness field")
+
     Dv = np.maximum(-target_grid / float(dx), 0.0).astype(np.float32)  # radius, voxels
     nz, ny, nx = Dv.shape
     thick = np.zeros_like(Dv)  # holds diameter in voxel units
@@ -152,18 +200,33 @@ def local_thickness(
     interior = Dv > 0.0
     idx = np.argwhere(interior)
     if idx.size == 0:
+        if progress_cb is not None:
+            progress_cb(1.0, "Thickness done")
         return thick.astype(np.float32)
 
-    radii = _refine_peak_depth(Dv)[interior]   # sub-voxel-refined inscribed radii
+    if progress_cb is not None:
+        progress_cb(0.08, "Refining medial depths")
+
+        def _refine_progress(frac, msg):
+            progress_cb(0.08 + 0.12 * float(frac), str(msg))
+    else:
+        _refine_progress = None
+    radii = _refine_peak_depth(
+        Dv, progress_cb=_refine_progress)[interior]   # sub-voxel-refined inscribed radii
     order = np.argsort(-radii)
     idx = idx[order]
     radii = radii[order]
 
     offsets = _sphere_offset_cache()
+    total = int(len(radii))
+    report_every = max(1, total // 60)
 
-    for (z, y, x), r in zip(idx, radii):
+    for k, ((z, y, x), r) in enumerate(zip(idx, radii)):
         diam = 2.0 * float(r)
         if thick[z, y, x] >= diam:
+            if progress_cb is not None and (k % report_every == 0):
+                progress_cb(0.22 + 0.70 * (k / max(total, 1)),
+                            f"Thickness spheres {k}/{total}")
             continue  # already covered by a larger inscribed sphere
         offs = offsets(float(r))
         zz = z + offs[:, 0]
@@ -174,10 +237,17 @@ def local_thickness(
         cur = thick[zz, yy, xx]
         upd = cur < diam
         thick[zz[upd], yy[upd], xx[upd]] = diam
+        if progress_cb is not None and (k % report_every == 0):
+            progress_cb(0.22 + 0.70 * (k / max(total, 1)),
+                        f"Thickness spheres {k}/{total}")
 
     # Floor every interior voxel and convert to world units.
+    if progress_cb is not None:
+        progress_cb(0.94, "Finalizing thickness field")
     floor = float(thickness_floor_vox)
     thick[interior] = np.maximum(thick[interior], floor)
+    if progress_cb is not None:
+        progress_cb(1.0, "Thickness done")
     return (thick * float(dx)).astype(np.float32)
 
 

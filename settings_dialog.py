@@ -25,7 +25,7 @@ class SettingsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
-        self._widgets: dict[str, QtWidgets.QAbstractSpinBox] = {}
+        self._widgets: dict[str, QtWidgets.QWidget] = {}
 
         root = QtWidgets.QVBoxLayout(self)
         tabs = QtWidgets.QTabWidget()
@@ -43,7 +43,7 @@ class SettingsDialog(QtWidgets.QDialog):
                 for field in fields:
                     key, label, kind, mn, mx, step, dec, default, tip = field
                     w = self._make_widget(kind, mn, mx, step, dec)
-                    w.setValue(values.get(key, default))
+                    self._set_widget_value(w, values.get(key, default))
                     if tip:
                         w.setToolTip(tip)
                     self._widgets[key] = w
@@ -90,7 +90,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.setMinimumSize(440, 520)
 
     @staticmethod
-    def _make_widget(kind, mn, mx, step, dec) -> QtWidgets.QAbstractSpinBox:
+    def _make_widget(kind, mn, mx, step, dec) -> QtWidgets.QWidget:
+        if kind == "bool":
+            return QtWidgets.QCheckBox()
         if kind == "int":
             w = QtWidgets.QSpinBox()
             w.setRange(int(mn), int(mx))
@@ -102,18 +104,31 @@ class SettingsDialog(QtWidgets.QDialog):
             w.setDecimals(int(dec))
         return w
 
+    @staticmethod
+    def _set_widget_value(w: QtWidgets.QWidget, value) -> None:
+        if isinstance(w, QtWidgets.QCheckBox):
+            w.setChecked(bool(value))
+        else:
+            w.setValue(value)
+
+    @staticmethod
+    def _widget_value(w: QtWidgets.QWidget):
+        if isinstance(w, QtWidgets.QCheckBox):
+            return bool(w.isChecked())
+        return w.value()
+
     def load_values(self, values: dict) -> None:
         """Refresh every widget from *values* (used when reopening the dialog)."""
         for key, w in self._widgets.items():
             if key in values:
-                w.setValue(values[key])
+                self._set_widget_value(w, values[key])
 
     def _restore_defaults(self) -> None:
         defaults = app_settings.defaults()
         for key, w in self._widgets.items():
             if key in defaults:
-                w.setValue(defaults[key])
+                self._set_widget_value(w, defaults[key])
 
     def values(self) -> dict:
         """The current value of every setting widget."""
-        return {key: w.value() for key, w in self._widgets.items()}
+        return {key: self._widget_value(w) for key, w in self._widgets.items()}

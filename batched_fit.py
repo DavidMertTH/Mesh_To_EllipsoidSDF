@@ -177,7 +177,13 @@ def _grouped_loss_kernel(
     if t < 0.0 and sp > 0.0:
         wp.atomic_add(loss, 0, w * miss_weight * (sp - t) * inv_batch)
     if t > 0.0 and sp < 0.0:
-        wp.atomic_add(loss, 0, w * outside_weight * (t - sp) * inv_batch)
+        # Match the main fitter's per-location quadratic protrusion loss.  The
+        # surface-band scale preserves the old linear loss at one sigma and
+        # makes farther protrusions progressively more expensive.
+        over = t - sp
+        over_scale = wp.max(sigma, 1.0e-6)
+        over_penalty = over * over / over_scale
+        wp.atomic_add(loss, 0, w * outside_weight * over_penalty * inv_batch)
 
 
 @wp.kernel

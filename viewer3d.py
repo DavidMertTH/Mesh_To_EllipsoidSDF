@@ -27,6 +27,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import theme
 import raymarch
 import sdf_slice as slice_module
+from sdf_blowup import DEFAULT_MAX_THICKNESS_FRACTION
 from widgets import DropGLView
 
 
@@ -663,6 +664,7 @@ class ViewportOverlay(QtWidgets.QFrame):
         ("Too Large", "too_large"),
         ("Too Small", "too_small"),
         ("Redundant", "redundant"),
+        ("Bone Budget", "bone_over_budget"),
         ("Coverage", "coverage"),
         ("Unique", "unique_coverage"),
     )
@@ -912,7 +914,9 @@ class SceneViewer3D(_BaseViewer):
         self._sdf_dx: Optional[float] = None
         self._mesh_depth: float = 1e-4
         self._grid_wp = None                             # mesh grid uploaded once
-        self._sdf_blowup_vox: float = 0.0                # uniform SDF offset (voxels)
+        self._blowup_thickness_wp = None                 # exterior-carried local thickness
+        self._blowup_thickness_source: Optional[np.ndarray] = None
+        self._sdf_blowup_vox: float = 0.0                # requested max SDF offset (voxels)
         self._slice_lut = slice_module.make_sdf_lut()
         self._slice_lut_wp, self._slice_lut_n = slice_module.make_lut_wp(self._slice_lut)
 
@@ -920,6 +924,10 @@ class SceneViewer3D(_BaseViewer):
         self._mesh_item: Optional[gl.GLMeshItem] = None
         self._ell_item: Optional[gl.GLMeshItem] = None
         self._slice_item: Optional[gl.GLImageItem] = None
+        self._slice_sparse_item: Optional[gl.GLScatterPlotItem] = None
+        self._sparse_sample_points: Optional[np.ndarray] = None
+        self._sparse_sample_values: Optional[np.ndarray] = None
+        self._max_sparse_slice_points = 30_000
         # Render mode the current ellipsoid item was built with, so live fit
         # updates can reuse it (setMeshData) instead of recreating it.
         self._ell_item_mode: Optional[str] = None
@@ -1338,13 +1346,19 @@ class SceneViewer3D(_BaseViewer):
         sq_bend: Optional[np.ndarray] = None,
         primitive: Optional[str] = None,
     ) -> None:
-        self._ell_centers = centers
-        self._ell_radii = radii
-        self._ell_rotations = rotations
+        self._ell_centers = np.asarray(
+            centers, dtype=np.float32).reshape(-1, 3)
+        self._ell_radii = np.asarray(
+            radii, dtype=np.float32).reshape(-1, 3)
+        self._ell_rotations = np.asarray(
+            rotations, dtype=np.float32).reshape(-1, 4)
         self._ell_base_colors = colors
-        self._ell_sq_eps = sq_eps      # per-primitive (N,2) roundness, or None
-        self._ell_sq_bend = sq_bend    # per-primitive (N,2) bend, or None
+        self._ell_sq_eps = (           # per-primitive (N,2) roundness, or None
+            None if sq_eps is None else np.asarray(sq_eps, dtype=np.float32))
+        self._ell_sq_bend = (          # per-primitive (N,2) bend, or None
+            None if sq_bend is None else np.asarray(sq_bend, dtype=np.float32))
         self._ell_primitive = primitive  # e.g. "capsule", or None for ellipsoid
+        self._align_stored_ellipsoid_population()
         self._apply_ellipsoid_metric_colors()
         self._rm_dirty = True          # population changed → re-upload for raymarch
         self._rebuild_ellipsoids()
@@ -1405,7 +1419,39 @@ class SceneViewer3D(_BaseViewer):
             return
         self._ell_colors = _ellipsoid_metric_heatmap(values)
 
+    def _align_stored_ellipsoid_population(self) -> None:
+        """Repair a stale partial population before any rendering path uses it."""
+        arrays = {
+            "centers": self._ell_centers,
+            "radii": self._ell_radii,
+            "rotations": self._ell_rotations,
+        }
+        if any(value is None for value in arrays.values()):
+            return
+        if self._ell_sq_eps is not None:
+            arrays["eps"] = self._ell_sq_eps
+        if self._ell_sq_bend is not None:
+            arrays["bend"] = self._ell_sq_bend
+
+        counts = {name: len(value) for name, value in arrays.items()}
+        if len(set(counts.values())) == 1:
+            return
+        valid_count = min(counts.values())
+        detail = ", ".join(f"{name}={count}" for name, count in counts.items())
+        print(
+            f"[Viewer] inconsistent ellipsoid population ({detail}); "
+            f"rendering {valid_count}"
+        )
+        self._ell_centers = self._ell_centers[:valid_count]
+        self._ell_radii = self._ell_radii[:valid_count]
+        self._ell_rotations = self._ell_rotations[:valid_count]
+        if self._ell_sq_eps is not None:
+            self._ell_sq_eps = self._ell_sq_eps[:valid_count]
+        if self._ell_sq_bend is not None:
+            self._ell_sq_bend = self._ell_sq_bend[:valid_count]
+
     def _rebuild_ellipsoids(self) -> None:
+        self._align_stored_ellipsoid_population()
         # Raymarch mode draws the SDF directly into the overlay image instead of
         # building a GL mesh — re-render for the latest population and bail.
         # Low-res now (cheap during a live fit); the poll refines to full res
@@ -1482,7 +1528,9 @@ class SceneViewer3D(_BaseViewer):
                 and getattr(self, "_ell_primitive", None) not in ("capsule",)
                 and (bend is None or not np.any(bend))
                 and self._ell_radii is not None
-                and self._ell_rotations is not None):
+                and self._ell_rotations is not None
+                and len(self._ell_radii) == len(self._ell_rotations)
+                and len(self._ell_radii) == len(self._ell_centers)):
             return ellipsoid_vertex_normals(self._ell_radii, self._ell_rotations)
         return _vertex_normals(verts, faces)
 
@@ -1725,8 +1773,13 @@ class SceneViewer3D(_BaseViewer):
 
     # ── SDF slice plane ─────────────────────────────────────────────────
 
-    def set_sdf_volume(self, grid: np.ndarray, origin: np.ndarray,
-                       dx: float) -> None:
+    def set_sdf_volume(
+        self,
+        grid: np.ndarray,
+        origin: np.ndarray,
+        dx: float,
+        blowup_thickness: np.ndarray | None = None,
+    ) -> None:
         """Provide the mesh SDF volume the slice plane samples (and slides in).
 
         Stores the grid + world geometry, resizes the position slider to the
@@ -1737,21 +1790,86 @@ class SceneViewer3D(_BaseViewer):
         self._sdf_dx = float(dx)
         self._mesh_depth = max(-float(self._sdf_grid.min()), 1e-4)
         self._grid_wp = slice_module.upload_grid(self._sdf_grid)   # device, once
+        if blowup_thickness is None:
+            self._blowup_thickness_wp = None
+            self._blowup_thickness_source = None
+        else:
+            local_thickness = np.ascontiguousarray(
+                blowup_thickness, dtype=np.float32)
+            if local_thickness.shape != self._sdf_grid.shape:
+                raise ValueError(
+                    "blowup_thickness must have the same shape as grid")
+            self._blowup_thickness_wp = slice_module.upload_grid(
+                local_thickness)
+            self._blowup_thickness_source = local_thickness
+        self._sparse_sample_points = None
+        self._sparse_sample_values = None
+        self._clear_slice_sparse_samples()
         normal = slice_module.PLANE_NORMAL[self._overlay.slice_plane()]
         self._set_slice_range(
             slice_module.n_slices(self._sdf_grid.shape, normal))
         if self._overlay.slice_enabled():
             self._update_slice()
 
-    def set_sdf_blowup(self, voxels: float) -> None:
-        """SDF blowup: add a uniform offset of ``voxels`` (× dx) to the mesh SDF.
+    def set_blowup_thickness(
+        self,
+        blowup_thickness: np.ndarray | None,
+        *,
+        update: bool = True,
+    ) -> None:
+        """Upload a lazily-built adaptive-blowup carrier for the current grid."""
+        if blowup_thickness is self._blowup_thickness_source:
+            return
+        if blowup_thickness is None:
+            self._blowup_thickness_wp = None
+            self._blowup_thickness_source = None
+        else:
+            if self._sdf_grid is None:
+                raise ValueError(
+                    "set_sdf_volume must be called before blowup thickness")
+            local_thickness = np.ascontiguousarray(
+                blowup_thickness, dtype=np.float32)
+            if local_thickness.shape != self._sdf_grid.shape:
+                raise ValueError(
+                    "blowup_thickness must have the same shape as grid")
+            self._blowup_thickness_wp = slice_module.upload_grid(
+                local_thickness)
+            self._blowup_thickness_source = local_thickness
+        if (update and self._overlay.slice_enabled()
+                and self._sdf_grid is not None):
+            self._update_slice()
 
-        Positive erodes (surface inward), negative dilates.  Applied live in the
-        slice render (GPU, no grid recompute); refreshes the slice if it is on.
-        Stored in voxels and scaled by the current ``dx`` at render time.
-        """
-        self._sdf_blowup_vox = float(voxels)
+    def set_sparse_samples(self, samples) -> None:
+        """Show sparse SDF training samples on the active 3-D slice plane."""
+        if samples is None:
+            self._sparse_sample_points = None
+            self._sparse_sample_values = None
+            self._clear_slice_sparse_samples()
+            return
+
+        pts = np.asarray(getattr(samples, "points", samples), dtype=np.float32)
+        self._sparse_sample_points = np.ascontiguousarray(pts.reshape(-1, 3))
+        vals = getattr(samples, "values", None)
+        self._sparse_sample_values = (
+            None if vals is None
+            else np.ascontiguousarray(np.asarray(vals, dtype=np.float32).reshape(-1))
+        )
         if self._overlay.slice_enabled() and self._sdf_grid is not None:
+            self._update_slice()
+
+    def set_sdf_blowup(self, voxels: float) -> None:
+        """Set the maximum SDF offset in voxels.
+
+        Positive erodes and negative dilates.  Where local thickness is known,
+        the magnitude is capped at 25% of the feature diameter.  The live slice
+        applies the cap on the GPU without rebuilding or re-uploading the grid.
+        """
+        requested = float(voxels)
+        if requested == self._sdf_blowup_vox:
+            return
+        self._sdf_blowup_vox = requested
+        if (self._overlay.slice_enabled() and self._sdf_grid is not None
+                and self._overlay.slice_source() != "ellipsoids"):
             self._update_slice()
 
     # ── overlay callbacks ──
@@ -1816,7 +1934,9 @@ class SceneViewer3D(_BaseViewer):
                 self._ell_centers, self._ell_radii, self._ell_rotations,
                 self._grid_wp, self._sdf_origin, self._sdf_dx, nx, ny, nz,
                 self._sdf_origin, normal, k, W, H, px, theme.BLUE, theme.YELLOW,
-                offset=blow)
+                offset=blow,
+                thickness_wp=self._blowup_thickness_wp,
+                max_thickness_fraction=DEFAULT_MAX_THICKNESS_FRACTION)
         elif source == "ellipsoids":
             if self._ell_centers is None or len(self._ell_centers) == 0:
                 self._clear_slice()
@@ -1827,12 +1947,17 @@ class SceneViewer3D(_BaseViewer):
                 self._slice_lut_wp, self._slice_lut_n,
                 self._ellipsoid_depth(), out_band)
         else:  # mesh
-            depth = max(self._mesh_depth - blow, 1e-4)   # blowup shifts the surface
+            # Conservative colour normalization: adaptive erosion may be
+            # locally capped, while dilation can only increase interior depth
+            # by at most the requested magnitude.  Geometry remains unaffected.
+            depth = max(self._mesh_depth + max(-blow, 0.0), 1e-4)
             rgba = slice_module.render_mesh(
                 self._grid_wp, self._sdf_origin, self._sdf_dx, nx, ny, nz,
                 self._sdf_origin, normal, k, W, H, px,
                 self._slice_lut_wp, self._slice_lut_n, depth, out_band,
-                offset=blow)
+                offset=blow,
+                thickness_wp=self._blowup_thickness_wp,
+                max_thickness_fraction=DEFAULT_MAX_THICKNESS_FRACTION)
 
         mat = slice_module.slice_transform(
             self._sdf_origin, normal, k, px, self._sdf_dx)
@@ -1847,11 +1972,59 @@ class SceneViewer3D(_BaseViewer):
             self._slice_item.setData(rgba)
         self._slice_item.setTransform(transform)
         self._slice_item.setVisible(True)
+        self._update_slice_sparse_samples(normal, k)
 
     def _clear_slice(self) -> None:
         if self._slice_item is not None:
             self._view.removeItem(self._slice_item)
             self._slice_item = None
+        self._clear_slice_sparse_samples()
+
+    def _update_slice_sparse_samples(self, normal: int, k: int) -> None:
+        if self._sparse_sample_points is None or self._sdf_grid is None:
+            self._clear_slice_sparse_samples()
+            return
+
+        plane = self._sdf_origin[normal] + (float(k) + 0.5) * float(self._sdf_dx)
+        slab = np.abs(self._sparse_sample_points[:, normal] - plane) <= (
+            0.75 * float(self._sdf_dx)
+        )
+        if not np.any(slab):
+            self._clear_slice_sparse_samples()
+            return
+
+        pts = self._sparse_sample_points[slab]
+        if len(pts) > self._max_sparse_slice_points:
+            take = np.linspace(
+                0, len(pts) - 1, self._max_sparse_slice_points
+            ).astype(np.int64)
+            pts = pts[take]
+
+        color = np.tile(
+            np.array([[1.0, 1.0, 1.0, 0.86]], dtype=np.float32),
+            (len(pts), 1),
+        )
+        if self._slice_sparse_item is None:
+            self._slice_sparse_item = gl.GLScatterPlotItem(
+                pos=pts.astype(np.float32),
+                color=color,
+                size=4.0,
+                pxMode=True,
+            )
+            self._slice_sparse_item.setGLOptions("translucent")
+            self._view.addItem(self._slice_sparse_item)
+        else:
+            self._slice_sparse_item.setData(
+                pos=pts.astype(np.float32),
+                color=color,
+                size=4.0,
+            )
+        self._slice_sparse_item.setVisible(True)
+
+    def _clear_slice_sparse_samples(self) -> None:
+        if self._slice_sparse_item is not None:
+            self._view.removeItem(self._slice_sparse_item)
+            self._slice_sparse_item = None
 
     # ── under-representation overlay ────────────────────────────────────
 

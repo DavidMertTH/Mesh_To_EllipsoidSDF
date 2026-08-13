@@ -140,7 +140,21 @@ def main() -> int:
         local_fit=True,
         superfit=False,
     )
-    worker._pred_grid_from_params = types.MethodType(lambda self, c, r, q: pred, worker)
+    def _sample_pred(self, sample_points, _c, _r, _q):
+        ijk = np.floor(
+            (np.asarray(sample_points, np.float32) - res.origin[None, :])
+            / float(res.dx)
+        ).astype(np.int64)
+        ijk = np.clip(
+            ijk,
+            0,
+            np.array([target.shape[2] - 1,
+                      target.shape[1] - 1,
+                      target.shape[0] - 1]),
+        )
+        return pred[ijk[:, 2], ijk[:, 1], ijk[:, 0]]
+
+    worker._pred_points_from_params = types.MethodType(_sample_pred, worker)
 
     regions = worker._detect_worst_regions(
         np.empty((0, 3), np.float32),

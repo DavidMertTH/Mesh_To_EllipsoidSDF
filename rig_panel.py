@@ -8,7 +8,7 @@ pipeline works exactly as before.
 Features:
   - Toggle: Rig Mode on/off
   - Pose selector / timeline slider
-  - Multi-pose training controls
+  - Pose-corrective training controls
   - Bone assignment visualisation
   - Per-pose loss display
 """
@@ -22,7 +22,7 @@ import numpy as np
 
 from PySide6 import QtCore, QtWidgets
 
-from skeleton import Skeleton, Pose
+from skeleton import Skeleton, Pose, interpolate_pose
 from rig_loader import RiggedMesh, load_rigged_mesh, is_rigged_mesh
 from skinning import deform_mesh
 from bone_ellipsoid_mapper import BoneEllipsoidMapper, BoneLocalEllipsoids
@@ -39,15 +39,15 @@ class RigModePanel(QtWidgets.QGroupBox):
         Emitted when a rigged mesh is loaded.  Payload: RiggedMesh.
     poseChanged(int)
         Emitted when the user selects a different pose index.
-    multiPoseRequested()
-        Emitted when the user clicks "Multi-Pose Fit".
+    poseCorrectiveRequested()
+        Emitted when the user clicks "Train Correctives".
     rigModeToggled(bool)
         Emitted when rig mode is toggled on/off.
     """
 
     rigLoaded = QtCore.Signal(object)
     poseChanged = QtCore.Signal(int)
-    multiPoseRequested = QtCore.Signal()
+    poseCorrectiveRequested = QtCore.Signal()
     rigModeToggled = QtCore.Signal(bool)
     autoPipelineRequested = QtCore.Signal()
     exportUnityRequested = QtCore.Signal()
@@ -73,6 +73,14 @@ class RigModePanel(QtWidgets.QGroupBox):
         # library clip by name so a newly loaded mesh receives the same motion
         # after the pose files are remapped onto its skeleton.
         self._selected_library_clip_name: str | None = None
+        self._syncing_blend = False
+        self._anim_dir = 1
+        self._anim_pose_fps = 1.0
+        self._anim_clock = QtCore.QElapsedTimer()
+        self._anim_last_ms = 0
+        self._anim_timer = QtCore.QTimer(self)
+        self._anim_timer.setInterval(33)
+        self._anim_timer.timeout.connect(self._on_animate_tick)
 
         self._build_ui()
 
@@ -95,6 +103,23 @@ class RigModePanel(QtWidgets.QGroupBox):
     @property
     def current_pose_index(self) -> int:
         return self._slider_pose.value()
+
+    @property
+    def current_pose_frame(self) -> float:
+        if (hasattr(self, "_chk_blend") and self._chk_blend.isChecked()
+                and self._slider_blend.isEnabled()):
+            return float(self._slider_blend.value()) / 1000.0
+        return float(self._slider_pose.value())
+
+    @property
+    def current_source_label(self) -> str:
+        text = self._cmb_source.currentText().strip()
+        return text or "[Mesh Animation]"
+
+    @property
+    def shape_fitting_enabled(self) -> bool:
+        btn = getattr(self, "_btn_shape_fit", None)
+        return True if btn is None else bool(btn.isChecked())
 
     @property
     def active_poses(self) -> List[Pose]:
@@ -120,11 +145,59 @@ class RigModePanel(QtWidgets.QGroupBox):
             return poses[idx]
         return Pose.t_pose()
 
+    def pose_pair_at(self, frame: float) -> tuple[int, int, float]:
+        """Return integer pose endpoints and blend factor for a fractional frame."""
+        poses = self.active_poses
+        n = len(poses)
+        if n <= 1:
+            return 0, 0, 0.0
+        f = float(np.clip(frame, 0.0, float(n - 1)))
+        i0 = int(np.floor(f))
+        i1 = min(i0 + 1, n - 1)
+        return i0, i1, f - float(i0)
+
+    def pose_at_frame(self, frame: float) -> Pose:
+        """Return the active pose, interpolating when *frame* is fractional."""
+        poses = self.active_poses
+        if not poses:
+            return Pose.t_pose()
+        i0, i1, w = self.pose_pair_at(frame)
+        if i0 == i1 or w <= 1.0e-6 or self._rigged_mesh is None:
+            return self.pose_at(i0)
+        if w >= 1.0 - 1.0e-6:
+            return self.pose_at(i1)
+        return interpolate_pose(
+            self._rigged_mesh.skeleton,
+            poses[i0],
+            poses[i1],
+            w,
+            name=f"{poses[i0].name} -> {poses[i1].name} {w:.2f}",
+        )
+
+    def reset_pose_to_start(self, emit: bool = True) -> None:
+        """Move the visible pose timeline back to frame 0."""
+        if self._chk_animate.isChecked():
+            self._chk_animate.setChecked(False)
+        self._anim_timer.stop()
+        self._anim_dir = 1
+
+        self._slider_pose.blockSignals(True)
+        self._slider_pose.setValue(0)
+        self._slider_pose.blockSignals(False)
+
+        self._slider_blend.blockSignals(True)
+        self._slider_blend.setValue(0)
+        self._slider_blend.blockSignals(False)
+
+        self._update_pose_labels(0.0, len(self.active_poses))
+        if emit and self._rigged_mesh is not None:
+            self.poseChanged.emit(0)
+
     @property
     def current_pose(self) -> Optional[Pose]:
         if self._rigged_mesh is None:
             return None
-        return self.pose_at(self._slider_pose.value())
+        return self.pose_at_frame(self.current_pose_frame)
 
     # ── UI construction ──────────────────────────────────────────────
 
@@ -168,6 +241,35 @@ class RigModePanel(QtWidgets.QGroupBox):
 
         layout.addLayout(pose_row)
 
+        blend_row = QtWidgets.QHBoxLayout()
+        self._chk_blend = QtWidgets.QCheckBox("Debug Blend")
+        self._chk_blend.setToolTip(
+            "Smoothly scrub between adjacent poses and their learned ellipsoid shapes."
+        )
+        self._chk_blend.toggled.connect(self._on_blend_toggled)
+        blend_row.addWidget(self._chk_blend)
+
+        self._chk_animate = QtWidgets.QCheckBox("Animate")
+        self._chk_animate.setToolTip(
+            "Automatically move the smooth blend slider between poses."
+        )
+        self._chk_animate.setEnabled(False)
+        self._chk_animate.toggled.connect(self._on_animate_toggled)
+        blend_row.addWidget(self._chk_animate)
+
+        self._slider_blend = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._slider_blend.setRange(0, 0)
+        self._slider_blend.setValue(0)
+        self._slider_blend.setEnabled(False)
+        self._slider_blend.valueChanged.connect(self._on_blend_changed)
+        blend_row.addWidget(self._slider_blend, 1)
+
+        self._lbl_blend = QtWidgets.QLabel("0.00")
+        self._lbl_blend.setFixedWidth(54)
+        blend_row.addWidget(self._lbl_blend)
+
+        layout.addLayout(blend_row)
+
         # ── Pose name ──
         self._lbl_pose_name = QtWidgets.QLabel("")
         self._lbl_pose_name.setStyleSheet("font-size: 11px; color: gray;")
@@ -204,21 +306,31 @@ class RigModePanel(QtWidgets.QGroupBox):
         lib_row.addWidget(self._btn_reload_lib)
         layout.addLayout(lib_row)
 
-        # ── Multi-pose training ──
+        # ── Pose-corrective training ──
         # No rig-specific knobs: steps + LR come from the right panel, all loss
         # and sampling settings from the Settings dialog — same as a normal fit.
         layout.addSpacing(8)
         _hint = QtWidgets.QLabel(
-            "Multi-Pose Training uses the main Steps / LR and Settings dialog."
+            "Pose correctives use the main Steps / LR and Settings dialog."
         )
         _hint.setWordWrap(True)
         _hint.setStyleSheet("font-size: 10px; color: gray;")
         layout.addWidget(_hint)
 
+        self._btn_shape_fit = QtWidgets.QPushButton("Shape Fitting: On")
+        self._btn_shape_fit.setCheckable(True)
+        self._btn_shape_fit.setChecked(True)
+        self._btn_shape_fit.setToolTip(
+            "When enabled, train pose-specific ellipsoid center/rotation/radius deltas. "
+            "When disabled, Unity and the GUI use only the bone-driven base ellipsoids."
+        )
+        self._btn_shape_fit.toggled.connect(self._on_shape_fitting_toggled)
+        layout.addWidget(self._btn_shape_fit)
+
         # ── One-click auto pipeline ──
-        self._btn_auto = QtWidgets.QPushButton("▶ Auto Fit All Poses")
+        self._btn_auto = QtWidgets.QPushButton("▶ Train Pose Correctives")
         self._btn_auto.setToolTip(
-            "Automatically: fit T-pose ellipsoids → assign to bones → train all poses"
+            "Train one relative corrective layer for each active pose using the current base ellipsoids"
         )
         self._btn_auto.setEnabled(False)
         self._btn_auto.setStyleSheet(
@@ -239,13 +351,13 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._btn_assign.clicked.connect(self._on_assign_clicked)
         btn_row.addWidget(self._btn_assign)
 
-        self._btn_multipose = QtWidgets.QPushButton("2. Multi-Pose Fit")
-        self._btn_multipose.setToolTip(
-            "Train bone-local params across all poses"
+        self._btn_correctives = QtWidgets.QPushButton("2. Train Correctives")
+        self._btn_correctives.setToolTip(
+            "Keep the same ellipsoid IDs and fit relative center/rotation/radius deltas per active pose"
         )
-        self._btn_multipose.setEnabled(False)
-        self._btn_multipose.clicked.connect(self._on_multipose_clicked)
-        btn_row.addWidget(self._btn_multipose)
+        self._btn_correctives.setEnabled(False)
+        self._btn_correctives.clicked.connect(self._on_correctives_clicked)
+        btn_row.addWidget(self._btn_correctives)
 
         layout.addLayout(btn_row)
 
@@ -308,11 +420,12 @@ class RigModePanel(QtWidgets.QGroupBox):
     def set_bone_local(self, bone_local: BoneLocalEllipsoids):
         """Update bone-local params (after assignment or training)."""
         self._bone_local = bone_local
-        self._btn_multipose.setEnabled(True)
+        self._btn_correctives.setEnabled(True)
         self._btn_export.setEnabled(True)
 
         # Show bone assignment summary
         if self._mapper:
+            self._mapper._bone_local = bone_local
             bone_counts: dict[str, int] = {}
             for i in range(bone_local.num_ellipsoids):
                 name = self._mapper.get_bone_name(i)
@@ -327,7 +440,7 @@ class RigModePanel(QtWidgets.QGroupBox):
         if running:
             self._btn_auto.setText("⏳ Running…")
         else:
-            self._btn_auto.setText("▶ Auto Fit All Poses")
+            self._btn_auto.setText("▶ Train Pose Correctives")
 
     def set_progress(self, value: int, maximum: int = 100):
         """Update progress bar."""
@@ -335,23 +448,23 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._progress.setValue(value)
         self._progress.setVisible(value < maximum)
 
-    def get_deformed_mesh(self, pose_index: int = -1) -> Optional[np.ndarray]:
+    def get_deformed_mesh(self, pose_index: float = -1.0) -> Optional[np.ndarray]:
         """Return deformed vertices for the given pose (or current)."""
         if self._rigged_mesh is None:
             return None
 
         if pose_index < 0:
-            pose_index = self._slider_pose.value()
+            pose_index = self.current_pose_frame
 
         rm = self._rigged_mesh
-        pose = self.pose_at(pose_index)
+        pose = self.pose_at_frame(float(pose_index))
         skin_mats = rm.skeleton.compute_skin_matrices(pose)
         return deform_mesh(
             rm.vertices, rm.skin_joints, rm.skin_weights, skin_mats,
         )
 
     def get_world_ellipsoids(
-        self, pose_index: int = -1,
+        self, pose_index: float = -1.0,
     ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Return (centers, radii, rotations) in world space for the given pose."""
         if self._mapper is None or self._bone_local is None:
@@ -360,9 +473,9 @@ class RigModePanel(QtWidgets.QGroupBox):
             return None
 
         if pose_index < 0:
-            pose_index = self._slider_pose.value()
+            pose_index = self.current_pose_frame
 
-        pose = self.pose_at(pose_index)
+        pose = self.pose_at_frame(float(pose_index))
         return self._mapper.local_to_world_np(self._bone_local, pose)
 
     # ── Slots ────────────────────────────────────────────────────────
@@ -378,6 +491,19 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._slider_pose.setValue(0)
         self._slider_pose.setEnabled(n > 1)
         self._slider_pose.blockSignals(False)
+        self._slider_blend.blockSignals(True)
+        self._slider_blend.setRange(0, max(0, n - 1) * 1000)
+        self._slider_blend.setValue(0)
+        self._slider_blend.setEnabled(self._chk_blend.isChecked() and n > 1)
+        self._slider_blend.blockSignals(False)
+        self._chk_animate.setEnabled(n > 1)
+        self._lbl_blend.setText("0.00")
+        if n <= 1 and self._chk_animate.isChecked():
+            self._chk_animate.setChecked(False)
+        elif n > 1 and self._chk_animate.isChecked():
+            self._chk_blend.setChecked(True)
+            if not self._anim_timer.isActive():
+                self._start_animation_timer()
         self._on_pose_changed(0)
 
     def _populate_source_combo(self, select=None):
@@ -397,6 +523,33 @@ class RigModePanel(QtWidgets.QGroupBox):
         target = self._cmb_source.findData(select)
         self._cmb_source.setCurrentIndex(max(0, target))
         self._cmb_source.blockSignals(False)
+
+    def select_source(self, source) -> bool:
+        """Select an active pose source by combo data, label, or clip name."""
+        if source is None:
+            return True
+        text = str(source).strip()
+        if not text:
+            return True
+        lowered = text.lower()
+        if lowered in ("native", "mesh", "mesh animation", "[mesh animation]"):
+            target = self._cmb_source.findData(self.NATIVE)
+        else:
+            target = self._cmb_source.findData(text)
+            if target < 0:
+                for i in range(self._cmb_source.count()):
+                    label = self._cmb_source.itemText(i).strip()
+                    data = self._cmb_source.itemData(i)
+                    candidates = {label.lower(), str(data).lower()}
+                    if label.endswith(")") and " (" in label:
+                        candidates.add(label.rsplit(" (", 1)[0].lower())
+                    if lowered in candidates:
+                        target = i
+                        break
+        if target < 0:
+            return False
+        self._cmb_source.setCurrentIndex(target)
+        return True
 
     def _on_source_changed(self, _index: int):
         data = self._cmb_source.currentData()
@@ -478,10 +631,60 @@ class RigModePanel(QtWidgets.QGroupBox):
         if self._rigged_mesh is None:
             return
         n = len(self.active_poses)
+        if self._chk_blend.isChecked() and not self._syncing_blend:
+            self._slider_blend.blockSignals(True)
+            self._slider_blend.setValue(int(idx) * 1000)
+            self._slider_blend.blockSignals(False)
+        self._update_pose_labels(float(idx), n)
+        self.poseChanged.emit(idx)
+
+    def _on_blend_toggled(self, checked: bool):
+        n = len(self.active_poses)
+        self._slider_blend.setEnabled(bool(checked) and n > 1)
+        if not checked and self._chk_animate.isChecked():
+            self._chk_animate.setChecked(False)
+        if checked:
+            self._slider_blend.blockSignals(True)
+            self._slider_blend.setValue(int(self._slider_pose.value()) * 1000)
+            self._slider_blend.blockSignals(False)
+            frame = self.current_pose_frame
+        else:
+            frame = float(self._slider_pose.value())
+        self._update_pose_labels(frame, n)
+        if self._rigged_mesh is not None:
+            self.poseChanged.emit(int(np.floor(frame)))
+
+    def _on_blend_changed(self, value: int):
+        if self._rigged_mesh is None:
+            return
+        frame = float(value) / 1000.0
+        i0, _i1, _w = self.pose_pair_at(frame)
+        self._syncing_blend = True
+        self._slider_pose.blockSignals(True)
+        self._slider_pose.setValue(i0)
+        self._slider_pose.blockSignals(False)
+        self._syncing_blend = False
+        self._update_pose_labels(frame, len(self.active_poses))
+        self.poseChanged.emit(i0)
+
+    def _update_pose_labels(self, frame: float, n: int):
+        i0, i1, w = self.pose_pair_at(frame)
+        if self._chk_blend.isChecked() and self._slider_blend.isEnabled():
+            self._lbl_pose.setText(f"{frame:.2f} / {max(0, n - 1)}")
+            self._lbl_blend.setText(f"{frame:.2f}")
+            if i0 == i1 or w <= 1.0e-6:
+                self._lbl_pose_name.setText(f"Pose: {self.pose_at(i0).name}")
+            else:
+                self._lbl_pose_name.setText(
+                    f"Blend: {self.pose_at(i0).name} -> {self.pose_at(i1).name} "
+                    f"{w * 100.0:.0f}%"
+                )
+            return
+        idx = int(np.clip(round(frame), 0, max(0, n - 1)))
         pose = self.pose_at(idx)
         self._lbl_pose.setText(f"{idx} / {max(0, n - 1)}")
+        self._lbl_blend.setText(f"{idx:.2f}")
         self._lbl_pose_name.setText(f"Pose: {pose.name}")
-        self.poseChanged.emit(idx)
 
     def _on_assign_clicked(self):
         """Triggered by "Assign to Bones" button.
@@ -500,8 +703,55 @@ class RigModePanel(QtWidgets.QGroupBox):
         self._btn_assign.setText("1. Assign to Bones")
         self._btn_assign.setEnabled(True)
 
-    def _on_multipose_clicked(self):
-        self.multiPoseRequested.emit()
+    def _on_correctives_clicked(self):
+        self.poseCorrectiveRequested.emit()
+
+    def _on_shape_fitting_toggled(self, checked: bool):
+        self._btn_shape_fit.setText(
+            "Shape Fitting: On" if checked else "Shape Fitting: Off")
+
+    def _on_animate_toggled(self, checked: bool):
+        if not checked:
+            self._anim_timer.stop()
+            return
+        if self._rigged_mesh is None or len(self.active_poses) <= 1:
+            self._chk_animate.blockSignals(True)
+            self._chk_animate.setChecked(False)
+            self._chk_animate.blockSignals(False)
+            return
+        if not self._chk_blend.isChecked():
+            self._chk_blend.setChecked(True)
+        self._start_animation_timer()
+
+    def _start_animation_timer(self):
+        self._anim_dir = 1
+        self._anim_clock.restart()
+        self._anim_last_ms = 0
+        self._anim_timer.start()
+
+    def _on_animate_tick(self):
+        if self._rigged_mesh is None or len(self.active_poses) <= 1:
+            self._chk_animate.setChecked(False)
+            return
+        if not self._chk_blend.isChecked():
+            self._chk_blend.setChecked(True)
+        max_value = int(self._slider_blend.maximum())
+        if max_value <= 0:
+            self._chk_animate.setChecked(False)
+            return
+        now = int(self._anim_clock.elapsed())
+        dt = max(0.0, float(now - self._anim_last_ms) / 1000.0)
+        self._anim_last_ms = now
+        step = max(1, int(round(dt * 1000.0 * self._anim_pose_fps)))
+        value = int(self._slider_blend.value()) + step * int(self._anim_dir)
+        if value >= max_value:
+            value = max_value - (value - max_value)
+            self._anim_dir = -1
+        elif value <= 0:
+            value = -value
+            self._anim_dir = 1
+        value = int(np.clip(value, 0, max_value))
+        self._slider_blend.setValue(value)
 
 
 # ── File detection helper ────────────────────────────────────────────────────

@@ -340,6 +340,91 @@ def _grid_field_kernel(
     out[tid] = c0 * (1.0 - fz) + c1 * fz + offset
 
 
+@wp.func
+def _thickness_limited_grid_value(
+    value: wp.float32,
+    thickness: wp.float32,
+    requested_offset: wp.float32,
+    dx: wp.float32,
+    max_thickness_fraction: wp.float32,
+) -> wp.float32:
+    effective = requested_offset
+    if thickness > 0.0:
+        direction = 1.0
+        if requested_offset < 0.0:
+            direction = -1.0
+        effective = direction * wp.min(
+            wp.abs(requested_offset),
+            max_thickness_fraction * thickness,
+        )
+    else:
+        # Missing thickness can be an unresolved thin feature.  Keep it
+        # unchanged everywhere; a large negative offset must not pull a
+        # distant unresolved sample into a false exterior surface band.
+        effective = 0.0
+    return value + effective
+
+
+@wp.kernel
+def _adaptive_grid_field_kernel(
+    grid: wp.array(dtype=wp.float32),
+    thickness: wp.array(dtype=wp.float32),
+    gorigin: wp.vec3, dx: float, nx: int, ny: int, nz: int,
+    p0: wp.vec3, step0: wp.vec3, step1: wp.vec3, H: int,
+    offset: float,
+    max_thickness_fraction: float,
+    out: wp.array(dtype=wp.float32),
+):
+    # Apply the cap independently at all eight grid corners before trilinear
+    # interpolation.  This exactly matches interpolating the adjusted CPU grid.
+    tid = wp.tid()
+    i = tid // H
+    j = tid - i * H
+    p = p0 + float(i) * step0 + float(j) * step1
+    gx = (p[0] - gorigin[0]) / dx - 0.5
+    gy = (p[1] - gorigin[1]) / dx - 0.5
+    gz = (p[2] - gorigin[2]) / dx - 0.5
+    ix0 = wp.clamp(int(wp.floor(gx)), 0, nx - 2)
+    iy0 = wp.clamp(int(wp.floor(gy)), 0, ny - 2)
+    iz0 = wp.clamp(int(wp.floor(gz)), 0, nz - 2)
+    fx = wp.clamp(gx - float(ix0), 0.0, 1.0)
+    fy = wp.clamp(gy - float(iy0), 0.0, 1.0)
+    fz = wp.clamp(gz - float(iz0), 0.0, 1.0)
+    nynx = ny * nx
+    b = iz0 * nynx + iy0 * nx + ix0
+
+    v000 = _thickness_limited_grid_value(
+        grid[b], thickness[b], offset, dx, max_thickness_fraction)
+    v100 = _thickness_limited_grid_value(
+        grid[b + 1], thickness[b + 1], offset, dx,
+        max_thickness_fraction)
+    v010 = _thickness_limited_grid_value(
+        grid[b + nx], thickness[b + nx], offset, dx,
+        max_thickness_fraction)
+    v110 = _thickness_limited_grid_value(
+        grid[b + nx + 1], thickness[b + nx + 1], offset, dx,
+        max_thickness_fraction)
+    v001 = _thickness_limited_grid_value(
+        grid[b + nynx], thickness[b + nynx], offset, dx,
+        max_thickness_fraction)
+    v101 = _thickness_limited_grid_value(
+        grid[b + nynx + 1], thickness[b + nynx + 1], offset, dx,
+        max_thickness_fraction)
+    v011 = _thickness_limited_grid_value(
+        grid[b + nynx + nx], thickness[b + nynx + nx], offset, dx,
+        max_thickness_fraction)
+    v111 = _thickness_limited_grid_value(
+        grid[b + nynx + nx + 1], thickness[b + nynx + nx + 1],
+        offset, dx, max_thickness_fraction)
+    c00 = v000 * (1.0 - fx) + v100 * fx
+    c10 = v010 * (1.0 - fx) + v110 * fx
+    c01 = v001 * (1.0 - fx) + v101 * fx
+    c11 = v011 * (1.0 - fx) + v111 * fx
+    c0 = c00 * (1.0 - fy) + c10 * fy
+    c1 = c01 * (1.0 - fy) + c11 * fy
+    out[tid] = c0 * (1.0 - fz) + c1 * fz
+
+
 @wp.kernel
 def _color_sdf_kernel(
     field: wp.array(dtype=wp.float32),
@@ -431,7 +516,11 @@ def make_lut_wp(lut: np.ndarray | None = None):
 def upload_grid(grid: np.ndarray):
     """Upload the (nz,ny,nx) SDF grid to the device once (cache in the viewer)."""
     dev = best_device()
-    flat = np.ascontiguousarray(grid.ravel().astype(np.float32))
+    # ``astype`` without ``copy=False`` duplicated even an already-contiguous
+    # 512³ float32 carrier (another 512 MiB).  Keep the upload staging view
+    # zero-copy whenever the caller already supplies production layout/dtype.
+    flat = np.ascontiguousarray(
+        np.asarray(grid, dtype=np.float32)).reshape(-1)
     return wp.array(flat, dtype=wp.float32, device=dev)
 
 
@@ -463,20 +552,34 @@ def render_ellipsoid(centers, radii, rotations, origin, normal_idx, k, W, H,
 
 def render_mesh(grid_wp, gorigin, dx, nx, ny, nz, origin, normal_idx, k, W, H,
                 px, lut_wp, n_lut, depth, out_band, offset=0.0,
-                gamma=SLICE_INTERIOR_GAMMA):
+                gamma=SLICE_INTERIOR_GAMMA, thickness_wp=None,
+                max_thickness_fraction=0.25):
     """GPU-render the (trilinearly interpolated) mesh slice → uint8 RGBA.
 
-    ``offset`` is the SDF "blowup": a uniform value added to every sampled SDF.
+    ``offset`` is the requested SDF blowup.  With ``thickness_wp`` its magnitude
+    is capped per voxel by ``max_thickness_fraction`` of local feature thickness.
     """
     dev = best_device()
     M = int(W) * int(H)
     p0, s0, s1 = _plane_basis(origin, normal_idx, k, px, dx)
     field = wp.empty(M, dtype=wp.float32, device=dev)
-    wp.launch(_grid_field_kernel, dim=M,
-              inputs=[grid_wp, wp.vec3(float(gorigin[0]), float(gorigin[1]), float(gorigin[2])),
-                      float(dx), int(nx), int(ny), int(nz), p0, s0, s1, int(H),
-                      float(offset), field],
-              device=dev)
+    common = [
+        wp.vec3(float(gorigin[0]), float(gorigin[1]), float(gorigin[2])),
+        float(dx), int(nx), int(ny), int(nz), p0, s0, s1, int(H),
+    ]
+    if thickness_wp is None:
+        wp.launch(
+            _grid_field_kernel, dim=M,
+            inputs=[grid_wp, *common, float(offset), field],
+            device=dev)
+    else:
+        wp.launch(
+            _adaptive_grid_field_kernel, dim=M,
+            inputs=[
+                grid_wp, thickness_wp, *common, float(offset),
+                float(max_thickness_fraction), field,
+            ],
+            device=dev)
     rgba = wp.empty(M * 4, dtype=wp.uint8, device=dev)
     wp.launch(_color_sdf_kernel, dim=M,
               inputs=[field, float(depth), float(out_band), float(gamma),
@@ -487,11 +590,12 @@ def render_mesh(grid_wp, gorigin, dx, nx, ny, nz, origin, normal_idx, k, W, H,
 
 def render_diff(centers, radii, rotations, grid_wp, gorigin, dx, nx, ny, nz,
                 origin, normal_idx, k, W, H, px, primary_rgb, secondary_rgb,
-                mid_rgb=(128, 128, 138), offset=0.0):
+                mid_rgb=(128, 128, 138), offset=0.0, thickness_wp=None,
+                max_thickness_fraction=0.25):
     """GPU-render ellipsoid−mesh on a diverging two-colour ramp → uint8 RGBA.
 
-    ``offset`` is added to the mesh SDF (the blowup), so the diff is
-    ``ellipsoid − (mesh + offset)``.
+    ``offset`` is added to the mesh SDF.  With ``thickness_wp`` the same local
+    thickness cap used by the fitting target is applied before interpolation.
     """
     dev = best_device()
     n_e = int(np.asarray(centers).shape[0])
@@ -508,11 +612,23 @@ def render_diff(centers, radii, rotations, grid_wp, gorigin, dx, nx, ny, nz,
         wp.launch(_ell_field_kernel, dim=M,
                   inputs=[wc, wr, wq, n_e, p0, s0, s1, int(H), ell], device=dev)
     mesh = wp.empty(M, dtype=wp.float32, device=dev)
-    wp.launch(_grid_field_kernel, dim=M,
-              inputs=[grid_wp, wp.vec3(float(gorigin[0]), float(gorigin[1]), float(gorigin[2])),
-                      float(dx), int(nx), int(ny), int(nz), p0, s0, s1, int(H),
-                      float(offset), mesh],
-              device=dev)
+    common = [
+        wp.vec3(float(gorigin[0]), float(gorigin[1]), float(gorigin[2])),
+        float(dx), int(nx), int(ny), int(nz), p0, s0, s1, int(H),
+    ]
+    if thickness_wp is None:
+        wp.launch(
+            _grid_field_kernel, dim=M,
+            inputs=[grid_wp, *common, float(offset), mesh],
+            device=dev)
+    else:
+        wp.launch(
+            _adaptive_grid_field_kernel, dim=M,
+            inputs=[
+                grid_wp, thickness_wp, *common, float(offset),
+                float(max_thickness_fraction), mesh,
+            ],
+            device=dev)
     mx = wp.zeros(1, dtype=wp.float32, device=dev)
     wp.launch(_maxabs_diff_kernel, dim=M, inputs=[ell, mesh, mx], device=dev)
     scale = max(float(mx.numpy()[0]), 1e-4)

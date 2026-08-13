@@ -6,3 +6,6 @@
 /app_settings.json
 /panel_settings.json
 /theme_colors.json
+
+# Local junction to the Unity project; keep Unity files in that project.
+/clothSimulation/

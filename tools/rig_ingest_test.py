@@ -52,6 +52,15 @@ def main() -> int:
         print(" ", e["name"], "->", e["bone"], "local_center=", e["local_center"])
     ok &= entries[0]["bone"] == "BoneA"
     ok &= entries[1]["bone"] == "BoneB"
+    for entry in entries:
+        attachment_indices = entry.get("attachment_bone_indices", [])
+        attachment_names = entry.get("attachment_bones", [])
+        attachment_weights = entry.get("attachment_weights", [])
+        ok &= len(attachment_indices) == len(attachment_names)
+        ok &= len(attachment_indices) == len(attachment_weights)
+        ok &= len(attachment_indices) > 0
+        ok &= abs(sum(attachment_weights) - 1.0) < 1.0e-5
+        ok &= entry["bone_index"] in attachment_indices
 
     # Roundtrip: bone-local center → world should match the input world center.
     sk = build_skeleton_from_bones(rig["bones"])

@@ -15,9 +15,11 @@ Quaternion convention throughout: [x, y, z, w]
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
 
 from bone_ellipsoid_mapper import BoneLocalEllipsoids
+from rig_ingest import attachment_entry_fields, sphere_name
 from skeleton import Skeleton
 
 
@@ -42,20 +44,26 @@ def export_ellipsoids(
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
     entries = []
+    counts = defaultdict(int)
     for i in range(bone_local.num_ellipsoids):
         bi = int(bone_local.bone_assignments[i])
+        bone_name = skeleton.bones[bi].name
+        local_index = counts[bone_name]
+        counts[bone_name] += 1
         entries.append({
-            "bone":           skeleton.bones[bi].name,
+            "name":           sphere_name(bone_name, local_index),
+            "bone":           bone_name,
             # offset from bone origin, expressed in bone's orientation frame
             "local_center":   [round(float(v), 7) for v in bone_local.local_centers[i]],
             # ellipsoid semi-axes (half-extents)
             "radii":          [round(float(v), 7) for v in bone_local.local_radii[i]],
             # orientation relative to bone frame — quaternion [x, y, z, w]
             "local_rotation": [round(float(v), 7) for v in bone_local.local_rotations[i]],
+            **attachment_entry_fields(bone_local, i, skeleton),
         })
 
     payload = {
-        "version":               1,
+        "version":               2,
         "coordinate_system":     "right_hand_y_up",
         "quaternion_convention": "xyzw",
         "count":                 len(entries),

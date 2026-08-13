@@ -1,0 +1,603 @@
+[
+  {
+    "timestamp": "2026-06-30T14:59:22",
+    "phase": "triangle",
+    "reason": "early_stop",
+    "best_loss": 0.3937714695930481,
+    "final_loss": 0.609799861907959,
+    "best_step": 2608,
+    "elapsed": 255.1880000000001,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-59-22_triangle_loss-0.6098.pt",
+    "triangle_layers": [
+      512,
+      256,
+      128
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:53:56",
+    "phase": "triangle",
+    "reason": "early_stop",
+    "best_loss": 0.3451371192932129,
+    "final_loss": 0.4015648066997528,
+    "best_step": 9200,
+    "elapsed": 335.6720000000005,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-53-56_triangle_loss-0.401565.pt",
+    "triangle_layers": [
+      512,
+      256,
+      128
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:47:51",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.49547308683395386,
+    "final_loss": 0.49771183729171753,
+    "best_step": 940,
+    "elapsed": 27.35899999999856,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-47-51_triangle_loss-0.497712.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:42:41",
+    "phase": "triangle",
+    "reason": "completed",
+    "best_loss": 0.01837829500436783,
+    "final_loss": 0.018972478806972504,
+    "best_step": 49140,
+    "elapsed": 156.75,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-42-41_triangle_loss-0.0189725.pt",
+    "triangle_layers": [
+      512,
+      128,
+      16
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:36:08",
+    "phase": "triangle",
+    "reason": "early_stop",
+    "best_loss": 0.0018835922237485647,
+    "final_loss": 0.002501032780855894,
+    "best_step": 27216,
+    "elapsed": 163.78100000000086,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-36-08_triangle_loss-0.00250103.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:32:52",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.009427789598703384,
+    "final_loss": 0.010460380464792252,
+    "best_step": 3753,
+    "elapsed": 21.125,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-32-52_triangle_loss-0.0104604.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:27:27",
+    "phase": "triangle",
+    "reason": "completed",
+    "best_loss": 0.030437897890806198,
+    "final_loss": 0.031691595911979675,
+    "best_step": 45750,
+    "elapsed": 263.40599999999904,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-27-27_triangle_loss-0.0316916.pt",
+    "triangle_layers": [
+      256,
+      128
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:22:43",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.04024098441004753,
+    "final_loss": 0.041192978620529175,
+    "best_step": 18867,
+    "elapsed": 76.79600000000028,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-22-43_triangle_loss-0.041193.pt",
+    "triangle_layers": [
+      256,
+      128
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:21:08",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.04169139266014099,
+    "final_loss": 0.04274822026491165,
+    "best_step": 10791,
+    "elapsed": 47.96899999999914,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-21-08_triangle_loss-0.0427482.pt",
+    "triangle_layers": [
+      256,
+      128
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:20:00",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.04067387804389,
+    "final_loss": 0.04176507517695427,
+    "best_step": 25003,
+    "elapsed": 90.57800000000134,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-20-00_triangle_loss-0.0417651.pt",
+    "triangle_layers": [
+      256,
+      128
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:18:22",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.05525121092796326,
+    "final_loss": 0.05563509464263916,
+    "best_step": 5379,
+    "elapsed": 17.53100000000086,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-18-22_triangle_loss-0.0556351.pt",
+    "triangle_layers": [
+      256,
+      64
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:17:57",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.07273319363594055,
+    "final_loss": 0.07273319363594055,
+    "best_step": 3500,
+    "elapsed": 12.265999999999622,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-17-57_triangle_loss-0.0727332.pt",
+    "triangle_layers": [
+      256,
+      16
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:07:42",
+    "phase": "point",
+    "reason": "early_stop",
+    "best_loss": 0.00016720424173399806,
+    "final_loss": 0.00019827163487207144,
+    "best_step": 28132,
+    "elapsed": 153.32799999999952,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-07-42_point_loss-0.000198272.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:03:41",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.11493681371212006,
+    "final_loss": 0.11677703261375427,
+    "best_step": 9032,
+    "elapsed": 39.625,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-03-41_triangle_loss-0.116777.pt",
+    "triangle_layers": [
+      16
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:02:52",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.015462033450603485,
+    "final_loss": 0.016486290842294693,
+    "best_step": 1952,
+    "elapsed": 12.59400000000096,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-02-52_triangle_loss-0.0164863.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:02:30",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.005934671498835087,
+    "final_loss": 0.007024755701422691,
+    "best_step": 8016,
+    "elapsed": 50.39099999999962,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-02-30_triangle_loss-0.00702476.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:01:25",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.038987044245004654,
+    "final_loss": 0.040216971188783646,
+    "best_step": 5585,
+    "elapsed": 32.03199999999924,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-01-25_triangle_loss-0.040217.pt",
+    "triangle_layers": [
+      512,
+      512
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T14:00:42",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.0032172491773962975,
+    "final_loss": 0.004019373096525669,
+    "best_step": 16811,
+    "elapsed": 97.95399999999972,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T14-00-42_triangle_loss-0.00401937.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T13:43:37",
+    "phase": "nested",
+    "reason": "stopped",
+    "best_loss": 0.09936754405498505,
+    "final_loss": 0.11149732768535614,
+    "best_step": 713,
+    "elapsed": 6.781000000000859,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T13-43-37_nested_loss-0.111497.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T13:43:08",
+    "phase": "point",
+    "reason": "stopped",
+    "best_loss": 0.0017693773843348026,
+    "final_loss": 0.002468771766871214,
+    "best_step": 7236,
+    "elapsed": 29.67199999999866,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T13-43-08_point_loss-0.00246877.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T13:42:34",
+    "phase": "triangle",
+    "reason": "stopped",
+    "best_loss": 0.00595664419233799,
+    "final_loss": 0.00751747889444232,
+    "best_step": 7521,
+    "elapsed": 35.01499999999942,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T13-42-34_triangle_loss-0.00751748.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T13:41:36",
+    "phase": "triangle",
+    "reason": "early_stop",
+    "best_loss": 0.0028725857846438885,
+    "final_loss": 0.0036623382475227118,
+    "best_step": 19555,
+    "elapsed": 88.89100000000144,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T13-41-36_triangle_loss-0.00366234.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  },
+  {
+    "timestamp": "2026-06-30T13:38:33",
+    "phase": "point",
+    "reason": "stopped",
+    "best_loss": 0.002636021003127098,
+    "final_loss": 0.0037876637652516365,
+    "best_step": 5294,
+    "elapsed": 24.485000000000582,
+    "checkpoint": "C:\\Users\\dmertens\\AMA#\\Mesh_To_EllipsoidSDF\\saved_runs\\neural_triangle\\2026-06-30T13-38-33_point_loss-0.00378766.pt",
+    "triangle_layers": [
+      512,
+      512,
+      256,
+      256
+    ],
+    "point_backbone_layers": [
+      256,
+      256,
+      128
+    ],
+    "inside_head_layers": [
+      64
+    ],
+    "grad_head_layers": [
+      128
+    ]
+  }
+]

@@ -16,6 +16,7 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
 import theme
+from sdf_blowup import apply_thickness_limited_blowup
 from sdf_colormap import make_sdf_lut, colorize_sdf_slice
 
 
@@ -121,6 +122,22 @@ class DropGLView(gl.GLViewWidget):
         self._nav_timer.stop()
         super().focusOutEvent(ev)
 
+    def mouseMoveEvent(self, ev):
+        # pyqtgraph pans the middle mouse button in ``view-upright`` space by
+        # default.  That keeps vertical dragging tied to the world's up axis.
+        # Use the camera's right/up basis instead so both drag axes stay in the
+        # plane parallel to the viewport at every orbit angle.
+        if ev.buttons() == QtCore.Qt.MiddleButton:
+            lpos = ev.position() if hasattr(ev, "position") else ev.localPos()
+            if not hasattr(self, "mousePos"):
+                self.mousePos = lpos
+            diff = lpos - self.mousePos
+            self.mousePos = lpos
+            self.pan(diff.x(), diff.y(), 0.0, relative="view")
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
     def _nav_step(self):
         keys = self._nav_keys
         if not keys:
@@ -221,7 +238,15 @@ class SdfSlicePanel(QtWidgets.QWidget):
         super().__init__(parent)
         self._lut = make_sdf_lut()
         self._sdf_grid: Optional[np.ndarray] = None
+        self._blowup_thickness: Optional[np.ndarray] = None
+        self._sdf_blowup_vox: float = 0.0
+        self._raw_sdf_depth: float = 1.0e-4
+        self._sdf_origin = np.zeros(3, dtype=np.float32)
         self._dx: float = 1.0                 # voxel size (for the exterior band)
+        self._sparse_points: Optional[np.ndarray] = None
+        self._sparse_values: Optional[np.ndarray] = None
+        self._sparse_scatter: Optional[pg.ScatterPlotItem] = None
+        self._max_sparse_points_per_slice = 20_000
         # Default grid resolution.  The host lowers this (→ 64) when no CUDA GPU
         # is present, since the n³ SDF runs on the CPU there and 512³ is far too
         # heavy.  Not persisted, so it is re-applied per session.
@@ -230,15 +255,37 @@ class SdfSlicePanel(QtWidgets.QWidget):
 
     # ── public API ────────────────────────────────────────────────────────
 
-    def set_sdf(self, grid: np.ndarray, dx: float | None = None) -> None:
+    def set_sdf(
+        self,
+        grid: np.ndarray,
+        dx: float | None = None,
+        origin: np.ndarray | None = None,
+        blowup_thickness: np.ndarray | None = None,
+    ) -> None:
         """
         Provide a new SDF volume (nz, ny, nx) and refresh the view.
         The Z slider is automatically adjusted.  ``dx`` (voxel size) sets the
         exterior fade band so the colouring matches the 3-D slice.
         """
-        self._sdf_grid = grid
+        self._sdf_grid = np.asarray(grid, dtype=np.float32)
+        self._raw_sdf_depth = max(
+            -float(np.min(self._sdf_grid)), 1.0e-4)
+        if blowup_thickness is None:
+            self._blowup_thickness = None
+        else:
+            local_thickness = np.asarray(
+                blowup_thickness, dtype=np.float32)
+            if local_thickness.shape != self._sdf_grid.shape:
+                raise ValueError(
+                    "blowup_thickness must have the same shape as grid")
+            # Keep the SdfResult-owned array by reference; copying a 512³
+            # carrier just for the 2-D panel would waste hundreds of MiB.
+            self._blowup_thickness = local_thickness
         if dx is not None:
             self._dx = max(float(dx), 1e-9)
+        if origin is not None:
+            self._sdf_origin = np.asarray(origin, dtype=np.float32).reshape(3)
+        self.set_sparse_samples(None, update=False)
         n = grid.shape[0]
 
         self.slider_z.blockSignals(True)
@@ -249,6 +296,57 @@ class SdfSlicePanel(QtWidgets.QWidget):
         self.slider_z.blockSignals(False)
 
         self._update_slice()
+
+    def set_sdf_blowup(self, voxels: float) -> None:
+        """Set the requested maximum offset and redraw only the visible slice."""
+        requested = float(voxels)
+        if requested == self._sdf_blowup_vox:
+            return
+        self._sdf_blowup_vox = requested
+        self._update_slice()
+
+    def set_blowup_thickness(
+        self,
+        blowup_thickness: np.ndarray | None,
+        *,
+        update: bool = True,
+    ) -> None:
+        """Attach a lazily-built carrier without replacing the raw SDF grid."""
+        if blowup_thickness is self._blowup_thickness:
+            return
+        if blowup_thickness is None:
+            self._blowup_thickness = None
+        else:
+            local_thickness = np.asarray(
+                blowup_thickness, dtype=np.float32)
+            if (self._sdf_grid is None
+                    or local_thickness.shape != self._sdf_grid.shape):
+                raise ValueError(
+                    "blowup_thickness must have the same shape as grid")
+            self._blowup_thickness = local_thickness
+        if update:
+            self._update_slice()
+
+    def set_sparse_samples(self, samples, update: bool = True) -> None:
+        """Overlay sparse SDF training samples on the current XY slice."""
+        if samples is None:
+            self._sparse_points = None
+            self._sparse_values = None
+            if self._sparse_scatter is not None:
+                self._sparse_scatter.setData(x=[], y=[])
+            if update:
+                self._update_slice()
+            return
+
+        pts = np.asarray(getattr(samples, "points", samples), dtype=np.float32)
+        self._sparse_points = np.ascontiguousarray(pts.reshape(-1, 3))
+        vals = getattr(samples, "values", None)
+        self._sparse_values = (
+            None if vals is None
+            else np.ascontiguousarray(np.asarray(vals, dtype=np.float32).reshape(-1))
+        )
+        if update:
+            self._update_slice()
 
     @property
     def requested_n(self) -> int:
@@ -302,6 +400,17 @@ class SdfSlicePanel(QtWidgets.QWidget):
 
         layout.addWidget(QtWidgets.QLabel("XY (Z fixed)"))
         layout.addWidget(self.img_xy, 1)
+        self._sparse_scatter = pg.ScatterPlotItem(
+            size=4,
+            pxMode=True,
+            pen=pg.mkPen(0, 0, 0, 180, width=1),
+            brush=pg.mkBrush(255, 255, 255, 190),
+        )
+        self._sparse_scatter.setZValue(10)
+        try:
+            self.img_xy.getView().addItem(self._sparse_scatter)
+        except Exception:
+            self.img_xy.addItem(self._sparse_scatter)
 
         # Z slider
         self.slider_z = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -328,14 +437,31 @@ class SdfSlicePanel(QtWidgets.QWidget):
             return
         n = self._sdf_grid.shape[0]
         iz = max(0, min(n - 1, int(self.slider_z.value())))
-        slice2d = np.ascontiguousarray(self._sdf_grid[iz, :, :].T)   # [a0, a1]
+        raw_slice = self._sdf_grid[iz, :, :]
+        thickness_slice = (
+            None if self._blowup_thickness is None
+            else self._blowup_thickness[iz, :, :]
+        )
+        adjusted_slice = apply_thickness_limited_blowup(
+            raw_slice,
+            self._sdf_blowup_vox * float(self._dx),
+            thickness_slice,
+            float(self._dx),
+        )
+        slice2d = np.ascontiguousarray(adjusted_slice.T)   # [a0, a1]
 
         # Colour exactly like the 3-D slice: interior blends surface->deepest
         # across the whole interior (full colour only at the deepest point),
         # exterior fades within a few voxels.  depth is per-volume (deepest
         # interior magnitude of the WHOLE grid, so the colour scale is stable
         # while scrolling through Z).
-        depth = max(-float(self._sdf_grid.min()), 1e-4)
+        # Conservative and stable while moving the slider.  The displayed zero
+        # surface itself is exact; this value controls only colour normalization.
+        requested = self._sdf_blowup_vox * float(self._dx)
+        depth = max(
+            self._raw_sdf_depth + max(-requested, 0.0),
+            1.0e-4,
+        )
         out_band = 3.0 * float(self._dx)
         rgba = colorize_sdf_slice(slice2d, self._lut, depth, out_band)
         # Pre-coloured RGBA → must be shown RAW.  ImageView otherwise applies a
@@ -348,6 +474,42 @@ class SdfSlicePanel(QtWidgets.QWidget):
         item.setLookupTable(None)
         self.img_xy.setImage(rgba, autoLevels=False, autoHistogramRange=False,
                              levels=(0, 255))
+        self._update_sparse_overlay(iz)
+
+    def _update_sparse_overlay(self, iz: int) -> None:
+        if self._sparse_scatter is None:
+            return
+        if self._sparse_points is None or self._sdf_grid is None:
+            self._sparse_scatter.setData(x=[], y=[])
+            return
+
+        nz, ny, nx = self._sdf_grid.shape
+        q = (self._sparse_points - self._sdf_origin[None, :]) / float(self._dx) - 0.5
+        slab = np.abs(q[:, 2] - float(iz)) <= 0.75
+        bounds = (
+            (q[:, 0] >= -0.5) & (q[:, 0] <= nx - 0.5)
+            & (q[:, 1] >= -0.5) & (q[:, 1] <= ny - 0.5)
+        )
+        idx = np.flatnonzero(slab & bounds)
+        if idx.size == 0:
+            self._sparse_scatter.setData(x=[], y=[])
+            return
+
+        if idx.size > self._max_sparse_points_per_slice:
+            take = np.linspace(
+                0, idx.size - 1, self._max_sparse_points_per_slice
+            ).astype(np.int64)
+            idx = idx[take]
+
+        pts = q[idx]
+        self._sparse_scatter.setData(
+            x=pts[:, 0],
+            y=pts[:, 1],
+            symbol="o",
+            size=4,
+            pen=pg.mkPen(0, 0, 0, 180, width=1),
+            brush=pg.mkBrush(255, 255, 255, 190),
+        )
 
     def _on_compute_clicked(self):
         self.computeRequested.emit(self.requested_n)

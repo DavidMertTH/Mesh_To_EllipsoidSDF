@@ -230,6 +230,51 @@ class _OptimizedPrimitiveShape(ShapePlugin):
 
         return chk, rng, lbl, every
 
+    @staticmethod
+    def _build_window_toggle_group(
+        v: QtWidgets.QVBoxLayout,
+        title: str,
+        chk_text: str,
+        chk_tip: str,
+        window_default: tuple[int, int],
+        *,
+        checked: bool,
+    ) -> tuple:
+        """Build an enable checkbox plus a two-handle training window slider."""
+        form = _OptimizedPrimitiveShape._group(v, title)
+
+        chk = QtWidgets.QCheckBox(chk_text)
+        chk.setChecked(checked)
+        chk.setToolTip(chk_tip)
+        form.addRow(chk)
+
+        lo0, hi0 = window_default
+        rng = RangeSlider(0, 100)
+        rng.setValues(lo0, hi0)
+        rng.setToolTip(
+            "Training window: the two handles set from when (left) until when\n"
+            "(right) of the run this mode is active, as a fraction of total steps.")
+        lbl = QtWidgets.QLabel(f"{lo0} % – {hi0} %")
+        lbl.setMinimumWidth(72)
+        lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        win_row = QtWidgets.QWidget()
+        win_h = QtWidgets.QHBoxLayout(win_row)
+        win_h.setContentsMargins(0, 0, 0, 0)
+        win_h.setSpacing(6)
+        win_h.addWidget(rng, 1)
+        win_h.addWidget(lbl)
+        rng.valueChanged.connect(
+            lambda lo, hi: lbl.setText(f"{lo} % – {hi} %"))
+        form.addRow("Window:", win_row)
+
+        def _set_enabled(on: bool) -> None:
+            rng.setEnabled(on)
+            lbl.setEnabled(on)
+        _set_enabled(checked)
+        chk.toggled.connect(_set_enabled)
+
+        return chk, rng, lbl
+
     def _build_common_groups(self, v: QtWidgets.QVBoxLayout) -> None:
         """Build the Densification + Local-fit + Maintenance groups shared by
         all fitted shapes.  Densification and Local fit use the *same* uniform
@@ -434,10 +479,19 @@ class SuperquadricShape(_OptimizedPrimitiveShape):
     def _build_options(self) -> QtWidgets.QWidget:
         root, v = self._new_root()
 
-        # ── Roundness (shared across all primitives, fixed during a fit) ──
+        # ── Roundness ──
         rg = self._group(v, "Roundness  (ε)")
+        self._combo_eps_mode = QtWidgets.QComboBox()
+        self._combo_eps_mode.addItem("Per primitive (trainable)", "per_primitive")
+        self._combo_eps_mode.addItem("Shared (trainable)", "shared")
+        self._combo_eps_mode.addItem("Fixed", "fixed")
+        self._combo_eps_mode.setToolTip(
+            "Controls how the two roundness exponents are fitted.\n"
+            "Per primitive gives every primitive its own ε₁/ε₂ pair; shared "
+            "learns one pair for the whole population; fixed keeps the initial "
+            "values unchanged.")
         self._spin_eps1 = QtWidgets.QDoubleSpinBox()
-        self._spin_eps1.setRange(0.2, 1.5)
+        self._spin_eps1.setRange(0.1, 2.0)
         self._spin_eps1.setSingleStep(0.05)
         self._spin_eps1.setDecimals(2)
         self._spin_eps1.setValue(0.6)
@@ -445,20 +499,43 @@ class SuperquadricShape(_OptimizedPrimitiveShape):
             "ε₁ — north-south roundness.\n"
             "1.0 = ellipsoid, < 1 = boxier (sharper edges), > 1 = pinched.")
         self._spin_eps2 = QtWidgets.QDoubleSpinBox()
-        self._spin_eps2.setRange(0.2, 1.5)
+        self._spin_eps2.setRange(0.1, 2.0)
         self._spin_eps2.setSingleStep(0.05)
         self._spin_eps2.setDecimals(2)
         self._spin_eps2.setValue(0.6)
         self._spin_eps2.setToolTip(
             "ε₂ — east-west roundness (cross-section).\n"
             "1.0 = ellipsoid, < 1 = boxier, > 1 = pinched.")
+        self._spin_eps_warmup = QtWidgets.QSpinBox()
+        self._spin_eps_warmup.setRange(0, 80)
+        self._spin_eps_warmup.setSingleStep(5)
+        self._spin_eps_warmup.setSuffix(" %")
+        self._spin_eps_warmup.setValue(20)
+        self._spin_eps_warmup.setToolTip(
+            "Fraction of training spent fitting centres, radii and rotations "
+            "before trainable ε values are unlocked.")
+        self._spin_bend_warmup = QtWidgets.QSpinBox()
+        self._spin_bend_warmup.setRange(0, 90)
+        self._spin_bend_warmup.setSingleStep(5)
+        self._spin_bend_warmup.setSuffix(" %")
+        self._spin_bend_warmup.setValue(40)
+        self._spin_bend_warmup.setToolTip(
+            "Bent superquadrics unlock curvature after this fraction of the run.")
+        self._bend_warmup_row_label = QtWidgets.QLabel("Bend warm-up:")
+        self._bend_warmup_row_label.setVisible(False)
+        self._spin_bend_warmup.setVisible(False)
+
         info = QtWidgets.QLabel(
-            "Shared roundness for all primitives (fixed during the fit). "
-            "1.0 = ellipsoid; smaller = rounded-box.")
+            "The ε values above are the initial values.  1.0 is an ellipsoid; "
+            "smaller values produce rounded boxes and larger values produce "
+            "pinched shapes.")
         info.setWordWrap(True)
         info.setStyleSheet("color: gray;")
+        rg.addRow("Mode:", self._combo_eps_mode)
         rg.addRow("ε₁ (lengthwise):", self._spin_eps1)
         rg.addRow("ε₂ (cross):", self._spin_eps2)
+        rg.addRow("Shape warm-up:", self._spin_eps_warmup)
+        rg.addRow(self._bend_warmup_row_label, self._spin_bend_warmup)
         rg.addRow(info)
 
         self._build_common_groups(v)
@@ -466,8 +543,11 @@ class SuperquadricShape(_OptimizedPrimitiveShape):
 
     def _setting_specs(self) -> list:
         return [
+            ("eps_mode", self._combo_eps_mode, "combo_data"),
             ("eps1", self._spin_eps1, "float"),
             ("eps2", self._spin_eps2, "float"),
+            ("eps_warmup", self._spin_eps_warmup, "int"),
+            ("bend_warmup", self._spin_bend_warmup, "int"),
         ] + self._common_specs()
 
     def viewer_eps(self):
@@ -488,6 +568,9 @@ class SuperquadricShape(_OptimizedPrimitiveShape):
             "primitive_shape": "superquadric",
             "sq_eps1": self._spin_eps1.value(),
             "sq_eps2": self._spin_eps2.value(),
+            "sq_eps_mode": self._combo_eps_mode.currentData(),
+            "sq_unlock_frac": self._spin_eps_warmup.value() / 100.0,
+            "sq_bend_unlock_frac": self._spin_bend_warmup.value() / 100.0,
             **self._common_fit_kwargs(),
         }
 
@@ -502,6 +585,8 @@ class BentSuperquadricShape(SuperquadricShape):
 
     def _build_options(self) -> QtWidgets.QWidget:
         root = super()._build_options()
+        self._bend_warmup_row_label.setVisible(True)
+        self._spin_bend_warmup.setVisible(True)
         # Add a note: bend is trained per primitive (no slider).
         lbl = QtWidgets.QLabel(
             "Plus a per-primitive bend (curvature), trained automatically — "
@@ -530,6 +615,9 @@ class BentSuperquadricShape(SuperquadricShape):
             "primitive_shape": "bent_superquadric",
             "sq_eps1": self._spin_eps1.value(),
             "sq_eps2": self._spin_eps2.value(),
+            "sq_eps_mode": self._combo_eps_mode.currentData(),
+            "sq_unlock_frac": self._spin_eps_warmup.value() / 100.0,
+            "sq_bend_unlock_frac": self._spin_bend_warmup.value() / 100.0,
             **self._common_fit_kwargs(),
         }
 

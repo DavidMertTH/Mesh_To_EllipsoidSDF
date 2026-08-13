@@ -202,6 +202,46 @@ def compute_relative_underrep(
     return points.astype(np.float32), values
 
 
+def relative_underrep_samples(
+    target_values: np.ndarray,
+    pred_values: np.ndarray,
+    dx: float,
+    surface_weight: float = 4.0,
+    surface_sigma_vox: float = 1.5,
+    depth_floor_vox: float = 2.0,
+    outside_margin_vox: float = 0.0,
+    min_gap_vox: float = 1.0,
+    thickness_values: np.ndarray | None = None,
+    min_thickness_vox: float = 0.0,
+) -> np.ndarray:
+    """Surface-weighted under-representation at arbitrary exact samples.
+
+    This is the point-sampled counterpart of :func:`relative_underrep_grid`.
+    Values stay aligned with the input arrays; samples outside the considered
+    target band or below the absolute gap floor receive zero severity.
+    """
+    target = np.asarray(target_values, dtype=np.float32).reshape(-1)
+    pred = np.asarray(pred_values, dtype=np.float32).reshape(-1)
+    if target.shape != pred.shape:
+        raise ValueError("target_values and pred_values must have the same shape")
+
+    thickness = None
+    if thickness_values is not None:
+        thickness = np.asarray(thickness_values, dtype=np.float32).reshape(-1)
+        if thickness.shape != target.shape:
+            raise ValueError("thickness_values must match target_values")
+
+    out = np.zeros(target.shape, dtype=np.float32)
+    consider_idx, rel, gap, sw = _underrep_score(
+        target, pred, dx,
+        surface_weight, surface_sigma_vox, depth_floor_vox, outside_margin_vox,
+        thickness, min_thickness_vox,
+    )
+    valid = gap >= float(min_gap_vox) * float(dx)
+    out[consider_idx[valid]] = (rel[valid] * sw[valid]).astype(np.float32)
+    return out
+
+
 def relative_underrep_grid(
     target_grid: np.ndarray,
     pred_grid: np.ndarray,

@@ -334,6 +334,16 @@ def save_animation(poses: List[Pose], skeleton: Skeleton, name: str,
     """Serialize a multi-frame animation clip independent of any mesh."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    # Guard against accidental one-frame "animations" when the current Rig Mode
+    # source is a single saved pose.  Keep it as a hold clip so downstream UI and
+    # MultiFit see a real clip length without inventing unexpected motion.
+    if len(poses) == 1:
+        base = poses[0]
+        poses = [
+            Pose(name=f"{base.name or name} hold {i:02d}",
+                 bone_locals=dict(base.bone_locals))
+            for i in range(24)
+        ]
     frames = []
     for i, pose in enumerate(poses):
         frame = serialize_pose(pose, skeleton)

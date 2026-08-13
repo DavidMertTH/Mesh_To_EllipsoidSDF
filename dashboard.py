@@ -9,6 +9,10 @@ numbers are visible without reading the run tracker.
 Fed from MainWindow's existing optimisation signal handlers via:
   begin(total_steps, mesh_name, num_ellipsoids)
   record(step, loss, n_ellipsoids, radii=None)
+  record_local_progress(current, total)
+  record_local_loss(loss)
+  record_local_regions(count)
+  record_maintenance(step, changed, appended)
   set_phase(phase)   finish()   reset()
 """
 
@@ -48,6 +52,8 @@ class DashboardPanel(QtWidgets.QWidget):
         ("ellipsoids", "Ellipsoids"),
         ("phase", "Phase"), ("elapsed", "Elapsed"),
         ("speed", "Speed"), ("eta", "ETA"),
+        ("local_fit", "Local fit"), ("local_loss", "Local loss"),
+        ("local_regions", "Regions"), ("maintenance", "Maintenance"),
     )
     _CARD_COLS = 4
 
@@ -111,6 +117,23 @@ class DashboardPanel(QtWidgets.QWidget):
 
     def set_phase(self, phase: str) -> None:
         self._set("phase", str(phase).upper())
+
+    def record_local_progress(self, current: int, total: int) -> None:
+        total = max(1, int(total))
+        current = max(0, min(int(current), total))
+        self._set("local_fit",
+                  f"{current} / {total}  ({current / total * 100:.0f}%)")
+
+    def record_local_loss(self, loss: float) -> None:
+        self._set("local_loss", _fmt_loss(float(loss)))
+
+    def record_local_regions(self, count: int) -> None:
+        self._set("local_regions", str(max(0, int(count))))
+
+    def record_maintenance(self, step: int, changed: int,
+                           appended: int) -> None:
+        self._set("maintenance",
+                  f"s{int(step)}: ops {int(changed)}, +{int(appended)}")
 
     def finish(self) -> None:
         self._set("phase", "DONE")

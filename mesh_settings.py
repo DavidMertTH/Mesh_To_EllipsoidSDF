@@ -5,8 +5,9 @@ Two controls:
   * Rotation (X/Y/Z degrees) — slider AND a number field per axis; rotates the
     loaded mesh.  For a rigged FBX the host applies the rotation across every
     pose (and the skeleton) and re-computes the SDF asynchronously.
-  * SDF Blowup — a single offset added uniformly to the SDF at every voxel
-    (positive erodes / surface inward, negative dilates).  Shown live in the SDF
+  * SDF Blowup — a requested maximum offset for the SDF (positive erodes /
+    surface inward, negative dilates).  The local magnitude is capped at 25% of
+    feature thickness so thin structures are protected.  Shown live in the SDF
     slice and baked into the fit target.
   * Mesh Blowup — an exploded view of the per-bone region submeshes (the carving
     used by Bone-Separation mode): a toggle plus a slider that pushes each bone's
@@ -22,6 +23,11 @@ from __future__ import annotations
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
+
+from sdf_blowup import (
+    DEFAULT_MAX_THICKNESS_FRACTION,
+    MAX_UI_BLOWUP_VOXELS,
+)
 
 
 def rotation_matrix(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
@@ -61,7 +67,8 @@ class MeshSettingsPanel(QtWidgets.QWidget):
     regionBlowupChanged = QtCore.Signal(float)             # explosion factor
 
     _BLOWUP_STEPS = 10          # slider int → /10 voxels
-    _BLOWUP_RANGE = 100         # ±10.0 voxels
+    _BLOWUP_RANGE = int(round(
+        MAX_UI_BLOWUP_VOXELS * _BLOWUP_STEPS))
     _REGION_STEPS = 100         # slider int → /100 explosion factor
     _REGION_RANGE = 300         # 0.0 … 3.0× explosion
 
@@ -106,8 +113,11 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         self._blowup.setRange(-self._BLOWUP_RANGE, self._BLOWUP_RANGE)
         self._blowup.setValue(0)
         self._blowup.setToolTip(
-            "Add a uniform offset (in voxels) to the SDF everywhere.\n"
+            "Request a maximum SDF offset in voxels.\n"
             "Positive erodes (surface inward), negative dilates.\n"
+            f"Locally capped at "
+            f"{100.0 * DEFAULT_MAX_THICKNESS_FRACTION:.0f}% of mesh thickness "
+            "to protect thin parts.\n"
             "Live in the slice and baked into the fit target.")
         self._lbl_blowup = QtWidgets.QLabel("0.0 vox")
         self._lbl_blowup.setMinimumWidth(56)
@@ -115,7 +125,7 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         brow = QtWidgets.QHBoxLayout()
         brow.addWidget(self._blowup)
         brow.addWidget(self._lbl_blowup)
-        bform.addRow("Offset:", brow)
+        bform.addRow("Max offset:", brow)
         self._btn_reset_blowup = QtWidgets.QPushButton("Reset blowup")
         self._btn_reset_blowup.clicked.connect(self.reset_blowup)
         bform.addRow(self._btn_reset_blowup)

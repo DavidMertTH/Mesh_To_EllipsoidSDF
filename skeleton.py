@@ -6,7 +6,8 @@ Pure data model + math helpers. No I/O, no UI.
 Exports used by other modules:
   - Bone, Pose, Skeleton
   - mat4_compose, mat4_decompose
-  - quat_multiply, quat_inverse, quat_rotate, quat_from_matrix
+  - quat_multiply, quat_inverse, quat_slerp, quat_rotate, quat_from_matrix
+  - interpolate_pose
 """
 
 from __future__ import annotations
@@ -43,6 +44,44 @@ def quat_inverse(q: np.ndarray) -> np.ndarray:
     """Conjugate (= inverse for unit quaternion) of (x,y,z,w)."""
     q = np.asarray(q, dtype=np.float64)
     return np.array([-q[0], -q[1], -q[2], q[3]], dtype=np.float64)
+
+
+def quat_slerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
+    """Shortest-path spherical interpolation for (x,y,z,w) quaternions."""
+    qa = np.asarray(a, dtype=np.float64).copy()
+    qb = np.asarray(b, dtype=np.float64).copy()
+    na = np.linalg.norm(qa)
+    nb = np.linalg.norm(qb)
+    if na <= 1.0e-12:
+        qa = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        qa /= na
+    if nb <= 1.0e-12:
+        qb = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        qb /= nb
+
+    u = float(np.clip(t, 0.0, 1.0))
+    dot = float(np.dot(qa, qb))
+    if dot < 0.0:
+        qb *= -1.0
+        dot = -dot
+
+    if dot > 0.9995:
+        out = (1.0 - u) * qa + u * qb
+    else:
+        theta_0 = np.arccos(np.clip(dot, -1.0, 1.0))
+        sin_0 = np.sin(theta_0)
+        theta = theta_0 * u
+        out = (
+            np.sin(theta_0 - theta) / sin_0 * qa
+            + np.sin(theta) / sin_0 * qb
+        )
+
+    n = np.linalg.norm(out)
+    if n <= 1.0e-12:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    return out / n
 
 
 def quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -207,6 +246,48 @@ class Pose:
     def t_pose(cls) -> Pose:
         """The bind / T-pose (no overrides)."""
         return cls(name="T-Pose")
+
+
+def interpolate_pose(
+    skeleton: "Skeleton",
+    a: Pose,
+    b: Pose,
+    t: float,
+    name: str | None = None,
+) -> Pose:
+    """Blend two poses in local bone space using TRS decomposition."""
+    u = float(np.clip(t, 0.0, 1.0))
+    if u <= 0.0:
+        return Pose(name=name or a.name, bone_locals={
+            int(i): np.asarray(m, dtype=np.float64).copy()
+            for i, m in a.bone_locals.items()
+        })
+    if u >= 1.0:
+        return Pose(name=name or b.name, bone_locals={
+            int(i): np.asarray(m, dtype=np.float64).copy()
+            for i, m in b.bone_locals.items()
+        })
+
+    bone_locals: Dict[int, np.ndarray] = {}
+    for bone in skeleton.bones:
+        idx = int(bone.index)
+        ma = (
+            np.asarray(a.bone_locals[idx], dtype=np.float64)
+            if idx in a.bone_locals
+            else np.asarray(bone.local_bind_transform, dtype=np.float64)
+        )
+        mb = (
+            np.asarray(b.bone_locals[idx], dtype=np.float64)
+            if idx in b.bone_locals
+            else np.asarray(bone.local_bind_transform, dtype=np.float64)
+        )
+        ta, ra, sa = mat4_decompose(ma)
+        tb, rb, sb = mat4_decompose(mb)
+        tr = (1.0 - u) * ta + u * tb
+        sc = (1.0 - u) * sa + u * sb
+        rot = quat_slerp(ra, rb, u)
+        bone_locals[idx] = mat4_compose(tr, rot, sc)
+    return Pose(name=name or f"{a.name} -> {b.name} {u:.2f}", bone_locals=bone_locals)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

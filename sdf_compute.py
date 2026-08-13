@@ -14,7 +14,12 @@ from typing import Optional
 import numpy as np
 import warp as wp
 
-from thickness import local_thickness
+from sdf_blowup import (
+    build_surface_carried_thickness,
+    conservative_mirror_min,
+)
+from thickness import dilate_zeros, local_thickness
+from sdf_samples import SdfSampleSet
 
 
 # ── Warp kernels ──────────────────────────────────────────────────────────────
@@ -124,6 +129,29 @@ def _sdf_voxel_grid_batch_kernel(
     out_sdf[tid] = d * s
 
 
+@wp.kernel
+def _sdf_points_kernel(
+    mesh_id: wp.uint64,
+    points: wp.array(dtype=wp.vec3),
+    max_dist: float,
+    use_winding: int,
+    out_sdf: wp.array(dtype=wp.float32),
+):
+    tid = wp.tid()
+    p = points[tid]
+    if use_winding == 1:
+        q = wp.mesh_query_point_sign_winding_number(mesh_id, p, max_dist, 2.0, 0.5)
+    else:
+        q = wp.mesh_query_point(mesh_id, p, max_dist)
+    if q.result == 0:
+        out_sdf[tid] = 1.0e6
+        return
+    closest = wp.mesh_eval_position(mesh_id, q.face, q.u, q.v)
+    d = wp.length(p - closest)
+    s = -1.0 if q.sign < 0.0 else 1.0
+    out_sdf[tid] = d * s
+
+
 # ── Data containers ───────────────────────────────────────────────────────────
 
 @dataclass
@@ -141,6 +169,7 @@ class SdfResult:
     aabb_min: np.ndarray      # (3,) float32
     aabb_max: np.ndarray      # (3,) float32
     thickness: np.ndarray | None = None  # (nz, ny, nx) float32 local feature thickness
+    blowup_thickness: np.ndarray | None = None  # thickness carried into exterior blowup band
     nx: int = 0               # per-axis voxel counts; 0 → fall back to ``n``
     ny: int = 0
     nz: int = 0
@@ -153,11 +182,83 @@ class SdfResult:
             self.ny = self.n
         if self.nz == 0:
             self.nz = self.n
+        if self.blowup_thickness is not None:
+            blowup_thickness = np.asarray(
+                self.blowup_thickness, dtype=np.float32)
+            if blowup_thickness.shape != np.asarray(self.grid).shape:
+                raise ValueError(
+                    "blowup_thickness must have the same shape as grid")
+            self.blowup_thickness = np.ascontiguousarray(blowup_thickness)
 
     @property
     def shape(self) -> tuple[int, int, int]:
         """Grid shape as ``(nz, ny, nx)`` — matches ``grid.shape``."""
         return (self.nz, self.ny, self.nx)
+
+
+def _sample_voxel_field_trilinear(
+    field: np.ndarray,
+    origin: np.ndarray,
+    spacing: float | np.ndarray,
+    points: np.ndarray,
+    *,
+    chunk_size: int = 262_144,
+) -> np.ndarray:
+    """Sample a voxel-centred ``(nz, ny, nx)`` field at world-space points.
+
+    ``origin`` is the grid *corner*, matching :class:`SdfResult`; consequently
+    voxel ``(0, 0, 0)`` is centred at ``origin + 0.5 * spacing``.  A scalar
+    spacing covers the regular production grids.  A 3-vector is accepted for
+    the anisotropic coarse lattice used by the sparse-only fallback.
+
+    Values outside the grid's cell bounds are zero.  Processing in chunks keeps
+    temporary index/weight arrays bounded even for million-sample clouds.
+    """
+    values = np.asarray(field, dtype=np.float32)
+    if values.ndim != 3:
+        raise ValueError("voxel field must have shape (nz, ny, nx)")
+    pts = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
+    if pts.size == 0:
+        return np.empty(0, dtype=np.float32)
+    org = np.asarray(origin, dtype=np.float64).reshape(3)
+    step = np.asarray(spacing, dtype=np.float64)
+    if step.ndim == 0:
+        step = np.repeat(step, 3)
+    step = step.reshape(3)
+    if not np.isfinite(step).all() or np.any(step <= 0.0):
+        raise ValueError("voxel spacing must be finite and positive")
+
+    # Coordinates and shape are xyz here; the ndarray itself is indexed zyx.
+    shape_xyz = np.asarray(values.shape[::-1], dtype=np.int64)
+    out = np.zeros(len(pts), dtype=np.float32)
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, len(pts), chunk_size):
+        end = min(len(pts), start + chunk_size)
+        coord = (pts[start:end].astype(np.float64) - org) / step - 0.5
+        valid_point = np.all(
+            (coord >= -0.5) & (coord <= shape_xyz.astype(np.float64) - 0.5),
+            axis=1,
+        )
+        # Cell-boundary points use constant extension of the nearest voxel;
+        # points farther outside remain zero via ``valid_point``.
+        coord = np.clip(coord, 0.0, shape_xyz.astype(np.float64) - 1.0)
+        lo = np.floor(coord).astype(np.int64)
+        hi = np.minimum(lo + 1, shape_xyz - 1)
+        frac = (coord - lo).astype(np.float32)
+        accum = np.zeros(end - start, dtype=np.float32)
+        for dz in (0, 1):
+            iz = hi[:, 2] if dz else lo[:, 2]
+            wz = frac[:, 2] if dz else (1.0 - frac[:, 2])
+            for dy in (0, 1):
+                iy = hi[:, 1] if dy else lo[:, 1]
+                wy = frac[:, 1] if dy else (1.0 - frac[:, 1])
+                for dx_i in (0, 1):
+                    ix = hi[:, 0] if dx_i else lo[:, 0]
+                    wx = frac[:, 0] if dx_i else (1.0 - frac[:, 0])
+                    accum += values[iz, iy, ix] * (wx * wy * wz)
+        accum[~valid_point] = 0.0
+        out[start:end] = accum
+    return out
 
 
 # ── SDF computer ──────────────────────────────────────────────────────────────
@@ -177,6 +278,7 @@ class SdfComputer:
         self.device = device or ("cuda" if wp.is_cuda_available() else "cpu")
         self._warp_mesh: Optional[wp.Mesh] = None
         self._verts: Optional[np.ndarray] = None
+        self._faces: Optional[np.ndarray] = None
         # Whether the mesh is closed (every edge shared by exactly 2 faces).  A
         # non-watertight mesh has an unreliable normal-based inside/outside sign,
         # so we switch to the (slower but robust) winding-number sign for it.
@@ -197,6 +299,7 @@ class SdfComputer:
             faces: (F, 3) int32
         """
         self._verts = verts.astype(np.float32, copy=False)
+        self._faces = faces.astype(np.int32, copy=False)
         self._watertight = self._is_watertight(faces)
         points_wp = wp.array(self._verts, dtype=wp.vec3, device=self.device)
         indices_wp = wp.array(
@@ -241,6 +344,233 @@ class SdfComputer:
             device=self.device,
         )
         return float(out.numpy()[0])
+
+    def query_points(self, points: np.ndarray, max_dist: float = 1.0e6) -> np.ndarray:
+        """Return signed distances for many world-space points."""
+        self._check_ready()
+        pts = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
+        if pts.size == 0:
+            return np.empty(0, dtype=np.float32)
+        pts_wp = wp.array(pts, dtype=wp.vec3, device=self.device)
+        out = wp.empty(pts.shape[0], dtype=wp.float32, device=self.device)
+        wp.launch(
+            kernel=_sdf_points_kernel,
+            dim=pts.shape[0],
+            inputs=[self._warp_mesh.id, pts_wp, float(max_dist),
+                    self._winding_flag, out],
+            device=self.device,
+        )
+        return out.numpy().astype(np.float32, copy=False)
+
+    def compute_sparse_samples(
+        self,
+        n: int,
+        margin: float = 0.5,
+        surface_samples: int | None = None,
+        offsets_vox: tuple[float, ...] = (-4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0),
+        coarse_n: int = 32,
+        max_dist: float | None = None,
+        seed: int = 12345,
+        progress_cb=None,
+        thickness_result: SdfResult | None = None,
+    ) -> SdfSampleSet:
+        """Compute sparse training samples concentrated around mesh triangles.
+
+        The sample cloud has high density in a narrow band around the surface
+        and a low-density coarse lattice through the padded AABB.  It is intended
+        for optimizer loss batches, not for UI slicing.
+
+        When ``thickness_result`` provides a dense local-thickness field, that
+        field is sampled trilinearly.  This is the preferred production path:
+        it gives sparse and dense training identical feature scales without
+        recomputing thickness.  Standalone sparse calls derive a lower-resolution
+        thickness field from their coarse SDF lattice instead.
+        """
+        self._check_ready()
+        if self._faces is None or self._verts is None:
+            raise RuntimeError("No mesh loaded. Call set_mesh() first.")
+        if progress_cb is not None:
+            progress_cb(0.0, "Preparing sparse SDF samples ...")
+
+        verts = np.asarray(self._verts, dtype=np.float32)
+        faces = np.asarray(self._faces, dtype=np.int32)
+        vmin = verts.min(axis=0).astype(np.float32)
+        vmax = verts.max(axis=0).astype(np.float32)
+        extent = vmax - vmin
+        max_extent = float(extent.max())
+        if max_extent <= 0.0:
+            raise ValueError("Degenerate AABB (extent <= 0).")
+
+        padded_max = max_extent * (1.0 + float(margin))
+        dx = padded_max / float(n)
+        padded = (extent * (1.0 + float(margin))).astype(np.float64)
+        counts = np.maximum(1, np.ceil(padded / dx).astype(np.int64))
+        center = 0.5 * (vmin + vmax)
+        half = 0.5 * counts.astype(np.float64) * dx
+        aabb_min = (center - half).astype(np.float32)
+        aabb_max = (center + half).astype(np.float32)
+
+        tri = verts[faces]
+        e1 = tri[:, 1] - tri[:, 0]
+        e2 = tri[:, 2] - tri[:, 0]
+        cross = np.cross(e1, e2)
+        double_area = np.linalg.norm(cross, axis=1)
+        valid = double_area > 1e-12
+        if not np.any(valid):
+            raise ValueError("Mesh has no non-degenerate triangles.")
+        tri = tri[valid]
+        cross = cross[valid]
+        area = (double_area[valid].astype(np.float64) * 0.5)
+        normals = cross / np.maximum(double_area[valid, None], 1e-12)
+
+        rng = np.random.default_rng(seed)
+        if surface_samples is None:
+            # O(n^2) surface density instead of O(n^3) volume density.
+            surface_samples = int(np.clip(2 * int(n) * int(n), 8192, 160_000))
+        area_sum = float(area.sum(dtype=np.float64))
+        if not np.isfinite(area_sum) or area_sum <= 1e-12:
+            raise ValueError("Mesh has no finite triangle area.")
+        probs = area / area_sum
+        probs = probs / float(probs.sum(dtype=np.float64))
+        tri_idx = rng.choice(len(tri), size=int(surface_samples), replace=True, p=probs)
+        r1 = rng.random(int(surface_samples), dtype=np.float32)
+        r2 = rng.random(int(surface_samples), dtype=np.float32)
+        sr1 = np.sqrt(r1).astype(np.float32, copy=False)
+        b0 = 1.0 - sr1
+        b1 = sr1 * (1.0 - r2)
+        b2 = sr1 * r2
+        base = (tri[tri_idx, 0] * b0[:, None]
+                + tri[tri_idx, 1] * b1[:, None]
+                + tri[tri_idx, 2] * b2[:, None]).astype(np.float32)
+        nrm = normals[tri_idx].astype(np.float32)
+
+        offsets = np.asarray(offsets_vox, dtype=np.float32) * np.float32(dx)
+        band_points = [
+            (base + off * nrm).astype(np.float32)
+            for off in offsets
+        ]
+
+        coarse_n = max(4, int(coarse_n))
+        coarse_counts = np.maximum(
+            1,
+            np.ceil(counts * (coarse_n / max(float(counts.max()), 1.0))).astype(np.int64),
+        )
+        gx = np.linspace(aabb_min[0], aabb_max[0], int(coarse_counts[0]), endpoint=False,
+                         dtype=np.float32) + 0.5 * (aabb_max[0] - aabb_min[0]) / int(coarse_counts[0])
+        gy = np.linspace(aabb_min[1], aabb_max[1], int(coarse_counts[1]), endpoint=False,
+                         dtype=np.float32) + 0.5 * (aabb_max[1] - aabb_min[1]) / int(coarse_counts[1])
+        gz = np.linspace(aabb_min[2], aabb_max[2], int(coarse_counts[2]), endpoint=False,
+                         dtype=np.float32) + 0.5 * (aabb_max[2] - aabb_min[2]) / int(coarse_counts[2])
+        zz, yy, xx = np.meshgrid(gz, gy, gx, indexing="ij")
+        coarse_points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=1).astype(np.float32)
+
+        band_count = sum(len(part) for part in band_points)
+        points = np.concatenate(band_points + [coarse_points], axis=0)
+        coarse_mask = np.zeros(points.shape[0], dtype=np.bool_)
+        coarse_mask[band_count:] = True
+        if progress_cb is not None:
+            progress_cb(0.45, f"Querying {len(points):,} sparse SDF samples ...")
+        if max_dist is None:
+            max_dist = max(16.0 * float(dx), 1.2 * padded_max)
+        if progress_cb is not None and len(points) > 65_536:
+            vals = np.empty(len(points), dtype=np.float32)
+            chunk = 65_536
+            for start in range(0, len(points), chunk):
+                end = min(len(points), start + chunk)
+                vals[start:end] = self.query_points(
+                    points[start:end],
+                    max_dist=float(max_dist),
+                )
+                progress_cb(
+                    0.45 + 0.50 * (end / max(1, len(points))),
+                    f"Sparse query {end:,}/{len(points):,} samples",
+                )
+            values = vals
+        else:
+            values = self.query_points(points, max_dist=float(max_dist))
+        if progress_cb is not None:
+            progress_cb(0.96, "Sampling sparse feature thickness ...")
+
+        thickness_field = None
+        thickness_origin = None
+        thickness_spacing: float | np.ndarray | None = None
+        if thickness_result is not None and thickness_result.thickness is not None:
+            carried_source = getattr(
+                thickness_result, "blowup_thickness", None)
+            source = np.asarray(
+                carried_source
+                if carried_source is not None
+                else thickness_result.thickness,
+                dtype=np.float32,
+            )
+            if source.shape != np.asarray(thickness_result.grid).shape:
+                raise ValueError("thickness_result grid/thickness shape mismatch")
+            # Prefer the normal-projected carrier used by dense fitting and the
+            # live preview.  Older results without that cache retain the former
+            # two-voxel compatibility extension.
+            thickness_field = (
+                source if carried_source is not None
+                else dilate_zeros(source, iters=2)
+            )
+            thickness_origin = np.asarray(thickness_result.origin, dtype=np.float32)
+            thickness_spacing = float(thickness_result.dx)
+        else:
+            # Sparse-only callers already queried a regular coarse SDF lattice.
+            # Reuse it as a geometrically meaningful, bounded-cost thickness
+            # source instead of silently disabling thin-feature weighting.
+            coarse_shape = (
+                int(coarse_counts[2]), int(coarse_counts[1]), int(coarse_counts[0]),
+            )
+            coarse_grid = values[band_count:].reshape(coarse_shape)
+            coarse_spacing = (
+                (aabb_max.astype(np.float64) - aabb_min.astype(np.float64))
+                / coarse_counts.astype(np.float64)
+            )
+            thickness_field = dilate_zeros(
+                local_thickness(coarse_grid, float(np.max(coarse_spacing))),
+                iters=2,
+            )
+            thickness_origin = aabb_min
+            thickness_spacing = coarse_spacing
+
+        thickness = _sample_voxel_field_trilinear(
+            thickness_field,
+            thickness_origin,
+            thickness_spacing,
+            points,
+        )
+        # All offset samples in one band originate from the same triangle point.
+        # If an exterior offset lies beyond the two-voxel dilated grid field,
+        # carry that surface point's feature scale along its sampled normal.
+        # This is a property of the sampling construction, not nearest-neighbour
+        # guessing, and keeps inside/outside residuals weighted symmetrically.
+        base_thickness = _sample_voxel_field_trilinear(
+            thickness_field,
+            thickness_origin,
+            thickness_spacing,
+            base,
+        )
+        surface_samples_i = int(surface_samples)
+        for band_i in range(len(band_points)):
+            start = band_i * surface_samples_i
+            end = start + surface_samples_i
+            band_thickness = thickness[start:end]
+            missing = band_thickness <= 0.0
+            if np.any(missing):
+                band_thickness[missing] = base_thickness[missing]
+        thickness = np.nan_to_num(
+            thickness, nan=0.0, posinf=0.0, neginf=0.0,
+        ).astype(np.float32, copy=False)
+        if progress_cb is not None:
+            progress_cb(1.0, "Sparse SDF samples done")
+        return SdfSampleSet(
+            points,
+            values,
+            thickness,
+            dx=float(dx),
+            source="mesh-sparse",
+            coarse_mask=coarse_mask,
+        )
 
     # ── voxel grid ────────────────────────────────────────────────────────
 
@@ -343,7 +673,8 @@ class SdfComputer:
 
     def _launch_grid_half(self, aabb_min: np.ndarray, dx: float, shape: tuple,
                           max_dist: float, mirror_ax: int,
-                          progress_cb=None) -> np.ndarray:
+                          progress_cb=None, p0: float = 0.1,
+                          p1: float = 0.9) -> np.ndarray:
         """Compute only one half of the grid along ``mirror_ax`` and mirror it.
 
         For a mesh symmetric about the box centre, voxel ``i`` and ``nA-1-i``
@@ -363,7 +694,7 @@ class SdfComputer:
 
         if progress_cb is not None:
             grid_low = self._launch_grid_chunked(
-                aabb_min, dx, half_shape, max_dist, progress_cb, p0=0.1, p1=0.9)
+                aabb_min, dx, half_shape, max_dist, progress_cb, p0=p0, p1=p1)
         else:
             grid_low = self._launch_grid(aabb_min, dx, half_shape, max_dist)
 
@@ -379,9 +710,11 @@ class SdfComputer:
 
     def compute_voxel_grid(self, n: int, margin: float = 0.5,
                            compute_thickness: bool = True,
+                           thickness_max_resolution: int | None = 128,
                            max_dist: float | None = None,
                            progress_cb=None,
-                           symmetry: bool = False) -> SdfResult:
+                           symmetry: bool = False,
+                           compute_blowup_thickness: bool = False) -> SdfResult:
         """
         Compute an axis-aligned voxel grid SDF from the mesh AABB.
 
@@ -390,6 +723,13 @@ class SdfComputer:
             margin: fractional margin added to the bounding box extent (0.0–1.0).
             compute_thickness: also compute the local feature-thickness field
                 (used by the relative under-representation metric).
+            compute_blowup_thickness: carry that thickness through the exterior
+                offset band.  Disable while blowup is zero to avoid retaining a
+                second large volume; it can be built lazily from ``thickness``.
+            thickness_max_resolution: if set, compute the expensive thickness
+                field on a downsampled grid whose longest axis is at most this
+                value, then upsample to the SDF grid shape.  ``0``/``None`` keeps
+                full-resolution thickness.
             max_dist: BVH search cap (world units).  ``None`` → auto-size from a
                 coarse interior-depth probe (prunes the empty exterior for a big
                 speedup).  Pass ``float('inf')`` to disable the cap.
@@ -444,24 +784,52 @@ class SdfComputer:
 
         mirror_ax = (self._detect_mirror_axis(coarse, coarse_dx)
                      if (symmetry and coarse is not None) else None)
+        grid_p1 = 0.78 if compute_thickness else 0.9
 
         if mirror_ax is not None:
             if progress_cb is not None:
                 progress_cb(0.08, f"SDF grid (symmetric ½, axis {'zyx'[mirror_ax]}) …")
             grid = self._launch_grid_half(
                 aabb_min, float(dx), (nx, ny, nz), float(max_dist),
-                mirror_ax, progress_cb)
+                mirror_ax, progress_cb, p0=0.1, p1=grid_p1)
         elif progress_cb is not None:
             grid = self._launch_grid_chunked(
                 aabb_min, float(dx), (nx, ny, nz), float(max_dist),
-                progress_cb, p0=0.1, p1=0.9)
+                progress_cb, p0=0.1, p1=grid_p1)
         else:
             grid = self._launch_grid(aabb_min, float(dx), (nx, ny, nz),
                                      float(max_dist))
 
-        if progress_cb is not None and compute_thickness:
-            progress_cb(0.9, "Computing thickness field …")
-        thickness = local_thickness(grid, float(dx)) if compute_thickness else None
+        thickness = None
+        blowup_thickness = None
+        if compute_thickness:
+            if progress_cb is not None:
+                progress_cb(grid_p1, "Computing thickness field …")
+
+                def _thick_progress(frac, msg):
+                    progress_cb(
+                        grid_p1 + (0.98 - grid_p1) * float(frac),
+                        str(msg),
+                    )
+            else:
+                _thick_progress = None
+            thickness = local_thickness(
+                grid, float(dx),
+                max_resolution=thickness_max_resolution,
+                progress_cb=_thick_progress)
+            if mirror_ax is not None:
+                # Strided low-resolution thickness sampling starts at index 0
+                # and can introduce a one-sided phase bias.  Mirror the resolved
+                # partner across one-sided holes and otherwise keep the smaller
+                # measured pair value, so the cap is exact and conservative.
+                thickness = conservative_mirror_min(
+                    thickness, axis=mirror_ax)
+            if compute_blowup_thickness:
+                if progress_cb is not None:
+                    progress_cb(
+                        0.985, "Preparing adaptive SDF blowup field …")
+                blowup_thickness = build_surface_carried_thickness(
+                    grid, thickness, float(dx))
         if progress_cb is not None:
             progress_cb(1.0, "SDF done")
 
@@ -473,6 +841,7 @@ class SdfComputer:
             aabb_min=aabb_min,
             aabb_max=aabb_max,
             thickness=thickness,
+            blowup_thickness=blowup_thickness,
             nx=nx, ny=ny, nz=nz,
         )
 

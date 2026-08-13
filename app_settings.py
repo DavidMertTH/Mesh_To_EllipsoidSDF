@@ -5,9 +5,9 @@ maintenance limits (how many ellipsoids merge / spawn / split per cycle), the
 high-res local-fit resolution, the loss weights, the sampling budget, etc.
 
 The values are stored as one flat ``{key: value}`` dict and persisted to
-``app_settings.json`` next to this file.  **Every key matches an
-``OptimizationWorker.__init__`` keyword argument exactly**, so the dict can be
-forwarded straight into the worker (see ``MainWindow.start_optimization``).
+``app_settings.json`` next to this file.  Most keys are forwarded into
+``OptimizationWorker``; global SDF/UI keys (for example sparse SDF and
+thickness resolution) are consumed by the window before worker creation.
 
 ``SETTINGS_SPEC`` is a 3-level structure that drives the settings dialog UI:
 
@@ -85,14 +85,22 @@ SETTINGS_SPEC = [
              "maintained region."),
             ("region_res", "Region resolution", "int", 32, 256, 16, 0, 128,
              "Voxel resolution of the fresh high-res SDF box used for local fit."),
-            ("region_steps", "Region steps", "int", 100, 20000, 100, 0, 2000,
-             "Total Adam steps spent per region local fit."),
+            ("region_steps", "Region steps", "int", 100, 20000, 100, 0, 400,
+              "Total Adam steps spent per region local fit."),
             ("region_dc_cycles", "Divide & conquer cycles", "int", 1, 10, 1, 0, 3,
              "Number of divide-and-conquer passes within one region fit."),
-            ("local_steps", "Local steps", "int", 100, 10000, 100, 0, 1200,
-             "Minimum Adam steps for an isolated local fit."),
-            ("local_lr", "Local learning rate", "float", 0.0001, 0.5, 0.005, 4, 0.02,
-             "Learning rate used while fitting a newly spawned region in isolation."),
+            ("local_steps", "Local steps", "int", 100, 10000, 100, 0, 400,
+              "Minimum Adam steps for an isolated local fit."),
+            ("local_lr", "Local learning rate", "float", 0.0001, 0.5, 0.0001, 4, 0.001,
+              "Learning rate used while fitting a newly spawned region in isolation."),
+            ("local_center_trust_radius_factor", "Center trust radius", "float",
+             0.0, 4.0, 0.05, 2, 0.75,
+             "Maximum cumulative centre movement during one local fit, as a\n"
+             "fraction of the ellipsoid's starting mean radius. 0 disables it."),
+            ("local_radii_trust_factor", "Radii trust factor", "float",
+             1.0, 4.0, 0.05, 2, 1.5,
+             "Maximum factor by which each radius may grow or shrink during\n"
+             "one local fit (symmetric in log space)."),
         ]),
     ]),
 
@@ -105,7 +113,7 @@ SETTINGS_SPEC = [
             ("miss_penalty_weight", "Miss penalty", "float", 0.0, 30.0, 0.5, 1, 3.0,
              "Penalty when the target is inside the mesh but the ellipsoids miss it."),
             ("outside_penalty_weight", "Protrusion penalty", "float", 0.0, 50.0, 0.5, 1, 14.0,
-             "Penalty when an ellipsoid bulges out past the true surface."),
+             "Quadratic per-location penalty when an ellipsoid bulges out past the true surface."),
             ("containment_weight", "Containment weight", "float", 0.0, 30.0, 0.5, 1, 6.0,
              "Pull an ellipsoid whose centre drifts outside the mesh back inside."),
             ("flat_weight", "Flatness penalty", "float", 0.0, 10.0, 0.1, 2, 0.5,
@@ -140,6 +148,15 @@ SETTINGS_SPEC = [
     ]),
 
     ("Sampling", [
+        ("SDF target", [
+            ("use_sparse_sdf", "Use sparse SDF samples", "bool", 0, 1, 1, 0, True,
+             "Train the optimiser on sparse surface-focused SDF samples.\n"
+             "Disable to use the full dense SDF grid for the loss."),
+            ("thickness_max_resolution", "Thickness max resolution", "int", 0, 512, 16, 0, 128,
+             "Compute the expensive local-thickness field at at most this\n"
+             "longest-axis resolution and upsample it to the SDF grid.\n"
+             "0 = full-resolution thickness."),
+        ]),
         ("Batch sampling", [
             ("sample_budget", "Sample budget (voxels)", "int", 64, 262144, 64, 0, 4096,
              "Voxels sampled per optimisation step — resolution-independent cost."),
@@ -158,6 +175,13 @@ SETTINGS_SPEC = [
              "Per-group learning-rate multiplier for the (log-space) radii."),
             ("lr_mult_rot", "LR × rotation", "float", 0.0, 10.0, 0.5, 1, 1.0,
              "Per-group learning-rate multiplier for the rotations."),
+            ("center_step_radius_frac", "Center step radius frac", "float", 0.0, 2.0, 0.05, 2, 0.5,
+             "Limit one centre update to this fraction of the ellipsoid's\n"
+             "mean radius. 0 disables the limiter."),
+            ("center_step_min_vox", "Center step min (vox)", "float", 0.0, 5.0, 0.05, 2, 0.25,
+             "Minimum allowed centre movement per Adam step, in voxels."),
+            ("center_step_max_vox", "Center step max (vox)", "float", 0.1, 20.0, 0.1, 1, 4.0,
+             "Maximum allowed centre movement per Adam step, in voxels."),
         ]),
         ("Symmetry", [
             ("symmetry_every", "Symmetry every (steps)", "int", 1, 1000, 10, 0, 100,
