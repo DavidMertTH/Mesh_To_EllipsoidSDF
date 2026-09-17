@@ -47,12 +47,15 @@ def main() -> int:
     def on_fit(job_id: str):
         server.registry.update(job_id, state="running")
         result = {
-            "version": 2, "rigged": False, "count": 2,
+            "version": 4, "primitive_type": "ellipsoid",
+            "rigged": False, "count": 2,
             "ellipsoids": [
                 {"name": "Sphere_0", "bone": None, "center": [0, 0, 0],
-                 "radii": [1, 1, 1], "rotation": [0, 0, 0, 1]},
+                 "radii": [1, 1, 1], "rotation": [0, 0, 0, 1],
+                 "primitive_type": "ellipsoid", "shape_exponents": [1, 1]},
                 {"name": "Sphere_1", "bone": None, "center": [1, 0, 0],
-                 "radii": [0.5, 0.5, 0.5], "rotation": [0, 0, 0, 1]},
+                 "radii": [0.5, 0.5, 0.5], "rotation": [0, 0, 0, 1],
+                 "primitive_type": "ellipsoid", "shape_exponents": [1, 1]},
             ],
         }
         server.registry.update(job_id, state="done", result=result, count=2)
@@ -65,7 +68,7 @@ def main() -> int:
 
     code, body = _get(f"{base}/ping")
     print("ping:", code, body)
-    ok &= code == 200 and body["busy"] is False
+    ok &= code == 200 and body["busy"] is False and body["version"] == 4
 
     cube = {
         "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]],

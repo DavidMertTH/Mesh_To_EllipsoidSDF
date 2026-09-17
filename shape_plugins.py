@@ -494,7 +494,7 @@ class SuperquadricShape(_OptimizedPrimitiveShape):
         self._spin_eps1.setRange(0.1, 2.0)
         self._spin_eps1.setSingleStep(0.05)
         self._spin_eps1.setDecimals(2)
-        self._spin_eps1.setValue(0.6)
+        self._spin_eps1.setValue(1.0)
         self._spin_eps1.setToolTip(
             "ε₁ — north-south roundness.\n"
             "1.0 = ellipsoid, < 1 = boxier (sharper edges), > 1 = pinched.")
@@ -502,7 +502,7 @@ class SuperquadricShape(_OptimizedPrimitiveShape):
         self._spin_eps2.setRange(0.1, 2.0)
         self._spin_eps2.setSingleStep(0.05)
         self._spin_eps2.setDecimals(2)
-        self._spin_eps2.setValue(0.6)
+        self._spin_eps2.setValue(1.0)
         self._spin_eps2.setToolTip(
             "ε₂ — east-west roundness (cross-section).\n"
             "1.0 = ellipsoid, < 1 = boxier, > 1 = pinched.")
@@ -510,7 +510,7 @@ class SuperquadricShape(_OptimizedPrimitiveShape):
         self._spin_eps_warmup.setRange(0, 80)
         self._spin_eps_warmup.setSingleStep(5)
         self._spin_eps_warmup.setSuffix(" %")
-        self._spin_eps_warmup.setValue(20)
+        self._spin_eps_warmup.setValue(5)
         self._spin_eps_warmup.setToolTip(
             "Fraction of training spent fitting centres, radii and rotations "
             "before trainable ε values are unlocked.")

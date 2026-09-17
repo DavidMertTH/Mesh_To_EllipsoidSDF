@@ -88,7 +88,6 @@ class AnimationPoseSamplerTest(unittest.TestCase):
         validation = _block_after(SAMPLER, "bool TryCollectSources(")
         for requirement in (
             "has no clip",
-            "not imported as a Humanoid animation",
             "has no usable duration",
             "has a non-finite normalized time range",
             "needs a non-zero normalized time range",
@@ -97,6 +96,7 @@ class AnimationPoseSamplerTest(unittest.TestCase):
             "must be at least the enabled source count",
         ):
             self.assertIn(requirement, validation)
+        self.assertNotIn("!source.clip.humanMotion", validation)
         self.assertIn("MaximumSampleCount", validation)
 
     def test_sample_budget_is_hard_bounded(self) -> None:
@@ -259,7 +259,7 @@ class AnimationPoseSamplerTest(unittest.TestCase):
             SAMPLER,
         )
         symmetry = _block_after(
-            FITTER, "bool ConfigureSavedTargetSymmetry(")
+            FITTER, "void ResolveSavedTargetSymmetry(")
         self.assertIn(
             "!animationSample.GenerateMirroredSupport",
             symmetry,

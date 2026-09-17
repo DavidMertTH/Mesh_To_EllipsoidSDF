@@ -224,6 +224,8 @@ def load_and_prepare_arrays(
     vertices: np.ndarray,
     faces: np.ndarray,
     target_scale: float = 1.0,
+    *,
+    faces_already_oriented: bool = False,
 ) -> tuple[trimesh.Trimesh, NormalizationTransform]:
     """Build a normalized Trimesh from in-memory vertex/face arrays.
 
@@ -245,16 +247,17 @@ def load_and_prepare_arrays(
 
     mesh = trimesh.Trimesh(vertices=verts, faces=tris, process=False)
 
-    # Meshes arriving over the wire (Unity, other DCC tools) can have an
-    # inconsistent or inward-facing winding.  The SDF sign is derived from
-    # triangle orientation (see sdf_compute._winding_flag), so inward-facing
-    # normals invert the field — the interior reads as exterior and the fit
-    # never converges.  Reorient faces outward so the sign is correct
-    # regardless of the caller's winding convention (handedness, CW/CCW).
-    try:
-        trimesh.repair.fix_normals(mesh)   # fix_winding + volume-based inversion
-    except Exception:                      # non-manifold/degenerate → best effort
-        pass
+    # Face orientation is invariant across poses of the same mesh topology.
+    # A synthetic batch can reuse faces repaired on its base fit instead of
+    # repeating this relatively expensive single-threaded graph traversal.
+    if not faces_already_oriented:
+        # Meshes arriving over the wire (Unity, other DCC tools) can have an
+        # inconsistent or inward-facing winding.  The SDF sign is derived from
+        # triangle orientation (see sdf_compute._winding_flag).
+        try:
+            trimesh.repair.fix_normals(mesh)
+        except Exception:  # non-manifold/degenerate → best effort
+            pass
 
     mesh, transform = normalize_mesh_capture(mesh, target_scale=target_scale)
     mesh.vertices = mesh.vertices.astype(np.float32, copy=False)

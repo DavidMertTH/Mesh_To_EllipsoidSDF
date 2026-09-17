@@ -2,7 +2,7 @@
 main_window.py — Application main window (fullscreen, three columns).
 
   ┌──────────────────────────┬──────────────────┬──────────────────┐
-  │  3-D Viewport            │  SDF Slice / Mesh │  Options column  │
+  │  3-D Viewport            │  Slice / Mesh     │  Options column  │
   │  (mesh + skeleton +      │  (tabbed)        │  (scrollable):   │
   │   ellipsoids, overlay)   │  ┌ Mesh tab ────┐│   Mesh, Training,│
   │                          │  │ rotation/blow││   Maintenance    │
@@ -16,7 +16,7 @@ main_window.py — Application main window (fullscreen, three columns).
 Starts fullscreen (F11 / Esc to toggle).
 Left:    mesh, skeleton bones and fitted ellipsoids share one GL scene with an
          in-viewport overlay (visibility toggles + render mode).
-Middle:  a tabbed top panel (SDF slice / Mesh) over the convergence curve + run
+Middle:  a tabbed top panel (Slice / Mesh) over the convergence curve + run
          statistics.  The "Mesh" tab holds per-mesh rotation/blowup controls and
          the FBX/rig panel (shown only when a rigged mesh is loaded).
 Right:   a scrollable options column — every selectable control, including
@@ -49,10 +49,16 @@ from api_rig_space import correct_unity_rig_space
 from mesh_io import load_and_prepare, load_and_prepare_arrays
 from sdf_compute import SdfComputer, SdfResult
 from sdf_blowup import (
-    apply_thickness_limited_blowup,
+    BLOWUP_CARRIER_MARGIN_VOXELS,
+    MAX_UI_THICKNESS_FRACTION,
+    apply_thickness_relative_blowup,
     build_surface_carried_thickness,
+    legacy_voxel_blowup_to_thickness_fraction,
+    relative_blowup_extent_voxels,
+    required_relative_sdf_margin,
     sparse_band_offsets,
 )
+from sdf_samples import sample_sdf_grid_normals
 from api_server import ApiServer
 from rig_ingest import (
     assign_ellipsoids_to_bones,
@@ -65,6 +71,7 @@ from bonesep_controller import BoneSeparationController
 from batched_fit import BatchedFitWorker
 from ellipsoid import EllipsoidSet, SDF_QUILEZ, SDF_METHOD_NAMES, best_device
 from viewer3d import SceneViewer3D
+from region_budget import build_mesh_region_budget
 from widgets import SdfSlicePanel
 from optimization import OptimizationWorker
 from pose_correctives import PoseCorrectiveLibrary, PoseCorrectiveWorker
@@ -142,7 +149,10 @@ class SdfWorker(QtCore.QThread):
                  compute_blowup_thickness: bool = False,
                  compute_sparse_samples: bool = False,
                  max_dist: float | None = None,
-                 sdf_blowup_offset: float = 0.0):
+                 sdf_blowup_fraction: float = 0.0,
+                 sdf_blowup_capacity_fraction: float | None = None,
+                 sdf_blowup_carrier_fraction: float | None = None,
+                 sdf_guard_voxels_per_side: int | None = None):
         super().__init__(parent)
         self._computer = computer
         self._n = n
@@ -154,14 +164,53 @@ class SdfWorker(QtCore.QThread):
             compute_blowup_thickness and compute_thickness)
         self._compute_sparse_samples = bool(compute_sparse_samples)
         self._max_dist = max_dist
-        self._sdf_blowup_offset = float(sdf_blowup_offset)
-        if not np.isfinite(self._sdf_blowup_offset):
-            raise ValueError("sdf_blowup_offset must be finite")
-        if self._sdf_blowup_offset != 0.0 and not self._compute_thickness:
+        self._sdf_blowup_fraction = float(sdf_blowup_fraction)
+        if (not np.isfinite(self._sdf_blowup_fraction)
+                or not -0.5 < self._sdf_blowup_fraction < 0.5):
             raise ValueError(
-                "non-zero sdf_blowup_offset requires compute_thickness")
-        if self._sdf_blowup_offset != 0.0:
+                "sdf_blowup_fraction magnitude must be smaller than 0.5")
+        if self._sdf_blowup_fraction != 0.0 and not self._compute_thickness:
+            raise ValueError(
+                "non-zero sdf_blowup_fraction requires compute_thickness")
+        if self._sdf_blowup_fraction != 0.0:
             self._compute_blowup_thickness = True
+        self._sdf_blowup_capacity_fraction = float(
+            self._sdf_blowup_fraction
+            if sdf_blowup_capacity_fraction is None
+            else sdf_blowup_capacity_fraction
+        )
+        if (not np.isfinite(self._sdf_blowup_capacity_fraction)
+                or not -0.5 < self._sdf_blowup_capacity_fraction < 0.5):
+            raise ValueError(
+                "sdf_blowup_capacity_fraction magnitude must be smaller than 0.5")
+        self._sdf_blowup_carrier_fraction = float(
+            self._sdf_blowup_capacity_fraction
+            if sdf_blowup_carrier_fraction is None
+            else sdf_blowup_carrier_fraction
+        )
+        if (not np.isfinite(self._sdf_blowup_carrier_fraction)
+                or not -0.5 < self._sdf_blowup_carrier_fraction < 0.5):
+            raise ValueError(
+                "sdf_blowup_carrier_fraction magnitude must be smaller than 0.5")
+        # Bounds capacity is unsigned and must cover both the baked transform
+        # and the carrier that supplies it.
+        self._sdf_blowup_capacity_fraction = max(
+            abs(self._sdf_blowup_capacity_fraction),
+            abs(self._sdf_blowup_fraction),
+            abs(self._sdf_blowup_carrier_fraction),
+        )
+        self._sdf_guard_voxels_per_side = int(
+            BLOWUP_CARRIER_MARGIN_VOXELS
+            if sdf_guard_voxels_per_side is None
+            and self._sdf_blowup_capacity_fraction != 0.0
+            else (sdf_guard_voxels_per_side or 0)
+        )
+        if (self._sdf_guard_voxels_per_side < 0
+                or (sdf_guard_voxels_per_side is not None
+                    and float(self._sdf_guard_voxels_per_side)
+                    != float(sdf_guard_voxels_per_side))):
+            raise ValueError(
+                "sdf_guard_voxels_per_side must be a non-negative integer")
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -179,6 +228,11 @@ class SdfWorker(QtCore.QThread):
     def run(self):
         try:
             self._raise_if_stopped()
+            effective_margin = required_relative_sdf_margin(
+                self._margin,
+                self._sdf_blowup_capacity_fraction,
+                self._n,
+            )
             if self._compute_sparse_samples:
                 def _grid_progress(f, m):
                     self._emit_progress(0.72 * float(f), str(m))
@@ -186,20 +240,30 @@ class SdfWorker(QtCore.QThread):
                 def _grid_progress(f, m):
                     self._emit_progress(float(f), str(m))
             result = self._computer.compute_voxel_grid(
-                n=self._n, margin=self._margin,
+                n=self._n, margin=effective_margin,
                 compute_thickness=self._compute_thickness,
                 compute_blowup_thickness=self._compute_blowup_thickness,
                 thickness_max_resolution=self._thickness_max_resolution,
                 max_dist=self._max_dist,
                 progress_cb=_grid_progress,
                 symmetry=self._symmetry,
+                blowup_thickness_fraction=(
+                    self._sdf_blowup_carrier_fraction),
+                guard_voxels_per_side=self._sdf_guard_voxels_per_side,
             )
             self._raise_if_stopped()
             if self._compute_sparse_samples:
                 samples = None
                 dense_count = int(np.prod(np.asarray(result.grid).shape))
-                local_blowup_vox = (
-                    self._sdf_blowup_offset / float(result.dx))
+                blowup_thickness = getattr(
+                    result, "blowup_thickness", None)
+                if blowup_thickness is None:
+                    blowup_thickness = result.thickness
+                local_blowup_vox = relative_blowup_extent_voxels(
+                    self._sdf_blowup_fraction,
+                    blowup_thickness,
+                    float(result.dx),
+                )
                 offsets = sparse_band_offsets(
                     local_blowup_vox,
                     base_offsets=(-2.0, -1.0, 0.0, 1.0, 2.0),
@@ -221,16 +285,29 @@ class SdfWorker(QtCore.QThread):
 
                     samples = self._computer.compute_sparse_samples(
                         n=int(result.n),
-                        margin=self._margin,
+                        margin=effective_margin,
                         surface_samples=surface_samples,
                         offsets_vox=offsets_vox,
                         coarse_n=coarse_n,
                         progress_cb=_sparse_progress,
                         thickness_result=result,
                     )
-                    if self._sdf_blowup_offset != 0.0:
-                        samples = samples.with_thickness_limited_offset(
-                            self._sdf_blowup_offset)
+                    if self._sdf_blowup_fraction != 0.0:
+                        adjusted_grid = apply_thickness_relative_blowup(
+                            result.grid,
+                            self._sdf_blowup_fraction,
+                            blowup_thickness,
+                        )
+                        adjusted_normals = sample_sdf_grid_normals(
+                            adjusted_grid,
+                            result.origin,
+                            float(result.dx),
+                            samples.points,
+                        )
+                        samples = samples.with_thickness_relative_offset(
+                            self._sdf_blowup_fraction,
+                            normals=adjusted_normals,
+                        )
                     if samples.size >= dense_count:
                         samples = None
                 else:
@@ -240,27 +317,71 @@ class SdfWorker(QtCore.QThread):
                     )
                 self._raise_if_stopped()
                 setattr(result, "_sparse_samples", samples)
-            if self._sdf_blowup_offset != 0.0:
+                setattr(result, "_sparse_samples_computed", True)
+            if self._sdf_blowup_fraction != 0.0:
                 blowup_thickness = getattr(
                     result, "blowup_thickness", None)
                 if blowup_thickness is None:
                     blowup_thickness = result.thickness
-                result.grid = apply_thickness_limited_blowup(
+                result.grid = apply_thickness_relative_blowup(
                     result.grid,
-                    self._sdf_blowup_offset,
+                    self._sdf_blowup_fraction,
                     blowup_thickness,
-                    float(result.dx),
                 )
                 if blowup_thickness is not None:
                     # Loss weighting must include the moved exterior band.
                     result.thickness = blowup_thickness
-            setattr(result, "_sdf_blowup_offset", self._sdf_blowup_offset)
+            setattr(
+                result, "_sdf_blowup_applied_fraction",
+                self._sdf_blowup_fraction)
+            setattr(
+                result, "_sdf_blowup_fraction",
+                self._sdf_blowup_fraction)
+            setattr(
+                result, "_sdf_blowup_capacity_fraction",
+                max(
+                    abs(self._sdf_blowup_capacity_fraction),
+                    (min(
+                        MAX_UI_THICKNESS_FRACTION,
+                        0.5 * float(effective_margin))
+                     if self._sdf_guard_voxels_per_side
+                     >= int(BLOWUP_CARRIER_MARGIN_VOXELS) else 0.0),
+                ),
+            )
             self._raise_if_stopped()
             self.done.emit(result)
         except _SdfCanceled:
             self.failed.emit(SDF_CANCELED)
         except Exception as e:                       # surfaced on the GUI thread
             self.failed.emit(str(e))
+
+
+class _DockDragStrip(QtWidgets.QWidget):
+    """Minimal dock handle without repeating the panel title above its content."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("WorkspaceDockDragStrip")
+        self.setFixedHeight(5)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed,
+        )
+        self.setCursor(QtCore.Qt.OpenHandCursor)
+
+    # Unhandled mouse events must reach QDockWidget so this remains a working
+    # drag / double-click handle even though it has no caption of its own.
+    def mousePressEvent(self, event) -> None:
+        event.ignore()
+
+    def mouseMoveEvent(self, event) -> None:
+        event.ignore()
+
+    def mouseReleaseEvent(self, event) -> None:
+        event.ignore()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        event.ignore()
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -301,6 +422,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._sdf = SdfComputer(device=self._device)
         self._ellipsoids: EllipsoidSet | None = None
+        self._fitted_primitive_type: str = "ellipsoid"
+        self._fitted_shape_exponents: np.ndarray | None = None
 
         self._last_mesh_result: SdfResult | None = None
 
@@ -313,17 +436,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._api_stage: str | None = None        # None | "sdf" | "fit" | "correctives" | "canceled"
         self._api_norm = None                     # NormalizationTransform
         self._api_options: dict | None = None
-        self._api_last = None                     # (centers, radii, rotations)
+        self._api_last = None                     # (centers, radii, rotations, eps)
         self._api_local_last = None               # optimized bone-local parameters
         self._api_symmetry = None                 # detected base-fit mirror layout
         self._api_fit_existing: bool = False
-        self._api_initial_ellipsoids = None       # normalized (centers, radii, rotations)
+        self._api_initial_ellipsoids = None       # normalized (centers, radii, rotations, eps)
         self._api_initial_ellipsoid_meta = None   # Unity ids/names/bones for fit-pose
+        self._api_primitive_type: str = "ellipsoid"
+        self._api_shape_fit_kwargs: dict = {"primitive_shape": "ellipsoid"}
         self._api_train_correctives: bool = False
         self._api_pose_corrective_source: str | None = None
         self._api_pending_base_result: dict | None = None
+        # Synthetic pose batches favor throughput over live visualization.  The
+        # numerical SDF/fit path stays identical; only GUI-only work is skipped.
+        self._api_batch_pipeline: bool = False
         self._api_preview_last_step: int = -1
         self._api_preview_last_time: float = 0.0
+        self._api_progress_last_time: float = 0.0
+        self._api_cached_raw_faces: np.ndarray | None = None
+        self._api_cached_oriented_faces: np.ndarray | None = None
+        self._api_cached_vertex_count: int = -1
         self._api_verts = None                    # original (un-normalized) verts
         self._api_rig: dict | None = None         # Unity skinning payload
         self._api_base_pose: Pose | None = None
@@ -339,7 +471,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bonesep_on_complete = None
         self._bonesep_is_api: bool = False
         self._bonesep_fit_kwargs: dict = {}
-        self._bonesep_sdf_blowup_offset: float = 0.0
+        self._bonesep_sdf_blowup_fraction: float = 0.0
         # Dedicated SDF computer/worker for the region-SDF precompute phase, kept
         # separate from ``self._sdf`` so per-bone grids never clobber the loaded
         # mesh's grid, slice view or viewport volume.
@@ -369,11 +501,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._viewer = SceneViewer3D()
         self._viewer.connect_ellipsoid_metric_changed(self._on_view_ellipsoid_metric_changed)
         self._active_ellipsoid_metric = self._viewer.ellipsoid_metric_mode()
-        # SDF slice is shown for the mesh only.  Without a CUDA GPU the n³ SDF
-        # runs on the CPU, so start at a much smaller default grid (64 vs 512).
+        # The Slice panel shows the mesh SDF or the color-coded fit error.
+        # Without a CUDA GPU the n³ SDF runs on the CPU, so start at a much
+        # smaller default grid (128 vs 512).
         self._cpu_only = not str(self._device).startswith("cuda")
         self._mesh_sdf_panel = SdfSlicePanel(
             default_n=128 if self._cpu_only else 512)
+        self._mesh_sdf_panel.set_error_source_provider(
+            self._viewer.slice_ellipsoid_parameters)
+        self._viewer.connect_slice_data_changed(
+            self._mesh_sdf_panel.refresh_error_slice)
         # Visual-refresh cadence (steps between viewport/dashboard updates).  On
         # GPU each emit forces a device sync + readback, so a wider stride (20)
         # keeps throughput up; on CPU steps are slow, so refresh more often (5)
@@ -447,7 +584,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._style_progress_bar()
         self._sdf_worker: SdfWorker | None = None
+        self._worker_generation: int = 0
+        self._sdf_worker_generation: int = 0
+        self._sdf_finalize_generation: int = 0
+        self._sdf_finalize_active: bool = False
         self._sdf_cancel_message: str | None = None
+        self._pending_blowup_capacity_fraction: float = 0.0
 
         # ── Shape plugins (multi-shape fitting infrastructure) ──
         # Each plugin owns its shape-specific options + how they map to the
@@ -462,6 +604,26 @@ class MainWindow(QtWidgets.QMainWindow):
         # _build_layout(), because the default mesh load can immediately kick
         # off an SDF computation that reads SDF/thickness settings.
         self._settings = app_settings.load()
+        # Read the panel state before the default mesh starts its worker.  In
+        # particular this lets a persisted non-zero blowup build its carrier in
+        # that worker, instead of doing the expensive first build later in the
+        # GUI thread during result finalization.
+        self._startup_panel_state = app_settings.load_panel()
+        self._startup_blowup_fraction: float | None = None
+        try:
+            _startup_shared = self._startup_panel_state.get("shared", {})
+            if "blowup_fraction" in _startup_shared:
+                self._startup_blowup_fraction = float(
+                    _startup_shared["blowup_fraction"])
+            elif "blowup" in _startup_shared:
+                self._startup_blowup_fraction = (
+                    legacy_voxel_blowup_to_thickness_fraction(
+                        float(_startup_shared["blowup"])))
+            if (self._startup_blowup_fraction is not None
+                    and not np.isfinite(self._startup_blowup_fraction)):
+                self._startup_blowup_fraction = None
+        except (AttributeError, TypeError, ValueError):
+            self._startup_blowup_fraction = None
         self._settings_dialog: SettingsDialog | None = None
         _tick(0.45, "Loading 3-D viewport & panels …")
 
@@ -473,6 +635,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _tick(1.0, "Done")
 
         self._opt_worker: OptimizationWorker | None = None
+        self._opt_worker_generation: int = 0
         self._opt_cancel_requested = False
         self._opt_cancel_message: str | None = None
         # Live-render decoupling: the optimizer can emit ``step_visual`` far faster
@@ -534,55 +697,213 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_panel_persistence()
 
     def _build_layout(self):
-        # Three columns:
-        #   left   — 3-D viewport (with the FBX/rig panel below it when rigged)
-        #   middle — SDF analysis (top) + convergence curve & statistics (bottom)
-        #   right  — a scrollable column with every option
+        """Build a Unity-style workspace from independently dockable panels."""
         self._build_option_widgets()
-
-        # ── Left: viewport only (the FBX/rig panel now lives in the Mesh tab) ──
-        left_panel = QtWidgets.QWidget()
-        left_layout = QtWidgets.QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
-        left_layout.addWidget(self._viewer.widget, 1)
-
-        # ── Middle: tabbed (SDF Slice / Mesh) on top, tabbed Dashboard / Runs
-        # below ──.  The Mesh tab bundles per-mesh settings + the FBX/rig panel.
-        self._top_tabs = QtWidgets.QTabWidget()
-        self._top_tabs.addTab(self._mesh_sdf_panel, "SDF Slice")
-        self._top_tabs.addTab(self._build_mesh_tab(), "Mesh")
-        self._analysis_tabs = QtWidgets.QTabWidget()
-        self._analysis_tabs.addTab(self._dashboard, "Dashboard")
-        self._analysis_tabs.addTab(self._run_tracker, "Runs")
-        middle_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        middle_splitter.addWidget(self._top_tabs)
-        middle_splitter.addWidget(self._analysis_tabs)
-        middle_splitter.setSizes([420, 580])
-        self._middle_panel = middle_splitter
-
-        # ── Right: options column (scrollable) ──
+        mesh_panel = self._build_mesh_tab()
         self._options_panel = self._build_options_column()
 
-        main_hsplitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        main_hsplitter.addWidget(left_panel)
-        main_hsplitter.addWidget(middle_splitter)
-        main_hsplitter.addWidget(self._options_panel)
-        main_hsplitter.setSizes([900, 460, 320])
-        main_hsplitter.setCollapsible(0, False)
-        main_hsplitter.setStretchFactor(0, 1)
+        self.setDockOptions(
+            QtWidgets.QMainWindow.AnimatedDocks
+            | QtWidgets.QMainWindow.AllowNestedDocks
+            | QtWidgets.QMainWindow.AllowTabbedDocks
+        )
+        self.setTabPosition(
+            QtCore.Qt.AllDockWidgetAreas, QtWidgets.QTabWidget.North)
+
+        # A zero-sized centre lets every visible workspace panel participate in
+        # Qt's dock layout, including the 3-D scene.  There is no permanently
+        # fixed panel: any dock can become a tab, a split, or a floating window.
+        centre = QtWidgets.QWidget(self)
+        centre.setObjectName("WorkspaceDockCentre")
+        centre.setFixedSize(0, 0)
+        self.setCentralWidget(centre)
+
+        self._dock_widgets = {
+            "scene": self._make_workspace_dock(
+                "Scene", "DockScene", self._viewer.widget),
+            "sdf": self._make_workspace_dock(
+                "Slice", "DockSdfSlice", self._mesh_sdf_panel),
+            "mesh": self._make_workspace_dock(
+                "Mesh", "DockMesh", mesh_panel),
+            "dashboard": self._make_workspace_dock(
+                "Dashboard", "DockDashboard", self._dashboard),
+            "runs": self._make_workspace_dock(
+                "Runs", "DockRuns", self._run_tracker),
+            "options": self._make_workspace_dock(
+                "Options", "DockOptions", self._options_panel),
+        }
+        self._layout_settings = QtCore.QSettings(
+            "EllipSDF", "MeshToEllipsoidSDF")
+        self._arrange_default_workspace()
+        self._default_workspace_resize_pending = (
+            not self._restore_workspace_layout())
+        self._schedule_workspace_dock_tab_style()
         self._build_view_menu()
         # 'Settings' is a clickable menu-bar entry (not a submenu) that opens a
         # small dialog with the detailed fitting knobs + theme colours.
         self.menuBar().addAction("Settings", self._open_settings_dialog)
-
-        central = QtWidgets.QWidget()
-        root_layout = QtWidgets.QVBoxLayout(central)
-        root_layout.setContentsMargins(4, 4, 4, 4)
-        root_layout.addWidget(main_hsplitter, 1)
-        self.setCentralWidget(central)
         self._scan_mesh_dir()
         self._load_default_mesh()
+
+    def _make_workspace_dock(
+            self, title: str, object_name: str,
+            widget: QtWidgets.QWidget) -> QtWidgets.QDockWidget:
+        dock = QtWidgets.QDockWidget(title, self)
+        # saveState/restoreState require a unique, stable object name.
+        dock.setObjectName(object_name)
+        dock.setAllowedAreas(QtCore.Qt.AllDockWidgetAreas)
+        dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetClosable
+            | QtWidgets.QDockWidget.DockWidgetMovable
+            | QtWidgets.QDockWidget.DockWidgetFloatable
+        )
+        dock.setWidget(widget)
+        dock.setMinimumSize(140, 100)
+        drag_strip = _DockDragStrip(dock)
+        dock._workspace_drag_strip = drag_strip
+        dock.setTitleBarWidget(drag_strip)
+        dock.topLevelChanged.connect(
+            lambda floating, d=dock: self._sync_workspace_dock_title_bar(
+                d, floating))
+        dock.dockLocationChanged.connect(
+            lambda _area: self._schedule_workspace_dock_tab_style())
+        return dock
+
+    def _sync_workspace_dock_title_bar(
+            self, dock: QtWidgets.QDockWidget, floating: bool) -> None:
+        """Use native chrome while floating and a caption-free grip in-layout."""
+        if floating:
+            dock.setTitleBarWidget(None)
+        else:
+            dock.setTitleBarWidget(dock._workspace_drag_strip)
+        self._schedule_workspace_dock_tab_style()
+
+    def _schedule_workspace_dock_tab_style(self) -> None:
+        """Restyle Qt-created dock tabs after the layout has settled."""
+        QtCore.QTimer.singleShot(0, self._style_workspace_dock_tabs)
+
+    def _style_workspace_dock_tabs(self) -> None:
+        """Make the visible dock obvious through its selected tab."""
+        if not hasattr(self, "_dock_widgets"):
+            return
+        if theme.is_dark_mode():
+            inactive_bg, hover_bg, active_bg = "#252830", "#303540", "#383e4b"
+            inactive_fg, active_fg = "#9da5b4", "#f3f5f8"
+            separator = "#3a3f4b"
+        else:
+            inactive_bg, hover_bg, active_bg = "#e3e6eb", "#edf0f4", "#ffffff"
+            inactive_fg, active_fg = "#5e6673", "#171a20"
+            separator = "#c3c8d0"
+        css = f"""
+            QTabBar {{
+                background: {inactive_bg};
+            }}
+            QTabBar::tab {{
+                min-width: 72px;
+                padding: 6px 14px 5px 14px;
+                color: {inactive_fg};
+                background: {inactive_bg};
+                border: 0;
+                border-right: 1px solid {separator};
+                border-bottom: 2px solid transparent;
+            }}
+            QTabBar::tab:hover:!selected {{
+                background: {hover_bg};
+            }}
+            QTabBar::tab:selected {{
+                color: {active_fg};
+                background: {active_bg};
+                border-bottom: 2px solid {theme.BLUE_HEX};
+                font-weight: 600;
+            }}
+        """
+        for tab_bar in self.findChildren(
+                QtWidgets.QTabBar,
+                options=QtCore.Qt.FindDirectChildrenOnly):
+            tab_bar.setDrawBase(False)
+            tab_bar.setExpanding(False)
+            tab_bar.setElideMode(QtCore.Qt.ElideRight)
+            tab_bar.setStyleSheet(css)
+
+        strip_css = (
+            "#WorkspaceDockDragStrip {"
+            f"background: {separator}; border: 0;"
+            "}"
+        )
+        for dock in self._dock_widgets.values():
+            dock._workspace_drag_strip.setStyleSheet(strip_css)
+
+    def _arrange_default_workspace(self) -> None:
+        """Restore the initial three-column workspace with two tab groups."""
+        docks = self._dock_widgets
+        for dock in docks.values():
+            if dock.isFloating():
+                dock.setFloating(False)
+            self.removeDockWidget(dock)
+            dock.show()
+
+        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, docks["scene"])
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, docks["sdf"])
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, docks["options"])
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, docks["dashboard"])
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, docks["mesh"])
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, docks["runs"])
+        for dock in docks.values():
+            dock.setFloating(False)
+
+        self.splitDockWidget(
+            docks["scene"], docks["sdf"], QtCore.Qt.Horizontal)
+        self.splitDockWidget(
+            docks["sdf"], docks["options"], QtCore.Qt.Horizontal)
+        self.splitDockWidget(
+            docks["sdf"], docks["dashboard"], QtCore.Qt.Vertical)
+        self.tabifyDockWidget(docks["sdf"], docks["mesh"])
+        self.tabifyDockWidget(docks["dashboard"], docks["runs"])
+
+        docks["sdf"].raise_()
+        docks["dashboard"].raise_()
+        self._schedule_workspace_dock_tab_style()
+        if self.isVisible():
+            QtCore.QTimer.singleShot(0, self._resize_default_workspace)
+
+    def _resize_default_workspace(self) -> None:
+        """Apply useful ratios after the window has reached its real size."""
+        docks = self._dock_widgets
+        self.resizeDocks(
+            [docks["scene"], docks["sdf"], docks["options"]],
+            [1000, 460, 320], QtCore.Qt.Horizontal)
+        self.resizeDocks(
+            [docks["sdf"], docks["dashboard"]],
+            [420, 580], QtCore.Qt.Vertical)
+
+    def _restore_workspace_layout(self) -> bool:
+        state = self._layout_settings.value("workspace/dockState")
+        if isinstance(state, QtCore.QByteArray) and not state.isEmpty():
+            return bool(self.restoreState(state, 1))
+        return False
+
+    def _save_workspace_layout(self) -> None:
+        if not hasattr(self, "_layout_settings"):
+            return
+        self._layout_settings.setValue(
+            "workspace/dockState", self.saveState(1))
+        self._layout_settings.sync()
+
+    def _reset_workspace_layout(self) -> None:
+        self._layout_settings.remove("workspace/dockState")
+        self._arrange_default_workspace()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if getattr(self, "_default_workspace_resize_pending", False):
+            QtCore.QTimer.singleShot(
+                0, self._apply_pending_workspace_resize)
+
+    def _apply_pending_workspace_resize(self) -> None:
+        if not getattr(self, "_default_workspace_resize_pending", False):
+            return
+        self._default_workspace_resize_pending = False
+        self._resize_default_workspace()
 
     def _build_mesh_tab(self) -> QtWidgets.QScrollArea:
         """Compose the 'Mesh' tab: per-mesh settings + the FBX/rig panel.
@@ -648,6 +969,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spin_max_ellipsoids.setValue(180)
         self._spin_max_ellipsoids.setToolTip(
             "SuperFit ellipsoid budget. Higher values can use a lot of GPU/CPU memory."
+        )
+
+        self._chk_region_budget = QtWidgets.QCheckBox("Regional limit")
+        self._chk_region_budget.setChecked(bool(
+            self._settings.get("size_region_budget_enabled", True)))
+        self._chk_region_budget.setToolTip(
+            "Limit how many ellipsoids can occupy each coloured mesh region.\n"
+            "Turn this off to use only the global Max value. The change applies\n"
+            "to the next fit."
         )
 
         self._spin_max_steps = QtWidgets.QSpinBox()
@@ -778,6 +1108,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lbl_count_row = QtWidgets.QLabel("Primitives:")
         tr_form.addRow(self._lbl_count_row, self._spin_num_ellipsoids)
         tr_form.addRow("Max:", self._spin_max_ellipsoids)
+        tr_form.addRow(self._chk_region_budget)
         tr_form.addRow("Steps:", self._spin_max_steps)
         tr_form.addRow(self._chk_symmetry)
 
@@ -865,20 +1196,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status.showMessage(f"Shape: {shape.display_name}")
 
     def _build_view_menu(self):
-        """An 'Ansicht' menu to show/hide each panel individually."""
+        """Expose every dock plus a one-click default-layout reset."""
         self._view_menu = self.menuBar().addMenu("View")
         self._view_actions = {}
-        for label, widget in (
-            ("3D viewport", self._viewer.widget),
-            ("SDF analysis", self._mesh_sdf_panel),
-            ("Convergence / statistics", self._run_tracker),
-            ("Options", self._options_panel),
-        ):
-            act = QtGui.QAction(label, self, checkable=True)
-            act.setChecked(True)
-            act.toggled.connect(widget.setVisible)
+        for key in ("scene", "sdf", "mesh", "dashboard", "runs", "options"):
+            dock = self._dock_widgets[key]
+            act = dock.toggleViewAction()
             self._view_menu.addAction(act)
-            self._view_actions[label] = act
+            self._view_actions[dock.windowTitle()] = act
+        self._view_menu.addSeparator()
+        reset = self._view_menu.addAction("Reset Workspace Layout")
+        reset.triggered.connect(self._reset_workspace_layout)
 
     def _make_color_row(self) -> QtWidgets.QWidget:
         """A small row holding the (existing) primary/secondary swatch buttons.
@@ -972,6 +1300,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._settings_dialog.exec() == QtWidgets.QDialog.Accepted:
             self._settings.update(self._settings_dialog.values())
             app_settings.save(self._settings)
+            enabled = bool(self._settings.get(
+                "size_region_budget_enabled", True))
+            self._chk_region_budget.blockSignals(True)
+            self._chk_region_budget.setChecked(enabled)
+            self._chk_region_budget.blockSignals(False)
+            if not enabled:
+                self._viewer.clear_region_budget()
+
+    def _on_region_budget_toggled(self, enabled: bool) -> None:
+        """Persist the prominent regional-cap switch for subsequent fits."""
+        enabled = bool(enabled)
+        self._settings["size_region_budget_enabled"] = enabled
+        app_settings.save(self._settings)
+        if self._settings_dialog is not None:
+            self._settings_dialog.load_values(self._settings)
+        if not enabled:
+            self._viewer.clear_region_budget()
+        state = "enabled" if enabled else "disabled"
+        self._status.showMessage(
+            f"Regional ellipsoid limit {state} for the next fit.")
 
     # ── options-panel persistence (right-hand column) ─────────────────────
     # Layout of panel_settings.json:
@@ -1007,7 +1355,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_save_timer.setInterval(400)
         self._panel_save_timer.timeout.connect(self._save_panel_settings)
 
-        saved = app_settings.load_panel()
+        saved = getattr(self, "_startup_panel_state", None)
+        if not isinstance(saved, dict):
+            saved = app_settings.load_panel()
+        self._startup_panel_state = None
         shared = saved.get("shared", {}) if isinstance(saved, dict) else {}
         shapes_state = saved.get("shapes", {}) if isinstance(saved, dict) else {}
 
@@ -1017,15 +1368,21 @@ class MainWindow(QtWidgets.QMainWindow):
             for key, w, kind in self._shared_setting_specs():
                 if key in shared:
                     set_widget_value(w, kind, shared[key])
-        # SDF blowup lives on the Mesh-settings panel (not a shared widget) and is
-        # reset to 0 on every mesh load.  The startup mesh has already loaded by
-        # now (see __init__ order), so restoring the persisted value here makes it
-        # survive into the session.
-        if isinstance(shared, dict) and "blowup" in shared:
+        # SDF blowup lives on the Mesh-settings panel (not a shared widget).  Its
+        # startup value was already supplied to the first SDF worker; applying
+        # it here again keeps the control synchronized when no default mesh was
+        # available.
+        if isinstance(shared, dict) and (
+                "blowup_fraction" in shared or "blowup" in shared):
             try:
-                vox = float(shared["blowup"])
-                self._mesh_settings.set_blowup_voxels(vox)
-                self._on_sdf_blowup_changed(vox)
+                if "blowup_fraction" in shared:
+                    fraction = float(shared["blowup_fraction"])
+                else:
+                    fraction = legacy_voxel_blowup_to_thickness_fraction(
+                        float(shared["blowup"]))
+                self._mesh_settings.set_blowup_fraction(fraction)
+                self._on_sdf_blowup_changed(
+                    self._mesh_settings.blowup_fraction())
             except Exception:
                 pass
         if isinstance(shapes_state, dict):
@@ -1056,7 +1413,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _save_panel_settings(self) -> None:
         shared = {key: widget_value(w, kind)
                   for key, w, kind in self._shared_setting_specs()}
-        shared["blowup"] = self._mesh_settings.blowup_voxels()
+        shared["blowup_fraction"] = self._mesh_settings.blowup_fraction()
         shapes_state = {s.id: s.panel_state() for s in self._shapes if s.available}
         app_settings.save_panel({
             "shape": self._shape.id,
@@ -1100,6 +1457,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_open_dir.clicked.connect(self._open_mesh_dir)
         self._btn_fit.clicked.connect(self._on_fit_clicked)
         self._btn_stop.clicked.connect(self._on_stop_clicked)
+        self._chk_region_budget.toggled.connect(
+            self._on_region_budget_toggled)
 
         # ── Rig mode signals ──
         self._rig_panel.poseChanged.connect(self._on_rig_pose_changed)
@@ -1146,6 +1505,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not getattr(self, "_color_dialog_active", False):
                 self._schedule_brand_icon_update()
                 self._clear_custom_ui_style()
+            self._schedule_workspace_dock_tab_style()
             self._refresh_color_swatches()
             self._style_progress_bar()
         finally:
@@ -1590,12 +1950,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 and self._pose_correctives.base is self._rig_panel.bone_local):
             corrected = self._pose_correctives.corrected_blend(frame)
             wc, wr, wq = mapper.local_to_world_np(corrected, pose)
-            self._viewer.show_ellipsoids_fast(wc, wr, wq)
+            render_shape = self._shapes_by_id.get(
+                corrected.primitive_type, self._shape)
+            render_shape.render(
+                self._viewer, wc, wr, wq, corrected.shape_exponents)
         else:
             world_ell = self._rig_panel.get_world_ellipsoids(frame)
             if world_ell is not None:
                 wc, wr, wq = world_ell
-                self._viewer.show_ellipsoids_fast(wc, wr, wq)
+                bone_local = self._rig_panel.bone_local
+                primitive_type = getattr(
+                    bone_local, "primitive_type", "ellipsoid")
+                shape_exponents = getattr(
+                    bone_local, "shape_exponents", None)
+                render_shape = self._shapes_by_id.get(
+                    primitive_type, self._shape)
+                render_shape.render(
+                    self._viewer, wc, wr, wq, shape_exponents)
 
         self._status.showMessage(
             f"Pose {frame:.2f}: {pose.name}"
@@ -1656,27 +2027,77 @@ class MainWindow(QtWidgets.QMainWindow):
                                        + self._base_verts.max(axis=0))
         self._mesh_rotation = (0.0, 0.0, 0.0)
         self._pending_rot_mesh = None
+        startup_blowup = getattr(
+            self, "_startup_blowup_fraction", None)
         self._mesh_settings.reset()
-        self._on_sdf_blowup_changed(0.0)
+        if startup_blowup is not None:
+            self._mesh_settings.set_blowup_fraction(startup_blowup)
+            self._startup_blowup_fraction = None
+        self._on_sdf_blowup_changed(
+            self._mesh_settings.blowup_fraction())
 
-    def _on_sdf_blowup_changed(self, voxels: float) -> None:
-        """Keep both SDF previews on the same adaptive blowup request."""
-        requested = float(voxels)
+    def _set_api_batch_mesh(self, verts: np.ndarray, faces: np.ndarray) -> None:
+        """Swap the numerical mesh for a pose fit without rebuilding GUI state.
+
+        Synthetic pose requests always carry the same topology and their own
+        complete rig/ellipsoid snapshots.  Reinitialising panels, clearing
+        previews, and rebuilding the rig UI for every queued pose only creates a
+        CPU bubble between two GPU jobs; none of that state participates in the
+        fixed-population fit.
+        """
+        self._cancel_pending_pose_sdf()
+        self._base_verts = np.ascontiguousarray(verts, dtype=np.float32)
+        self._base_faces = np.ascontiguousarray(faces)
+        self._last_mesh_result = None
+        self._mesh_rot_center = 0.5 * (
+            self._base_verts.min(axis=0) + self._base_verts.max(axis=0))
+        self._mesh_rotation = (0.0, 0.0, 0.0)
+        self._pending_rot_mesh = None
+
+    def _on_sdf_blowup_changed(self, thickness_fraction: float) -> None:
+        """Keep both previews on the same local-thickness-relative request."""
+        requested = float(thickness_fraction)
         if requested != 0.0 and self._last_mesh_result is not None:
+            grid_capacity = float(getattr(
+                self._last_mesh_result,
+                "_sdf_blowup_capacity_fraction",
+                0.0,
+            ))
+            if abs(requested) > grid_capacity + 1.0e-7:
+                # One recompute reserves the full slider range, avoiding a
+                # second expensive SDF pass while the user keeps dragging.
+                self._pending_blowup_capacity_fraction = max(
+                    self._pending_blowup_capacity_fraction,
+                    MAX_UI_THICKNESS_FRACTION,
+                )
+                self._viewer.set_sdf_blowup(requested)
+                self._mesh_sdf_panel.set_sdf_blowup(requested)
+                self._status.showMessage(
+                    "Expanding the SDF grid for thickness-relative blowup …")
+                if not (self._sdf_worker is not None
+                        and self._sdf_worker.isRunning()):
+                    QtCore.QTimer.singleShot(
+                        0,
+                        lambda: MainWindow._restart_sdf_if_current(self, None),
+                    )
+                return
             try:
                 carrier = self._ensure_blowup_thickness(
+                    thickness_fraction=requested,
                     refresh_views=False)
                 if carrier is None:
                     raise RuntimeError(
                         "the current SDF has no local-thickness field")
             except Exception as exc:
                 # Never leave the label/slider ahead of the actual previews.
-                self._mesh_settings.set_blowup_voxels(0.0)
+                self._mesh_settings.set_blowup_fraction(0.0)
                 self._viewer.set_sdf_blowup(0.0)
                 self._mesh_sdf_panel.set_sdf_blowup(0.0)
                 self._status.showMessage(
                     f"SDF blowup unavailable: {exc}")
                 return
+        elif requested == 0.0:
+            self._pending_blowup_capacity_fraction = 0.0
         self._viewer.set_sdf_blowup(requested)
         self._mesh_sdf_panel.set_sdf_blowup(requested)
 
@@ -1684,6 +2105,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         mesh_result: SdfResult | None = None,
         *,
+        thickness_fraction: float | None = None,
         update_views: bool = True,
         refresh_views: bool = True,
     ) -> np.ndarray | None:
@@ -1691,19 +2113,63 @@ class MainWindow(QtWidgets.QMainWindow):
         result = mesh_result or self._last_mesh_result
         if result is None:
             return None
+        fraction = (
+            self._mesh_settings.blowup_fraction()
+            if thickness_fraction is None
+            else float(thickness_fraction)
+        )
+        raw_thickness = getattr(result, "thickness", None)
+        if raw_thickness is None:
+            return None
+        grid_capacity = float(getattr(
+            result, "_sdf_blowup_capacity_fraction", 0.0))
+        support_fraction = max(abs(fraction), grid_capacity)
         cached = getattr(result, "blowup_thickness", None)
-        if cached is None:
-            raw_thickness = getattr(result, "thickness", None)
-            if raw_thickness is None:
-                return None
+        cached_capacity = getattr(
+            result, "blowup_thickness_capacity_fraction", None)
+        try:
+            cached_capacity = float(cached_capacity)
+        except (TypeError, ValueError):
+            cached_capacity = -1.0
+        cache_covers_request = (
+            cached is not None
+            and np.isfinite(cached_capacity)
+            and cached_capacity >= 0.0
+            and cached_capacity + 1.0e-7 >= support_fraction
+        )
+        # This fast path is important for a 512^3 field: dragging the slider
+        # must not re-scan all 134 million thickness values on every tick.
+        if cache_covers_request:
+            required_extent_vox = float(getattr(
+                result, "blowup_thickness_extent_vox", 0.0))
+        else:
+            required_extent_vox = (
+                relative_blowup_extent_voxels(
+                    support_fraction, raw_thickness, float(result.dx))
+                + BLOWUP_CARRIER_MARGIN_VOXELS
+            )
+        cached_extent_vox = float(getattr(
+            result, "blowup_thickness_extent_vox", 0.0))
+        if (not cache_covers_request
+                and (cached is None
+                     or cached_extent_vox + 1.0e-6 < required_extent_vox)):
             self._status.showMessage(
-                "Preparing local-thickness protection for SDF blowup …")
+                "Preparing local-thickness SDF blowup field …")
             cached = build_surface_carried_thickness(
                 result.grid,
                 raw_thickness,
                 float(result.dx),
+                max_exterior_vox=required_extent_vox,
+                thickness_stride_vox=float(getattr(
+                    result, "thickness_stride_vox", 1.0)),
+                device=self._device,
             )
             result.blowup_thickness = cached
+            result.blowup_thickness_extent_vox = required_extent_vox
+        if not cache_covers_request:
+            # Also upgrades legacy/in-memory results whose existing carrier was
+            # already wide enough but did not yet have explicit capacity data.
+            result.blowup_thickness_capacity_fraction = support_fraction
         if update_views and result is self._last_mesh_result:
             # During chunked GUI finalization ``_last_mesh_result`` is stored a
             # moment before the two views receive the new volume.  Only attach
@@ -1812,6 +2278,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status.showMessage("Assigning ellipsoids to bones…")
         QtWidgets.QApplication.processEvents()
 
+        try:
+            primitive_type, shape_exponents = (
+                self._current_fitted_primitive_state(
+                    self._ellipsoids.count))
+        except ValueError as exc:
+            self._status.showMessage(f"Bone assignment unavailable: {exc}")
+            return
+
         bone_local = mapper.assign_to_bones(
             world_centers=self._ellipsoids.centers,
             world_radii=self._ellipsoids.radii,
@@ -1820,6 +2294,8 @@ class MainWindow(QtWidgets.QMainWindow):
             skin_joints=rm.skin_joints,
             skin_weights=rm.skin_weights,
             pose=Pose.t_pose(),
+            primitive_type=primitive_type,
+            shape_exponents=shape_exponents,
         )
 
         self._rig_panel.set_bone_local(bone_local)
@@ -1851,6 +2327,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 if (self._base_verts is not None
                         and len(self._base_verts) == len(rm.vertices)):
                     assignment_vertices = np.asarray(self._base_verts, dtype=np.float32)
+            try:
+                primitive_type, shape_exponents = (
+                    self._current_fitted_primitive_state(
+                        self._ellipsoids.count))
+            except ValueError as exc:
+                self._status.showMessage(f"Pose correctives unavailable: {exc}")
+                return False
             bone_local = mapper.assign_to_bones(
                 world_centers=self._ellipsoids.centers,
                 world_radii=self._ellipsoids.radii,
@@ -1859,6 +2342,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 skin_joints=rm.skin_joints,
                 skin_weights=rm.skin_weights,
                 pose=base_pose,
+                primitive_type=primitive_type,
+                shape_exponents=shape_exponents,
             )
         else:
             self._status.showMessage(
@@ -1904,7 +2389,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._cancel_pending_pose_sdf()
 
         grid_n = self._mesh_sdf_panel.requested_n
-        margin = self._slider_margin.value() / 100.0
+        requested_margin = self._slider_margin.value() / 100.0
+        blowup_fraction = self._mesh_settings.blowup_fraction()
+        margin = required_relative_sdf_margin(
+            requested_margin, blowup_fraction, int(grid_n))
         training_poses = list(self._rig_panel.active_poses)
         source_label = self._rig_panel.current_source_label
         if not training_poses:
@@ -1935,14 +2423,13 @@ class MainWindow(QtWidgets.QMainWindow):
             grid_n=grid_n,
             margin=margin,
             fit_kwargs=fit_kwargs,
-            target_vertices=target_vertices,
-            sdf_blowup_vox=self._mesh_settings.blowup_voxels(),
-            sdf_blowup_offset=(
-                self._mesh_settings.blowup_voxels()
-                * float(self._last_mesh_result.dx)
-                if self._last_mesh_result is not None
-                else None
+            base_pose=(
+                self._api_base_pose
+                if self._api_job_id is not None and self._api_base_pose is not None
+                else Pose.t_pose()
             ),
+            target_vertices=target_vertices,
+            sdf_blowup_fraction=self._mesh_settings.blowup_fraction(),
             thickness_max_resolution=int(
                 self._settings.get("thickness_max_resolution", 128)),
             device=self._device,
@@ -1964,7 +2451,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pose_corrective_worker.finished.connect(
             self._on_pose_corrective_worker_finished)
 
-        self._opt_total_steps = max(1, int(self._spin_max_steps.value()))
+        self._opt_total_steps = max(1, int(fit_kwargs["num_steps"]))
         self._pose_corrective_worker.start()
         self._btn_fit.setEnabled(False)
         self._btn_stop.setEnabled(True)
@@ -1986,6 +2473,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _pose_corrective_fit_kwargs(self) -> dict:
         """Optimizer settings for fixed-ID per-pose corrective fits."""
         fk = self._gather_fit_kwargs()
+        base = self._rig_panel.bone_local
+        primitive_type = self._api_canonical_primitive_type(
+            getattr(base, "primitive_type", "ellipsoid"))
         advanced = self._optimizer_settings(dict(self._settings))
         advanced.update(fk)
         for key in (
@@ -1998,7 +2488,7 @@ class MainWindow(QtWidgets.QMainWindow):
             advanced.pop(key, None)
         advanced.update({
             "method": "adam",
-            "num_steps": int(self._spin_max_steps.value()),
+            "num_steps": int(fk["num_steps"]),
             "report_every": int(self._report_every),
             "lr_init": float(self._spin_lr_init.value()),
             "lr_final": float(self._spin_lr_final.value()),
@@ -2006,7 +2496,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "superfit": False,
             "local_fit": False,
             "soft_union": bool(fk.get("soft_union", False)),
-            "primitive_shape": "ellipsoid",
+            "primitive_shape": primitive_type,
         })
         return self._optimizer_settings(advanced)
 
@@ -2024,6 +2514,7 @@ class MainWindow(QtWidgets.QMainWindow):
         centers: np.ndarray,
         radii: np.ndarray,
         rotations: np.ndarray,
+        shape_exponents: np.ndarray,
         pose,
     ):
         """Show the exact mesh/ellipsoid state this corrective is about to fit."""
@@ -2031,14 +2522,19 @@ class MainWindow(QtWidgets.QMainWindow):
         rm = self._rig_panel.rigged_mesh
         if rm is not None:
             self._show_skeleton_for_pose(rm, pose)
-        self._viewer.show_ellipsoids_fast(centers, radii, rotations)
+        primitive_type = getattr(
+            self._rig_panel.bone_local, "primitive_type", "ellipsoid")
+        render_shape = self._shapes_by_id.get(primitive_type, self._shape)
+        render_shape.render(
+            self._viewer, centers, radii, rotations, shape_exponents)
         total = max(1, len(self._rig_panel.active_poses))
         if (self._api_job_id is not None
                 and self._api_stage == "correctives"
                 and self._api_server is not None):
             try:
                 preview = self._api_build_world_preview_payload(
-                    centers, radii, rotations)
+                    centers, radii, rotations, shape_exponents,
+                    primitive_type=primitive_type)
                 self._api_server.registry.update(
                     self._api_job_id,
                     state="running",
@@ -2063,8 +2559,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_pose_corrective_step_visual(
         self, pose_index: int, step: int, loss: float,
         centers: np.ndarray, radii: np.ndarray, rotations: np.ndarray,
+        shape_exponents: np.ndarray,
     ):
-        self._viewer.show_ellipsoids_fast(centers, radii, rotations)
+        primitive_type = getattr(
+            self._rig_panel.bone_local, "primitive_type", "ellipsoid")
+        render_shape = self._shapes_by_id.get(primitive_type, self._shape)
+        render_shape.render(
+            self._viewer, centers, radii, rotations, shape_exponents)
         total = getattr(self, "_opt_total_steps", 0)
         pose_total = max(1, len(self._rig_panel.active_poses))
         pose_index = max(0, min(pose_total - 1, int(pose_index)))
@@ -2084,7 +2585,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._api_live_preview_due(api_step):
                 try:
                     fields["preview"] = self._api_build_world_preview_payload(
-                        centers, radii, rotations)
+                        centers, radii, rotations, shape_exponents,
+                        primitive_type=primitive_type)
                 except Exception as e:
                     print(f"[API] corrective live preview skipped: {e}")
             self._api_server.registry.update(self._api_job_id, **fields)
@@ -2221,43 +2723,172 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── Original methods (unchanged below) ────────────────────────────────
 
+    def _next_worker_generation(self) -> int:
+        self._worker_generation += 1
+        return self._worker_generation
+
+    def _sdf_worker_event_is_current(
+        self,
+        worker: SdfWorker,
+        generation: int,
+        api_job_id: str | None,
+    ) -> bool:
+        if (self._sdf_worker is not worker
+                or self._sdf_worker_generation != generation):
+            return False
+        if api_job_id is not None:
+            return (self._api_job_id == api_job_id
+                    and self._api_stage == "sdf")
+        return self._api_job_id is None
+
+    def _on_sdf_worker_progress(
+        self,
+        worker: SdfWorker,
+        generation: int,
+        api_job_id: str | None,
+        frac: float,
+        msg: str,
+    ) -> None:
+        if self._sdf_worker_event_is_current(
+                worker, generation, api_job_id):
+            self._on_sdf_progress(frac, msg)
+
+    def _on_sdf_worker_done(
+        self,
+        worker: SdfWorker,
+        generation: int,
+        api_job_id: str | None,
+        result,
+    ) -> None:
+        if not self._sdf_worker_event_is_current(
+                worker, generation, api_job_id):
+            return
+        try:
+            self._on_sdf_done(result, api_job_id)
+        except Exception as exc:
+            message = f"SDF result handling failed: {exc}"
+            if (api_job_id is not None
+                    and self._api_job_id == api_job_id
+                    and self._api_stage == "sdf"):
+                self._api_fail(api_job_id, message)
+            elif api_job_id is None and self._api_job_id is None:
+                self._on_sdf_failed(message)
+
+    def _on_sdf_worker_failed(
+        self,
+        worker: SdfWorker,
+        generation: int,
+        api_job_id: str | None,
+        msg: str,
+    ) -> None:
+        if self._sdf_worker_event_is_current(
+                worker, generation, api_job_id):
+            self._on_sdf_failed(msg)
+
     def _on_compute_all(self, n: int | None = None):
+        api_job_id = (
+            self._api_job_id if self._api_stage == "sdf" else None)
         if not self._sdf.is_ready:
-            self._status.showMessage("Load a mesh first.")
+            if api_job_id is not None:
+                self._api_fail(api_job_id, "SDF worker start failed: no mesh loaded")
+            else:
+                self._status.showMessage("Load a mesh first.")
             return
         if self._sdf_worker is not None and self._sdf_worker.isRunning():
-            self._status.showMessage("SDF computation already running …")
+            if api_job_id is None:
+                self._status.showMessage("SDF computation already running …")
             return
 
         if n is None:
             n = self._mesh_sdf_panel.requested_n
 
-        margin = self._slider_margin.value() / 100.0
-        self._status.showMessage(
-            f"Computing mesh SDF (n={n}, margin={margin:.2f}) on {self._device} …")
+        requested_margin = self._slider_margin.value() / 100.0
+        blowup_fraction = self._mesh_settings.blowup_fraction()
+        capacity_fraction = max(
+            abs(blowup_fraction),
+            float(self._pending_blowup_capacity_fraction),
+        )
+        self._pending_blowup_capacity_fraction = 0.0
+        margin = required_relative_sdf_margin(
+            requested_margin, capacity_fraction, int(n))
+        carrier_capacity_fraction = capacity_fraction
+        if blowup_fraction != 0.0:
+            # If the existing fractional margin already leaves room for more,
+            # build that full slider-supported carrier once in the worker.  A
+            # later slider drag then becomes a cheap metadata check only.
+            carrier_capacity_fraction = max(
+                carrier_capacity_fraction,
+                min(MAX_UI_THICKNESS_FRACTION, 0.5 * margin),
+            )
+        if not self._api_batch_pipeline:
+            self._status.showMessage(
+                f"Computing mesh SDF (n={n}, margin={margin:.2f}) "
+                f"on {self._device} …")
 
-        # Don't let a fit start against a stale/absent grid while computing.
-        self._btn_fit.setEnabled(False)
-        self._btn_stop.setEnabled(True)
+            # Don't let a fit start against a stale/absent grid while computing.
+            self._btn_fit.setEnabled(False)
+            self._btn_stop.setEnabled(True)
         self._sdf_cancel_message = None
-        self._progress_begin("Computing mesh SDF …")
+        if not self._api_batch_pipeline:
+            self._progress_begin("Computing mesh SDF …")
 
         # When symmetry fitting is on, let the SDF computer exploit it too:
         # detect the mirror plane and evaluate only half the grid at full res.
-        self._sdf_worker = SdfWorker(
-            self._sdf, n, margin, parent=self,
-            symmetry=self._effective_symmetry_enabled(),
-            thickness_max_resolution=int(
-                self._settings.get("thickness_max_resolution", 128)),
-            compute_blowup_thickness=(
-                self._mesh_settings.blowup_voxels() != 0.0),
+        worker = None
+        prepare_sparse_samples = bool(
+            api_job_id is not None
+            and self._api_batch_pipeline
+            and self._api_fit_existing
+            and self._settings.get("use_sparse_sdf", True)
         )
-        self._sdf_worker.progress.connect(self._on_sdf_progress)
-        self._sdf_worker.done.connect(self._on_sdf_done)
-        self._sdf_worker.failed.connect(self._on_sdf_failed)
-        self._sdf_worker.start()
+        try:
+            worker = SdfWorker(
+                self._sdf, n, margin, parent=self,
+                symmetry=self._effective_symmetry_enabled(),
+                thickness_max_resolution=int(
+                    self._settings.get("thickness_max_resolution", 128)),
+                compute_blowup_thickness=(
+                    blowup_fraction != 0.0),
+                compute_sparse_samples=prepare_sparse_samples,
+                # Keep the whole-mesh grid raw; only reserve/build enough support
+                # for the live transform that preview and fitting apply later.
+                sdf_blowup_fraction=(
+                    blowup_fraction if prepare_sparse_samples else 0.0),
+                sdf_blowup_capacity_fraction=capacity_fraction,
+                sdf_blowup_carrier_fraction=carrier_capacity_fraction,
+                sdf_guard_voxels_per_side=int(
+                    BLOWUP_CARRIER_MARGIN_VOXELS),
+            )
+            generation = self._next_worker_generation()
+            self._sdf_worker = worker
+            self._sdf_worker_generation = generation
+            worker.progress.connect(
+                lambda frac, msg, w=worker, g=generation, j=api_job_id:
+                self._on_sdf_worker_progress(w, g, j, frac, msg))
+            worker.done.connect(
+                lambda result, w=worker, g=generation, j=api_job_id:
+                self._on_sdf_worker_done(w, g, j, result))
+            worker.failed.connect(
+                lambda msg, w=worker, g=generation, j=api_job_id:
+                self._on_sdf_worker_failed(w, g, j, msg))
+            worker.start()
+        except Exception as exc:
+            if self._sdf_worker is worker:
+                self._sdf_worker = None
+                self._sdf_worker_generation = self._next_worker_generation()
+            message = f"SDF worker start failed: {exc}"
+            if api_job_id is not None:
+                self._api_fail(api_job_id, message)
+            else:
+                self._on_sdf_failed(message)
 
     def _on_sdf_progress(self, frac: float, msg: str) -> None:
+        if self._api_batch_pipeline:
+            # The batch skips viewport finalization, not local user feedback.
+            # _api_publish_progress updates this lightweight bar and the API.
+            MainWindow._api_publish_progress(
+                self, "sdf", msg, frac)
+            return
         # Keep the final few percent for GUI-side finalization after the worker
         # is done (panel update, GPU volume upload, thickness heatmap).  Those
         # steps can be visibly expensive on large grids, so don't let the bar
@@ -2266,17 +2897,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self._progress_set(pct, f"Mesh SDF · {msg}")
         self._status.showMessage(f"Mesh SDF: {msg}  ({int(pct)} %)")
 
-    def _on_sdf_done(self, mesh_result) -> None:
+    def _on_sdf_done(
+        self,
+        mesh_result,
+        api_job_id: str | None = None,
+    ) -> None:
+        # Direct/manual callers do not pass a token; worker callbacks always do.
+        # Capture the current API identity for compatibility without ever
+        # replacing an explicitly supplied old token with a newer job.
+        if api_job_id is None and self._api_stage == "sdf":
+            api_job_id = self._api_job_id
         self._sdf_worker = None
-        self._progress_set(92.0, "Mesh SDF · Finalizing result")
-        current_blowup = self._mesh_settings.blowup_voxels()
+        if not self._api_batch_pipeline:
+            self._progress_set(92.0, "Mesh SDF · Finalizing result")
+        current_blowup = self._mesh_settings.blowup_fraction()
+        result_capacity = float(getattr(
+            mesh_result, "_sdf_blowup_capacity_fraction", 0.0))
+        needed_capacity = max(
+            abs(current_blowup),
+            float(self._pending_blowup_capacity_fraction),
+        )
+        if needed_capacity > result_capacity + 1.0e-7:
+            # The slider moved beyond the worker's frozen layout while it was
+            # running.  Discard that undersized result and compute once more
+            # with capacity for the complete slider range.
+            self._pending_blowup_capacity_fraction = max(
+                needed_capacity, MAX_UI_THICKNESS_FRACTION)
+            self._status.showMessage(
+                "SDF blowup changed — expanding the grid once …")
+            QtCore.QTimer.singleShot(
+                0,
+                lambda j=api_job_id:
+                MainWindow._restart_sdf_if_current(self, j),
+            )
+            return
         if current_blowup == 0.0:
             # The slider may have returned to zero while the worker was still
             # building the carrier.  Do not retain/upload that large idle field.
             mesh_result.blowup_thickness = None
-        elif getattr(mesh_result, "blowup_thickness", None) is None:
+            mesh_result.blowup_thickness_extent_vox = 0.0
+            mesh_result.blowup_thickness_capacity_fraction = None
+        else:
+            # Also checks/expands a carrier built for an earlier slider value
+            # while this worker was running.
             self._ensure_blowup_thickness(
-                mesh_result, update_views=False)
+                mesh_result,
+                thickness_fraction=current_blowup,
+                update_views=False)
+
+        # Queued synthetic-pose jobs do not consume any of the expensive viewer
+        # products below.  Keep the numerical result identical and hand it to
+        # the optimizer immediately on the next event-loop turn.  This also
+        # removes the 15-ms UI slices between SDF completion and GPU fitting.
+        if (self._api_job_id is not None
+                and self._api_stage == "sdf"
+                and self._api_batch_pipeline):
+            self._last_mesh_result = mesh_result
+            MainWindow._api_publish_progress(
+                self, "fit_setup", "Preparing fit parameters", 0.0)
+            QtCore.QTimer.singleShot(
+                0,
+                lambda j=api_job_id:
+                MainWindow._api_start_fit_if_current(self, j),
+            )
+            return
 
         steps = [
             (93.0, "Storing result",
@@ -2296,10 +2980,55 @@ class MainWindow(QtWidgets.QMainWindow):
             (99.0, "Updating thickness heatmap",
              lambda: self._show_thickness(mesh_result)),
         ]
-        self._run_sdf_finalize_steps(mesh_result, steps)
+        finalize_generation = self._next_worker_generation()
+        self._sdf_finalize_generation = finalize_generation
+        self._sdf_finalize_active = True
+        self._run_sdf_finalize_steps(
+            mesh_result,
+            steps,
+            api_job_id=api_job_id,
+            finalize_generation=finalize_generation,
+        )
 
-    def _run_sdf_finalize_steps(self, mesh_result, steps, index: int = 0) -> None:
+    def _restart_sdf_if_current(self, api_job_id: str | None) -> None:
+        if api_job_id is None:
+            if self._api_job_id is None:
+                self._on_compute_all()
+            return
+        if self._api_job_id == api_job_id and self._api_stage == "sdf":
+            self._on_compute_all()
+
+    def _api_start_fit_if_current(self, api_job_id: str | None) -> None:
+        if (api_job_id is not None
+                and self._api_job_id == api_job_id
+                and self._api_stage == "sdf"):
+            self._api_start_fit()
+
+    def _run_sdf_finalize_steps(
+        self,
+        mesh_result,
+        steps,
+        index: int = 0,
+        api_job_id: str | None = None,
+        finalize_generation: int | None = None,
+    ) -> None:
         """Run GUI-side SDF finalization in small event-loop slices."""
+        if finalize_generation is None:
+            finalize_generation = self._sdf_finalize_generation
+        if (not self._sdf_finalize_active
+                or self._sdf_finalize_generation != finalize_generation):
+            return
+        api_identity_current = (
+            (api_job_id is None and self._api_job_id is None)
+            or (api_job_id is not None
+                and self._api_job_id == api_job_id
+                and self._api_stage == "sdf")
+        )
+        if not api_identity_current:
+            if self._sdf_finalize_generation != finalize_generation:
+                return
+            self._sdf_finalize_active = False
+            return
         if index >= len(steps):
             self._btn_fit.setEnabled(True)
             self._progress_set(100.0, "Mesh SDF · Ready")
@@ -2308,12 +3037,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"max={float(np.max(mesh_result.grid)):.4f}  |  "
                 f"Ready to fit ellipsoids."
             )
+            if self._sdf_finalize_generation != finalize_generation:
+                return
+            self._sdf_finalize_active = False
             # Chain into the fit when an API job is waiting for its SDF grid.
-            if self._api_job_id is not None and self._api_stage == "sdf":
+            if api_job_id is not None:
                 self._progress_end()
-                QtCore.QTimer.singleShot(0, self._api_start_fit)
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda j=api_job_id:
+                    MainWindow._api_start_fit_if_current(self, j),
+                )
             else:
-                QtCore.QTimer.singleShot(250, self._progress_end)
+                QtCore.QTimer.singleShot(
+                    250,
+                    lambda g=finalize_generation:
+                    MainWindow._end_sdf_progress_if_current(self, g),
+                )
             return
 
         pct, msg, fn = steps[index]
@@ -2321,24 +3061,83 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status.showMessage(f"Mesh SDF: {msg}  ({int(pct)} %)")
 
         def _execute_step() -> None:
+            if (not self._sdf_finalize_active
+                    or self._sdf_finalize_generation != finalize_generation):
+                return
+            api_identity_current = (
+                (api_job_id is None and self._api_job_id is None)
+                or (api_job_id is not None
+                    and self._api_job_id == api_job_id
+                    and self._api_stage == "sdf")
+            )
+            if not api_identity_current:
+                self._sdf_finalize_active = False
+                return
             try:
                 fn()
             except Exception as e:
-                self._on_sdf_failed(f"finalization failed during {msg}: {e}")
+                if self._sdf_finalize_generation != finalize_generation:
+                    return
+                self._sdf_finalize_active = False
+                failure = f"finalization failed during {msg}: {e}"
+                if (api_job_id is not None
+                        and self._api_job_id == api_job_id
+                        and self._api_stage == "sdf"):
+                    self._api_fail(api_job_id, failure)
+                elif self._api_job_id is None:
+                    self._on_sdf_failed(failure)
                 return
             QtCore.QTimer.singleShot(
                 15,
                 lambda: self._run_sdf_finalize_steps(
-                    mesh_result, steps, index + 1),
+                    mesh_result,
+                    steps,
+                    index + 1,
+                    api_job_id,
+                    finalize_generation,
+                ),
             )
 
         QtCore.QTimer.singleShot(15, _execute_step)
 
+    def _end_sdf_progress_if_current(
+        self,
+        finalize_generation: int,
+    ) -> None:
+        if (self._sdf_finalize_generation != finalize_generation
+                or self._sdf_finalize_active
+                or self._api_job_id is not None):
+            return
+        if any(getattr(self, name, None) is not None for name in (
+                "_sdf_worker", "_opt_worker", "_pose_corrective_worker",
+                "_region_sdf_worker", "_region_fit_worker", "_batched_worker")):
+            return
+        self._progress_end()
+
     def _on_sdf_failed(self, msg: str) -> None:
         canceled = str(msg).strip().lower() == SDF_CANCELED
         self._sdf_worker = None
+        self._sdf_finalize_active = False
+        self._sdf_finalize_generation = self._next_worker_generation()
         self._progress_end()
-        self._btn_fit.setEnabled(self._last_mesh_result is not None)
+        current_blowup = abs(self._mesh_settings.blowup_fraction())
+        old_capacity = float(getattr(
+            self._last_mesh_result,
+            "_sdf_blowup_capacity_fraction",
+            0.0,
+        )) if self._last_mesh_result is not None else 0.0
+        old_result_is_safe = (
+            self._last_mesh_result is not None
+            and current_blowup <= old_capacity + 1.0e-7
+        )
+        self._btn_fit.setEnabled(old_result_is_safe)
+        if self._last_mesh_result is not None and not old_result_is_safe:
+            # Keep the requested slider value visible, but never allow fitting
+            # it against the undersized previous grid after a failed expansion.
+            self._pending_blowup_capacity_fraction = max(
+                self._pending_blowup_capacity_fraction,
+                MAX_UI_THICKNESS_FRACTION,
+            )
         self._btn_stop.setEnabled(False)
         if canceled:
             msg = self._sdf_cancel_message or "Mesh SDF stopped."
@@ -2364,13 +3163,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event) -> None:
         # Persist the latest options-panel state before shutting down.
         self._save_panel_settings()
+        self._save_workspace_layout()
         # Don't let a running SDF worker be destroyed mid-flight (crash risk).
         self._ensure_sdf_idle()
         super().closeEvent(event)
 
     def update_ellipsoids(self, ellipsoid_set: EllipsoidSet) -> None:
-        # SDF slices are shown for the mesh only; this just refreshes the
-        # ellipsoid geometry in the unified viewport.
+        # Refreshing the unified viewport also refreshes an active error slice.
         self._ellipsoids = ellipsoid_set
         self._viewer.show_ellipsoids(self._ellipsoids)
 
@@ -2385,7 +3184,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fit and the per-bone fits so they share one source of settings.
         """
         shape_kwargs = self._shape.fit_kwargs()
-        return dict(
+        kwargs = dict(
             method="adam",
             num_steps=self._spin_max_steps.value(),
             report_every=self._report_every,
@@ -2397,6 +3196,18 @@ class MainWindow(QtWidgets.QMainWindow):
             advanced=self._settings,
             **shape_kwargs,   # sdf_mode, superfit*, local_fit*, soft_union, merge/spawn/split
         )
+        # Shape selection in an API request is part of the wire contract, not a
+        # hint.  Freeze it over the live GUI selection for the whole job.
+        if (getattr(self, "_api_job_id", None) is not None
+                and getattr(self, "_api_shape_fit_kwargs", None)):
+            kwargs.update(self._api_shape_fit_kwargs)
+        # The Unity client may choose a different budget for each queued fit.
+        # Keep it per job instead of changing the persistent GUI spin box.
+        if getattr(self, "_api_job_id", None) is not None:
+            api_options = getattr(self, "_api_options", None) or {}
+            if "num_steps" in api_options:
+                kwargs["num_steps"] = api_options["num_steps"]
+        return kwargs
 
     def _on_fit_clicked(self):
         if self._last_mesh_result is None:
@@ -2456,6 +3267,8 @@ class MainWindow(QtWidgets.QMainWindow):
         worker threads have stopped is the job published as ``canceled``.
         """
         api_server = self._api_server
+        self._sdf_finalize_active = False
+        self._sdf_finalize_generation = self._next_worker_generation()
         if api_job_id is not None:
             self._api_stage = "canceled"
         self._opt_cancel_message = (
@@ -2476,6 +3289,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._bonesep_ctl.cancel()
         if (self._sdf_worker is not None
                 and self._sdf_worker.isRunning()):
+            self._sdf_worker_generation = self._next_worker_generation()
             self._sdf_worker.request_stop()
             self._sdf_worker.wait()
         if (self._region_sdf_worker is not None
@@ -2499,6 +3313,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bonesep_ctl = None
         self._overall_end()             # hide the overall bone-separation bar
         self.stop_optimization()
+        if self._opt_worker is not None:
+            # The thread may already have stopped while its ``finished`` event
+            # is still queued.  Retire it explicitly so it cannot block the next
+            # dispatch or clear/finalize that next worker later.
+            self._opt_worker_generation = self._next_worker_generation()
+            self._opt_worker = None
         self._stop_pose_corrective_fit()
         self._sdf_worker = None
         self._region_sdf_worker = None
@@ -2604,12 +3424,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bonesep_on_complete = on_complete
         self._bonesep_is_api = bool(is_api)
         self._bonesep_fit_kwargs = dict(base_kwargs)
-        self._bonesep_sdf_blowup_offset = (
-            self._mesh_settings.blowup_voxels()
-            * float(self._last_mesh_result.dx)
-            if self._last_mesh_result is not None
-            else 0.0
-        )
+        self._bonesep_sdf_blowup_fraction = (
+            self._mesh_settings.blowup_fraction())
         # Reset the growing-union display accumulator for this run.
         self._bonesep_done_c = []
         self._bonesep_done_r = []
@@ -2646,8 +3462,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._region_sdf_worker.wait()
         self._region_sdf.set_mesh(vertices, faces)
         n = self._mesh_sdf_panel.requested_n
-        margin = self._slider_margin.value() / 100.0
-        blowup_offset = float(self._bonesep_sdf_blowup_offset)
+        requested_margin = self._slider_margin.value() / 100.0
+        blowup_fraction = float(self._bonesep_sdf_blowup_fraction)
+        margin = required_relative_sdf_margin(
+            requested_margin, blowup_fraction, int(n))
         self._region_sdf_active = True
         w = SdfWorker(
             self._region_sdf, n, margin, parent=self,
@@ -2657,13 +3475,13 @@ class MainWindow(QtWidgets.QMainWindow):
             symmetry=False,
             thickness_max_resolution=int(
                 self._settings.get("thickness_max_resolution", 128)),
-            compute_thickness=blowup_offset != 0.0,
-            compute_blowup_thickness=blowup_offset != 0.0,
+            compute_thickness=blowup_fraction != 0.0,
+            compute_blowup_thickness=blowup_fraction != 0.0,
             compute_sparse_samples=bool(
                 self._settings.get("use_sparse_sdf", True)
                 and not symmetry),
             max_dist=float("inf"),
-            sdf_blowup_offset=blowup_offset,
+            sdf_blowup_fraction=blowup_fraction,
         )
         self._region_sdf_worker = w
         w.progress.connect(self._on_region_sdf_progress)
@@ -2743,8 +3561,8 @@ class MainWindow(QtWidgets.QMainWindow):
             dx=result.dx,
             n=result.n,
             thickness_np=getattr(result, "thickness", None),
-            sdf_blowup_offset=float(
-                getattr(result, "_sdf_blowup_offset", 0.0)),
+            sdf_blowup_fraction=float(
+                getattr(result, "_sdf_blowup_fraction", 0.0)),
             sdf_computer=self._region_sdf,
             num_ellipsoids=int(part.budget),
             max_ellipsoids=int(part.max_budget),
@@ -2786,7 +3604,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._region_fit_worker = None
         self._region_fit_active = False
         self._bonesep_on_complete = None
-        self._bonesep_sdf_blowup_offset = 0.0
+        self._bonesep_sdf_blowup_fraction = 0.0
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._btn_stop.setEnabled(False)
         self._overall_end()
@@ -2802,7 +3620,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._region_fit_worker = None
         self._region_fit_active = False
         self._bonesep_on_complete = None
-        self._bonesep_sdf_blowup_offset = 0.0
+        self._bonesep_sdf_blowup_fraction = 0.0
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._btn_stop.setEnabled(False)
         self._overall_end()
@@ -2858,9 +3676,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._region_fit_worker = None
         if worker is not None:
             worker.wait()
+        worker_error = getattr(worker, "error_message", None)
         self._flush_visual()
         self._pending_visual = None     # drop any stray frame a late timer tick
         self._region_fit_active = False
+        if worker_error:
+            self._region_last_params = None
+            if self._bonesep_ctl is not None:
+                self._bonesep_ctl.on_region_fit_failed(worker_error)
+            else:
+                self._status.showMessage(
+                    f"Bone Separation: region fit failed: {worker_error}")
+            return
         params = self._region_last_params
         if params is None:
             c = np.zeros((0, 3), np.float32)
@@ -2901,7 +3728,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{len(np.unique(bone_idx))} bone(s).")
 
     def _api_bonesep_complete(self, accum) -> None:
-        """API completion: denormalize, map to bone-local, publish v2 result."""
+        """API completion: denormalize, map to bone-local, publish v4 result."""
         job_id = self._api_job_id
         if job_id is None or self._api_server is None:
             self._api_reset()
@@ -2913,10 +3740,14 @@ class MainWindow(QtWidgets.QMainWindow):
                                  dtype=np.float64)
             radii_o = np.array([t.to_original_length(r) for r in radii],
                                dtype=np.float64)
+            shape_exponents = np.ones((len(centers_o), 2), dtype=np.float32)
             entries = world_to_bone_local_entries(
-                centers_o, radii_o, rotations, bone_idx, self._api_rig)
+                centers_o, radii_o, rotations, bone_idx, self._api_rig,
+                primitive_type="ellipsoid",
+                shape_exponents=shape_exponents)
             result = {
-                "version": 3,
+                "version": 4,
+                "primitive_type": "ellipsoid",
                 "coordinate_system": "unity_world",
                 "quaternion_convention": "xyzw",
                 "rigged": True,
@@ -3051,7 +3882,12 @@ class MainWindow(QtWidgets.QMainWindow):
         allowed.discard("self")
         # These settings are consumed by MainWindow while constructing the SDF
         # target and are intentionally not OptimizationWorker arguments.
-        window_settings = {"use_sparse_sdf", "thickness_max_resolution"}
+        window_settings = {
+            "use_sparse_sdf", "thickness_max_resolution",
+            "size_region_budget_enabled", "size_region_target_capacity",
+            "size_region_min_capacity", "size_region_area_power",
+            "pose_fit_position", "pose_fit_rotation", "pose_fit_scale",
+        }
         ignored = sorted(
             key for key in src
             if key not in allowed and key not in window_settings
@@ -3064,6 +3900,44 @@ class MainWindow(QtWidgets.QMainWindow):
         return {k: v for k, v in src.items() if k in allowed}
 
     # ── async optimization ────────────────────────────────────────────────
+
+    def _opt_worker_event_is_current(
+        self,
+        worker: OptimizationWorker,
+        generation: int,
+        api_job_id: str | None,
+    ) -> bool:
+        if (self._opt_worker is not worker
+                or self._opt_worker_generation != generation):
+            return False
+        if api_job_id is not None:
+            return (self._api_job_id == api_job_id
+                    and self._api_stage == "fit")
+        return self._api_job_id is None
+
+    def _dispatch_opt_worker_signal(
+        self,
+        worker: OptimizationWorker,
+        generation: int,
+        api_job_id: str | None,
+        slot,
+        *args,
+    ) -> None:
+        if self._opt_worker_event_is_current(
+                worker, generation, api_job_id):
+            slot(*args)
+
+    def _connect_opt_worker_signal(
+        self,
+        signal,
+        slot,
+        worker: OptimizationWorker,
+        generation: int,
+        api_job_id: str | None,
+    ) -> None:
+        signal.connect(
+            lambda *args, w=worker, g=generation, j=api_job_id, s=slot:
+            self._dispatch_opt_worker_signal(w, g, j, s, *args))
 
     def start_optimization(
         self,
@@ -3100,7 +3974,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sq_eps1: float = 1.0,
         sq_eps2: float = 1.0,
         sq_eps_mode: str = "per_primitive",
-        sq_unlock_frac: float = 0.20,
+        sq_unlock_frac: float = 0.05,
         sq_bend_unlock_frac: float = 0.40,
         initial_centers: np.ndarray | None = None,
         initial_radii: np.ndarray | None = None,
@@ -3119,45 +3993,122 @@ class MainWindow(QtWidgets.QMainWindow):
 
         advanced_settings = dict(advanced or {})
         use_sparse_sdf = bool(advanced_settings.pop("use_sparse_sdf", True))
+        region_budget_enabled = bool(
+            advanced_settings.pop("size_region_budget_enabled", True))
+        region_target_capacity = int(
+            advanced_settings.pop("size_region_target_capacity", 6))
+        region_min_capacity = int(
+            advanced_settings.pop("size_region_min_capacity", 2))
+        region_area_power = float(
+            advanced_settings.pop("size_region_area_power", 0.65))
+
+        region_budget = None
+        if (region_budget_enabled and not fixed_population
+                and not self._api_batch_pipeline):
+            geometry = self._viewer.mesh_geometry()
+            if geometry is not None:
+                try:
+                    self._status.showMessage("Preparing regional ellipsoid budget …")
+                    region_budget = build_mesh_region_budget(
+                        geometry[0], geometry[1], max_ellipsoids,
+                        target_capacity=region_target_capacity,
+                        minimum_capacity=region_min_capacity,
+                        area_power=region_area_power,
+                    )
+                except Exception as exc:
+                    print(f"[RegionBudget] disabled for this fit: {exc}")
+        if region_budget is None:
+            self._viewer.clear_region_budget()
+        else:
+            self._viewer.set_region_budget(
+                region_budget.face_colors,
+                region_budget.centers,
+                region_budget.capacities,
+                region_budget.region_colors,
+                activate=True,
+            )
 
         r = self._last_mesh_result
-        # SDF blowup is a requested maximum.  Local feature thickness limits
-        # the actual offset so thin parts cannot be erased or enlarged out of
-        # proportion; the raw SDF/thickness always remain unchanged.
-        blowup_vox = self._mesh_settings.blowup_voxels()
-        blowup = blowup_vox * float(r.dx)
-        if blowup != 0.0:
-            self._ensure_blowup_thickness(r, update_views=True)
+        # SDF blowup is a dimensionless share of each region's own feature
+        # diameter.  It therefore remains identical across grid resolutions,
+        # mesh scales, and separately normalized animation poses.
+        blowup_fraction = self._mesh_settings.blowup_fraction()
+        if blowup_fraction != 0.0:
+            self._ensure_blowup_thickness(
+                r, update_views=not self._api_batch_pipeline)
         blowup_thickness = getattr(r, "blowup_thickness", None)
         if blowup_thickness is None:
             blowup_thickness = r.thickness
-        target_grid = apply_thickness_limited_blowup(
-            r.grid, blowup, blowup_thickness, float(r.dx),
-        ) if blowup != 0.0 else r.grid
-        sparse_samples = None
-        if use_sparse_sdf and self._sdf is not None and self._sdf.is_ready:
+        worker_blowup = float(getattr(
+            r, "_sdf_blowup_applied_fraction", 0.0))
+        blowup_already_applied = bool(
+            blowup_fraction != 0.0
+            and np.isclose(worker_blowup, blowup_fraction, atol=1.0e-8))
+        target_grid = (
+            r.grid if blowup_already_applied
+            else apply_thickness_relative_blowup(
+                r.grid, blowup_fraction, blowup_thickness)
+            if blowup_fraction != 0.0 else r.grid
+        )
+        max_blowup_vox = relative_blowup_extent_voxels(
+            blowup_fraction, blowup_thickness, float(r.dx))
+        sparse_prepared = bool(getattr(
+            r, "_sparse_samples_computed", False))
+        sparse_samples = (
+            getattr(r, "_sparse_samples", None)
+            if use_sparse_sdf and sparse_prepared else None)
+        if (use_sparse_sdf and not sparse_prepared
+                and self._sdf is not None and self._sdf.is_ready):
             try:
                 self._status.showMessage("Building sparse SDF training samples ...")
                 sparse_samples = self._sdf.compute_sparse_samples(
                     n=int(r.n),
                     margin=self._slider_margin.value() / 100.0,
                     thickness_result=r,
-                    offsets_vox=sparse_band_offsets(blowup_vox),
-                ).with_thickness_limited_offset(float(blowup))
+                    offsets_vox=sparse_band_offsets(max_blowup_vox),
+                )
+                if blowup_fraction != 0.0:
+                    adjusted_normals = sample_sdf_grid_normals(
+                        target_grid,
+                        r.origin,
+                        float(r.dx),
+                        sparse_samples.points,
+                    )
+                    sparse_samples = (
+                        sparse_samples.with_thickness_relative_offset(
+                            blowup_fraction,
+                            normals=adjusted_normals,
+                        )
+                    )
                 print(
                     f"[SparseSDF] training samples: {sparse_samples.size:,} "
                     f"(dense voxels: {int(np.prod(r.grid.shape)):,})"
                 )
-                self._mesh_sdf_panel.set_sparse_samples(sparse_samples)
-                self._viewer.set_sparse_samples(sparse_samples)
+                if not self._api_batch_pipeline:
+                    self._mesh_sdf_panel.set_sparse_samples(sparse_samples)
+                    self._viewer.set_sparse_samples(sparse_samples)
             except Exception as e:
                 print(f"[SparseSDF] Falling back to dense-grid training: {e}")
-                self._mesh_sdf_panel.set_sparse_samples(None)
-                self._viewer.set_sparse_samples(None)
+                if not self._api_batch_pipeline:
+                    self._mesh_sdf_panel.set_sparse_samples(None)
+                    self._viewer.set_sparse_samples(None)
+        elif use_sparse_sdf and sparse_prepared:
+            if sparse_samples is None:
+                print("[SparseSDF] worker selected dense-grid training")
+            else:
+                print(
+                    f"[SparseSDF] worker-prepared training samples: "
+                    f"{sparse_samples.size:,} "
+                    f"(dense voxels: {int(np.prod(r.grid.shape)):,})"
+                )
+                if not self._api_batch_pipeline:
+                    self._mesh_sdf_panel.set_sparse_samples(sparse_samples)
+                    self._viewer.set_sparse_samples(sparse_samples)
         elif not use_sparse_sdf:
             print("[SparseSDF] disabled by settings; using dense-grid training")
-            self._mesh_sdf_panel.set_sparse_samples(None)
-            self._viewer.set_sparse_samples(None)
+            if not self._api_batch_pipeline:
+                self._mesh_sdf_panel.set_sparse_samples(None)
+                self._viewer.set_sparse_samples(None)
         worker_kwargs = dict(
             sdf_target_np=target_grid,
             sdf_samples=sparse_samples,
@@ -3177,8 +4128,8 @@ class MainWindow(QtWidgets.QMainWindow):
             soft_union=soft_union,
             max_ellipsoids=max_ellipsoids,
             thickness_np=(
-                blowup_thickness if blowup != 0.0 else r.thickness),
-            sdf_blowup_offset=float(blowup),
+                blowup_thickness if blowup_fraction != 0.0 else r.thickness),
+            sdf_blowup_fraction=float(blowup_fraction),
             sdf_computer=self._sdf,
             local_fit=local_fit,
             local_fit_start_frac=local_fit_start_frac,
@@ -3196,6 +4147,10 @@ class MainWindow(QtWidgets.QMainWindow):
             bone_aware=bone_aware,
             bone_centers_np=bone_centers,
             bone_expected_counts_np=bone_expected_counts,
+            spatial_budget_centers_np=(
+                None if region_budget is None else region_budget.centers),
+            spatial_budget_caps_np=(
+                None if region_budget is None else region_budget.capacities),
             primitive_shape=primitive_shape,
             sq_eps1=sq_eps1,
             sq_eps2=sq_eps2,
@@ -3230,56 +4185,96 @@ class MainWindow(QtWidgets.QMainWindow):
                     "merge_enabled": False,
                     "prune_enabled": False,
                     "symmetry_enabled": False,
-                    "primitive_shape": "ellipsoid",
                 })
         if parameter_options:
             worker_kwargs.update(self._optimizer_settings(parameter_options))
+        # Advanced/parameter dictionaries are allowed to override ordinary UI
+        # settings, but never the primitive contract of an active API request.
+        if (self._api_job_id is not None
+                and self._api_stage == "fit"
+                and self._api_shape_fit_kwargs):
+            worker_kwargs.update(self._api_shape_fit_kwargs)
+        if self._api_job_id is not None and self._api_stage == "fit":
+            api_options = self._api_options or {}
+            if "num_steps" in api_options:
+                # Advanced Settings can override GUI defaults, but not the
+                # explicit iteration budget of this API request.
+                worker_kwargs["num_steps"] = api_options["num_steps"]
+        effective_num_steps = int(worker_kwargs["num_steps"])
         self._opt_cancel_requested = False
         self._opt_cancel_message = None
-        self._opt_worker = OptimizationWorker(**worker_kwargs)
-        self._opt_worker.set_live_metric(
-            getattr(self, "_active_ellipsoid_metric", "default"))
-        self._opt_phase = "global"
-        self._pending_visual = None
-        self._visual_timer.start()         # decouple GUI refresh from step rate
-        self._opt_worker.step_visual.connect(self._on_opt_step_visual)
-        self._opt_worker.step_sdf.connect(self._on_opt_step_sdf)
-        self._opt_worker.maintenance_done.connect(self._on_opt_maintenance_done)
-        self._opt_worker.phase_changed.connect(self._on_opt_phase_changed)
-        self._opt_worker.local_progress.connect(self._on_opt_local_progress)
-        self._opt_worker.region_changed.connect(self._on_opt_region_changed)
-        self._opt_worker.prep_progress.connect(self._on_opt_prep_progress)
-        self._opt_worker.op_events.connect(self._on_opt_op_events)
-        self._opt_worker.analysis_regions.connect(self._on_opt_analysis_regions)
-        self._opt_worker.ellipsoid_metrics.connect(self._on_opt_ellipsoid_metrics)
-        self._opt_worker.finished.connect(self._on_opt_finished)
-        self._viewer.clear_op_gizmos()      # drop markers from a previous run
-        self._viewer.clear_analysis_regions()
-        self._viewer.clear_ellipsoid_metrics()
-        self._opt_worker.start()
+        worker = None
+        try:
+            worker = OptimizationWorker(**worker_kwargs)
+            generation = self._next_worker_generation()
+            api_job_id = (
+                self._api_job_id if self._api_stage == "fit" else None)
+            self._opt_worker = worker
+            self._opt_worker_generation = generation
+            worker.set_live_metric(
+                getattr(self, "_active_ellipsoid_metric", "default"))
+            self._opt_phase = "global"
+            self._pending_visual = None
+            if not self._api_batch_pipeline:
+                self._visual_timer.start()  # decouple GUI refresh from step rate
+            for signal, slot in (
+                (worker.step_status, self._on_opt_step_status),
+                (worker.step_visual, self._on_opt_step_visual),
+                (worker.step_sdf, self._on_opt_step_sdf),
+                (worker.maintenance_done, self._on_opt_maintenance_done),
+                (worker.phase_changed, self._on_opt_phase_changed),
+                (worker.local_progress, self._on_opt_local_progress),
+                (worker.region_changed, self._on_opt_region_changed),
+                (worker.prep_progress, self._on_opt_prep_progress),
+                (worker.op_events, self._on_opt_op_events),
+                (worker.analysis_regions, self._on_opt_analysis_regions),
+                (worker.ellipsoid_metrics, self._on_opt_ellipsoid_metrics),
+                (worker.finished, self._on_opt_finished),
+            ):
+                self._connect_opt_worker_signal(
+                    signal, slot, worker, generation, api_job_id)
+            self._viewer.clear_op_gizmos()
+            self._viewer.clear_analysis_regions()
+            self._viewer.clear_ellipsoid_metrics()
 
-        sdf_name = SDF_METHOD_NAMES.get(sdf_mode, "?")
-        self._run_tracker.begin_run(
-            mesh_name=self._current_mesh_name,
-            method=method,
-            num_ellipsoids=num_ellipsoids,
-            grid_n=r.n,
-        )
-        self._dashboard.begin(num_steps, self._current_mesh_name, num_ellipsoids)
-        self._analysis_tabs.setCurrentWidget(self._dashboard)
+            sdf_name = SDF_METHOD_NAMES.get(sdf_mode, "?")
+            self._run_tracker.begin_run(
+                mesh_name=self._current_mesh_name,
+                method=method,
+                num_ellipsoids=num_ellipsoids,
+                grid_n=r.n,
+            )
+            self._dashboard.begin(
+                effective_num_steps, self._current_mesh_name, num_ellipsoids)
+            self._dock_widgets["dashboard"].show()
+            self._dock_widgets["dashboard"].raise_()
 
-        self._btn_fit.setEnabled(False)
-        self._btn_stop.setEnabled(True)
-        # Reuse the status-bar progress bar to show how far training has got.
-        self._opt_total_steps = max(1, int(num_steps))
-        self._progress_begin("Preparing …")
-        self._status.showMessage(
-            f"Optimization started ({method}, {num_ellipsoids} ellipsoids, SDF: {sdf_name}) …"
-        )
+            self._btn_fit.setEnabled(False)
+            self._btn_stop.setEnabled(True)
+            self._opt_total_steps = max(1, effective_num_steps)
+            if not self._api_batch_pipeline:
+                self._progress_begin("Preparing …")
+            self._status.showMessage(
+                f"Optimization started ({method}, {num_ellipsoids} "
+                f"ellipsoids, SDF: {sdf_name}) …"
+            )
+            # Start only after all callbacks and UI bookkeeping succeeded.  Any
+            # synchronous exception before this line owns no live QThread.
+            worker.start()
+        except Exception:
+            self._visual_timer.stop()
+            if worker is not None and worker.isRunning():
+                worker.request_stop()
+                worker.wait()
+            if self._opt_worker is worker:
+                self._opt_worker = None
+                self._opt_worker_generation = self._next_worker_generation()
+            raise
 
     def stop_optimization(self) -> None:
         self._cancel_pending_pose_sdf()
         if self._opt_worker is not None and self._opt_worker.isRunning():
+            self._opt_worker_generation = self._next_worker_generation()
             self._opt_cancel_requested = True
             if self._opt_cancel_message is None:
                 self._opt_cancel_message = "Optimization stopped."
@@ -3307,9 +4302,38 @@ class MainWindow(QtWidgets.QMainWindow):
         # happens in ``_flush_visual`` on the render timer.  (Bone Separation no
         # longer routes through here — it uses ``_on_batched_step``.)
         if self._api_job_id is not None and self._api_stage == "fit":
-            self._api_last = (centers, radii, rotations)
+            primitive_type = getattr(self, "_api_primitive_type", "ellipsoid")
+            try:
+                output_eps = MainWindow._api_shape_exponents_array(
+                    eps,
+                    len(centers),
+                    primitive_type=primitive_type,
+                    allow_missing_ellipsoid=True,
+                )
+            except ValueError:
+                # Preserve the bad/missing state so result construction fails
+                # explicitly instead of publishing a silently rounded SQ.
+                output_eps = None
+            self._api_last = (centers, radii, rotations, output_eps)
+            if self._api_batch_pipeline:
+                # The optimizer result still has to be captured for correctness,
+                # but rendering it and building a world-space preview competes
+                # with short pose fits.  Scalar progress is emitted separately
+                # by ``step_status``, without a GPU array copy.
+                return
         self._pending_visual = (int(step), float(loss),
                                 centers, radii, rotations, eps)
+
+    def _on_opt_step_status(self, step: int, loss: float) -> None:
+        """Publish cheap scalar progress without copying GPU primitive arrays."""
+        if not (self._api_job_id and self._api_stage == "fit"
+                and self._api_batch_pipeline):
+            return
+        total = max(1, int(getattr(self, "_opt_total_steps", 0)))
+        MainWindow._api_publish_progress(
+            self, "fit", f"GPU fit {step + 1}/{total}",
+            min(1.0, float(step + 1) / total),
+            step=int(step + 1), total=total, loss=float(loss))
 
     def _flush_visual(self) -> None:
         """Render the latest stashed optimizer frame (driven by a GUI timer).
@@ -3326,13 +4350,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Route rendering through the active shape plugin (superquadrics use the
         # per-primitive eps array for the deformed mesh).
-        self._shape.render(self._viewer, centers, radii, rotations, eps)
+        primitive_type = getattr(self._shape, "id", "ellipsoid")
+        render_shape = self._shape
+        if (self._api_job_id is not None
+                and self._api_stage in ("fit", "bonesep")):
+            primitive_type = getattr(self, "_api_primitive_type", "ellipsoid")
+            render_shape = self._shapes_by_id.get(primitive_type, self._shape)
+        render_shape.render(self._viewer, centers, radii, rotations, eps)
         self._viewer.tick_op_gizmos(step)
         self._lbl_ell_count.setText(f"Count: {len(centers)}")
 
         # Keep ellipsoids reference for rig assignment.
         self._ellipsoids = EllipsoidSet(device=self._device)
         self._ellipsoids.set_parameters(centers, radii, rotations)
+        if primitive_type in ("ellipsoid", "superquadric"):
+            self._fitted_primitive_type = primitive_type
+            try:
+                self._fitted_shape_exponents = self._api_shape_exponents_array(
+                    eps,
+                    len(centers),
+                    primitive_type=primitive_type,
+                    allow_missing_ellipsoid=True,
+                )
+            except ValueError:
+                self._fitted_shape_exponents = None
 
         # Bone Separation (batched): the worker emits already-combined world
         # ellipsoids for ALL bones, and the controller drives both progress bars
@@ -3384,7 +4425,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._api_live_preview_due(step):
                 try:
                     fields["preview"] = self._api_build_world_preview_payload(
-                        centers, radii, rotations)
+                        centers, radii, rotations, eps)
                 except Exception as e:
                     print(f"[API] live preview skipped: {e}")
             self._api_server.registry.update(self._api_job_id, **fields)
@@ -3413,7 +4454,11 @@ class MainWindow(QtWidgets.QMainWindow):
         For large SDFs this host-side preprocessing runs for a while before the
         first optimisation step; map it onto the bar so it is not dead time.
         """
-        self._progress_set(float(frac) * 100.0, f"Preparing · {label}")
+        if self._api_job_id and self._api_batch_pipeline:
+            MainWindow._api_publish_progress(
+                self, "fit_setup", label, frac)
+        else:
+            self._progress_set(float(frac) * 100.0, f"Preparing · {label}")
 
     def _on_opt_phase_changed(self, phase: str) -> None:
         """Track whether a global (Adam) or local (SuperFit) fit is running."""
@@ -3485,11 +4530,13 @@ class MainWindow(QtWidgets.QMainWindow):
             ur_points: np.ndarray,
             ur_values: np.ndarray,
     ) -> None:
-        # The ellipsoid SDF slice view was removed (SDF slices are shown for the
-        # mesh only), so the per-step ellipsoid grid is no longer displayed.
+        # The old per-step ellipsoid grid is no longer displayed; the Slice
+        # panel computes its color-coded fit error from the live primitives.
         return
 
     def _on_opt_finished(self) -> None:
+        worker = self._opt_worker
+        worker_error = getattr(worker, "error_message", None)
         canceled = (
             self._opt_cancel_requested
             or self._api_stage == "canceled"
@@ -3507,23 +4554,24 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._status.showMessage("Optimization finished.")
         if (self._api_job_id is not None and self._api_stage == "fit"
-                and self._opt_worker is not None
-                and self._opt_worker.optimized_parameter_result is not None):
+                and worker is not None
+                and worker.optimized_parameter_result is not None):
             self._api_local_last = tuple(
                 np.asarray(value, dtype=np.float32).copy()
-                for value in self._opt_worker.optimized_parameter_result
+                for value in worker.optimized_parameter_result
             )
         if (self._api_job_id is not None and self._api_stage == "fit"
                 and not self._api_fit_existing
-                and self._opt_worker is not None):
-            self._api_symmetry = self._opt_worker.symmetry_metadata()
+                and worker is not None):
+            self._api_symmetry = worker.symmetry_metadata()
         self._run_tracker.finish_run()
         self._dashboard.finish()
         self._opt_worker = None
         self._viewer.clear_region_box()
         self._viewer.clear_op_gizmos()
         self._viewer.clear_analysis_regions()
-        self._progress_end()
+        if not self._api_batch_pipeline:
+            self._progress_end()
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._btn_stop.setEnabled(False)
 
@@ -3532,6 +4580,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._rig_panel._btn_assign.setEnabled(True)
 
         if canceled:
+            return
+
+        if worker_error:
+            message = f"Optimization failed: {worker_error}"
+            if self._api_job_id is not None and self._api_stage == "fit":
+                self._api_fail(self._api_job_id, message)
+            else:
+                self._status.showMessage(message)
             return
 
         if self._pending_pose_corrective_after_base_fit:
@@ -3577,27 +4633,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _api_reset(self) -> None:
         """Clear all per-job API state so the next request starts clean."""
+        if self._api_batch_pipeline:
+            self._progress_end()
         self._api_job_id = None
         self._api_stage = None
+        self._api_options = None
         self._api_last = None
         self._api_local_last = None
         self._api_symmetry = None
         self._api_fit_existing = False
         self._api_initial_ellipsoids = None
         self._api_initial_ellipsoid_meta = None
+        self._api_primitive_type = "ellipsoid"
+        self._api_shape_fit_kwargs = {"primitive_shape": "ellipsoid"}
         self._api_train_correctives = False
         self._api_pose_corrective_source = None
         self._api_pending_base_result = None
+        self._api_batch_pipeline = False
         self._api_preview_last_step = -1
         self._api_preview_last_time = 0.0
+        self._api_progress_last_time = 0.0
+        self._api_progress_stage = None
         self._api_verts = None
         self._api_rig = None
         self._api_base_pose = None
         self._api_unity_pose_frames = False
 
     def _api_fail(self, job_id: str, msg: str) -> None:
+        owns_gui_job = self._api_job_id in (None, job_id)
         if self._api_server is not None:
-            self._api_server.registry.update(job_id, state="error", error=msg)
+            registry = self._api_server.registry
+            if registry.is_cancel_requested(job_id):
+                registry.complete_cancel(job_id)
+            else:
+                registry.update(job_id, state="error", error=msg)
+        if not owns_gui_job:
+            return
+        self._sdf_finalize_active = False
+        self._sdf_finalize_generation = self._next_worker_generation()
         self._status.showMessage(f"API job failed: {msg}")
         if self._bonesep_ctl is not None:
             self._bonesep_ctl.cancel()
@@ -3634,11 +4707,179 @@ class MainWindow(QtWidgets.QMainWindow):
             return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         return (arr / n).astype(np.float32)
 
+    @staticmethod
+    def _api_canonical_primitive_type(
+        value,
+        *,
+        default: str | None = "ellipsoid",
+        field: str = "primitive_type",
+    ) -> str | None:
+        """Validate the two primitive kinds supported by the Unity protocol."""
+        if value is None:
+            return default
+        kind = str(value).strip().lower()
+        if kind not in ("ellipsoid", "superquadric"):
+            if kind == "bent_superquadric":
+                raise ValueError(
+                    f"{field}='bent_superquadric' is not supported by the "
+                    "Unity API; only ellipsoid and superquadric are available")
+            raise ValueError(
+                f"{field} must be 'ellipsoid' or 'superquadric', got {value!r}")
+        return kind
+
+    @staticmethod
+    def _api_shape_exponents_array(
+        value,
+        count: int,
+        *,
+        primitive_type: str,
+        field: str = "shape_exponents",
+        allow_missing_ellipsoid: bool = True,
+    ) -> np.ndarray:
+        """Return a finite protocol ``(N,2)`` epsilon array."""
+        n = int(count)
+        kind = MainWindow._api_canonical_primitive_type(
+            primitive_type, field="primitive_type")
+        if value is None:
+            if kind == "superquadric" or not allow_missing_ellipsoid:
+                raise ValueError(f"{field} is required for superquadric primitives")
+            return np.ones((n, 2), dtype=np.float32)
+        arr = np.asarray(value, dtype=np.float32)
+        if n == 1 and arr.shape == (2,):
+            arr = arr.reshape(1, 2)
+        if arr.shape != (n, 2):
+            raise ValueError(f"{field} must have shape ({n}, 2), got {arr.shape}")
+        if (not np.isfinite(arr).all()
+                or np.any(arr < 0.1) or np.any(arr > 2.0)):
+            raise ValueError(f"{field} values must be finite and inside [0.1, 2.0]")
+        if kind == "ellipsoid":
+            if not np.allclose(arr, 1.0, rtol=0.0, atol=1.0e-6):
+                raise ValueError("ellipsoid shape_exponents must be [1, 1]")
+            return np.ones((n, 2), dtype=np.float32)
+        return np.ascontiguousarray(arr, dtype=np.float32)
+
+    @staticmethod
+    def _api_fit_steps_from_options(options: dict) -> int | None:
+        """Validate an optional, per-request optimizer iteration budget."""
+        present = [key for key in ("num_steps", "numSteps") if key in options]
+        if not present:
+            return None
+        values = [options[key] for key in present]
+        if any(type(value) is not int or not 1 <= value <= 1_000_000
+               for value in values):
+            raise ValueError(
+                "options.num_steps must be an integer inside [1, 1000000]")
+        if len(values) == 2 and values[0] != values[1]:
+            raise ValueError("options.num_steps and options.numSteps disagree")
+        return values[0]
+
+    @staticmethod
+    def _api_pose_fit_transform_flags(
+        settings: dict | None,
+        options: dict | None,
+    ) -> dict[str, bool]:
+        """Resolve which primitive transforms a pose refit may optimize.
+
+        Persisted Settings supply the defaults.  Optional per-request values
+        override them so a Unity batch can freeze its own choices for a run.
+        These flags are applied only to fixed-population ``/fit-pose`` jobs.
+        """
+        settings = settings or {}
+        options = options or {}
+        mapping = (
+            ("pose_fit_position", "optimize_centers"),
+            ("pose_fit_rotation", "optimize_rotations"),
+            ("pose_fit_scale", "optimize_radii"),
+        )
+        resolved = {}
+        for option_name, worker_name in mapping:
+            from_request = option_name in options
+            value = (options[option_name] if from_request
+                     else settings.get(option_name, True))
+            if type(value) is not bool:
+                source = "options" if from_request else "settings"
+                raise ValueError(f"{source}.{option_name} must be a boolean")
+            resolved[worker_name] = value
+        return resolved
+
+    @staticmethod
+    def _api_resolve_primitive_request(
+        payload: dict,
+        options: dict,
+    ) -> tuple[str, dict]:
+        """Resolve and freeze API shape options independently of the GUI."""
+        top_raw = payload.get("primitive_type", payload.get("primitiveType"))
+        option_raw = options.get("primitive_shape", options.get("primitiveShape"))
+        top_kind = MainWindow._api_canonical_primitive_type(
+            top_raw, default=None, field="primitive_type")
+        option_kind = MainWindow._api_canonical_primitive_type(
+            option_raw, default=None, field="options.primitive_shape")
+        if top_kind is not None and option_kind is not None \
+                and top_kind != option_kind:
+            raise ValueError(
+                "primitive_type and options.primitive_shape disagree "
+                f"({top_kind!r} != {option_kind!r})")
+        kind = top_kind or option_kind or "ellipsoid"
+
+        def _number(name: str, camel: str, default: float, lo: float, hi: float):
+            raw = options.get(name, options.get(camel, default))
+            try:
+                number = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"options.{name} must be a number") from exc
+            if not np.isfinite(number) or number < lo or number > hi:
+                raise ValueError(
+                    f"options.{name} must be finite and inside [{lo}, {hi}]")
+            return number
+
+        kwargs: dict = {"primitive_shape": kind}
+        if kind == "superquadric":
+            mode = str(options.get(
+                "sq_eps_mode", options.get("sqEpsMode", "per_primitive")
+            )).strip().lower()
+            if mode not in ("fixed", "shared", "per_primitive"):
+                raise ValueError(
+                    "options.sq_eps_mode must be 'fixed', 'shared' or "
+                    "'per_primitive'")
+            kwargs.update({
+                "sq_eps1": _number("sq_eps1", "sqEps1", 1.0, 0.1, 2.0),
+                "sq_eps2": _number("sq_eps2", "sqEps2", 1.0, 0.1, 2.0),
+                "sq_eps_mode": mode,
+                "sq_unlock_frac": _number(
+                    "sq_unlock_frac", "sqUnlockFrac", 0.05, 0.0, 1.0),
+            })
+        return kind, kwargs
+
+    def _current_fitted_primitive_state(
+        self,
+        count: int,
+    ) -> tuple[str, np.ndarray]:
+        """Shape metadata accompanying the current center/radius/rotation set."""
+        if self._api_job_id is not None:
+            kind = getattr(self, "_api_primitive_type", "ellipsoid")
+            eps = None
+            api_last = getattr(self, "_api_last", None)
+            if api_last is not None and len(api_last) >= 4:
+                eps = api_last[3]
+        else:
+            kind = getattr(self, "_fitted_primitive_type", "ellipsoid")
+            eps = getattr(self, "_fitted_shape_exponents", None)
+        kind = self._api_canonical_primitive_type(kind)
+        eps = self._api_shape_exponents_array(
+            eps,
+            count,
+            primitive_type=kind,
+            allow_missing_ellipsoid=True,
+        )
+        return kind, eps
+
     def _api_parse_initial_ellipsoids(self, payload: dict, transform):
-        """Parse Unity-posted ellipsoids and map them into normalized mesh space."""
+        """Parse Unity-posted primitives and map them into normalized mesh space."""
         entries = list(payload.get("ellipsoids") or [])
         if not entries:
             raise ValueError("fit-pose requires at least one ellipsoid")
+        expected_type = self._api_canonical_primitive_type(
+            getattr(self, "_api_primitive_type", "ellipsoid"))
 
         rig = payload.get("rig") or {}
         rig_bones = list(rig.get("bones") or [])
@@ -3664,17 +4905,64 @@ class MainWindow(QtWidgets.QMainWindow):
         centers: list[np.ndarray] = []
         radii: list[np.ndarray] = []
         rotations: list[np.ndarray] = []
+        shape_exponents: list[np.ndarray] = []
         metadata: list[dict] = []
+        seen_ids: set[int] = set()
         scale = float(transform.scale)
         center_offset = np.asarray(transform.center, dtype=np.float64)
 
         for i, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 raise ValueError(f"ellipsoids[{i}] must be an object")
+            raw_id = entry.get("id", i)
+            if isinstance(raw_id, bool):
+                raise ValueError(f"ellipsoids[{i}].id must be a non-negative integer")
             try:
-                entry_id = int(entry.get("id", i))
-            except Exception:
-                entry_id = int(i)
+                entry_id = int(raw_id)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"ellipsoids[{i}].id must be a non-negative integer") from exc
+            if (isinstance(raw_id, (float, np.floating))
+                    and (not np.isfinite(raw_id) or float(raw_id) != entry_id)):
+                raise ValueError(f"ellipsoids[{i}].id must be a non-negative integer")
+            if entry_id < 0:
+                raise ValueError(f"ellipsoids[{i}].id must be a non-negative integer")
+            if entry_id in seen_ids:
+                raise ValueError(f"duplicate primitive id {entry_id}")
+            seen_ids.add(entry_id)
+
+            # Missing per-entry metadata is the v1-v3 ellipsoid contract.  An
+            # SQ request therefore has to opt in both at the top level and for
+            # every fixed-ID entry; this prevents an accidental shape fallback.
+            entry_type = self._api_canonical_primitive_type(
+                entry.get("primitive_type", entry.get("primitiveType")),
+                field=f"ellipsoids[{i}].primitive_type",
+            )
+            if entry_type != expected_type:
+                raise ValueError(
+                    f"ellipsoids[{i}].primitive_type {entry_type!r} does not "
+                    f"match request primitive_type {expected_type!r}")
+            raw_shape = entry.get("shape_exponents")
+            raw_eps = entry.get("eps")
+            if raw_shape is not None and raw_eps is not None:
+                shape_value = self._api_shape_exponents_array(
+                    raw_shape, 1, primitive_type=entry_type,
+                    field=f"ellipsoids[{i}].shape_exponents")
+                eps_value = self._api_shape_exponents_array(
+                    raw_eps, 1, primitive_type=entry_type,
+                    field=f"ellipsoids[{i}].eps")
+                if not np.allclose(shape_value, eps_value, atol=1.0e-6):
+                    raise ValueError(
+                        f"ellipsoids[{i}].shape_exponents and eps disagree")
+                entry_eps = shape_value[0]
+            else:
+                entry_eps = self._api_shape_exponents_array(
+                    raw_shape if raw_shape is not None else raw_eps,
+                    1,
+                    primitive_type=entry_type,
+                    field=f"ellipsoids[{i}].shape_exponents",
+                    allow_missing_ellipsoid=True,
+                )[0]
             entry_name = str(entry.get("name") or "")
             bone_name = str(entry.get("bone") or "")
             try:
@@ -3736,6 +5024,7 @@ class MainWindow(QtWidgets.QMainWindow):
             centers.append(((c - center_offset) * scale).astype(np.float32))
             radii.append((r * scale).astype(np.float32))
             rotations.append(self._normalize_quat_np(raw_rot))
+            shape_exponents.append(entry_eps.astype(np.float32))
             attachment_indices = list(
                 entry.get("attachment_bone_indices")
                 or entry.get("attachmentBoneIndices")
@@ -3807,12 +5096,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 "attachment_weights": weight_array,
                 "attachment_reference_positions": reference_positions,
                 "attachment_reference_rotations": reference_rotations,
+                "primitive_type": entry_type,
+                "shape_exponents": entry_eps.astype(np.float32),
             })
 
         return (
             np.ascontiguousarray(np.vstack(centers), dtype=np.float32),
             np.ascontiguousarray(np.vstack(radii), dtype=np.float32),
             np.ascontiguousarray(np.vstack(rotations), dtype=np.float32),
+            np.ascontiguousarray(np.vstack(shape_exponents), dtype=np.float32),
             metadata,
         )
 
@@ -3835,6 +5127,8 @@ class MainWindow(QtWidgets.QMainWindow):
         reference_rotations = np.zeros((bone_count, 4), dtype=np.float32)
         current_positions = np.zeros((bone_count, 3), dtype=np.float32)
         current_rotations = np.zeros((bone_count, 4), dtype=np.float32)
+        reference_matrices = np.zeros((bone_count, 4, 4), dtype=np.float64)
+        current_matrices = np.zeros((bone_count, 4, 4), dtype=np.float64)
         identity = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
         for i, bone in enumerate(bones):
@@ -3853,6 +5147,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 quat_from_matrix(reference_matrix))
             current_rotations[i] = self._normalize_quat_np(
                 quat_from_matrix(current_matrix))
+            reference_matrices[i] = reference_matrix
+            current_matrices[i] = current_matrix
+            reference_matrices[i, :3, 3] = reference_positions[i]
+            current_matrices[i, :3, 3] = current_positions[i]
 
         correction = np.asarray(
             (rig.get("_ellipsdf_space_correction") or {}).get(
@@ -3904,9 +5202,23 @@ class MainWindow(QtWidgets.QMainWindow):
                         or np.linalg.norm(raw_q) < 0.5):
                     continue
                 q = self._normalize_quat_np(raw_q)
+                old_rotation_matrix = mat4_compose(
+                    np.zeros(3),
+                    reference_rotations[joint],
+                    np.ones(3),
+                )[:3, :3]
+                preserved_stretch = (
+                    old_rotation_matrix.T @ reference_matrices[joint, :3, :3]
+                )
+                new_rotation_matrix = mat4_compose(
+                    np.zeros(3), q, np.ones(3),
+                )[:3, :3]
                 reference_positions[joint] = (
                     (positions[slot] + correction - center_offset) * scale)
                 reference_rotations[joint] = q
+                reference_matrices[joint, :3, :3] = (
+                    new_rotation_matrix @ preserved_stretch)
+                reference_matrices[joint, :3, 3] = reference_positions[joint]
 
         local = BoneLocalEllipsoids(
             local_centers=np.ascontiguousarray(np.vstack([
@@ -3921,6 +5233,10 @@ class MainWindow(QtWidgets.QMainWindow):
             bone_assignments=assignments,
             attachment_joints=attachment_joints,
             attachment_weights=attachment_weights,
+            primitive_type=getattr(self, "_api_primitive_type", "ellipsoid"),
+            shape_exponents=np.ascontiguousarray(np.vstack([
+                entry.get("shape_exponents", [1.0, 1.0]) for entry in meta
+            ]), dtype=np.float32),
         )
         linear, offset, rotation_prefix = attachment_parameter_transform(
             local,
@@ -3928,8 +5244,24 @@ class MainWindow(QtWidgets.QMainWindow):
             reference_rotations,
             current_positions,
             current_rotations,
+            bind_transforms=reference_matrices,
+            pose_transforms=current_matrices,
         )
         return local, linear, offset, rotation_prefix
+
+    def _api_has_local_work_in_flight(self) -> bool:
+        """Whether GUI-owned compute must finish before an API job may mutate it."""
+        return any((
+            self._sdf_worker is not None,
+            getattr(self, "_sdf_finalize_active", False),
+            self._opt_worker is not None,
+            self._pose_corrective_worker is not None,
+            self._region_sdf_worker is not None,
+            self._region_fit_worker is not None,
+            self._batched_worker is not None,
+            self._bonesep_ctl is not None,
+            self._region_fit_active,
+        ))
 
     def _api_on_fit_requested(self, job_id: str) -> None:
         """GUI-thread slot: ingest the posted mesh and kick off SDF compute.
@@ -3937,6 +5269,76 @@ class MainWindow(QtWidgets.QMainWindow):
         The fit itself is started in ``_on_sdf_done`` once the grid is ready;
         the result is assembled in ``_on_opt_finished``.
         """
+        try:
+            self._api_on_fit_requested_impl(job_id)
+        except Exception as exc:
+            if self._api_job_id in (None, job_id):
+                self._api_fail(job_id, f"fit request start failed: {exc}")
+
+    def _api_publish_progress(
+        self, stage: str, detail: str, progress: float = 0.0, **fields
+    ) -> None:
+        """Forward phase progress to the HTTP job and the Python status line."""
+        job_id = getattr(self, "_api_job_id", None)
+        server = getattr(self, "_api_server", None)
+        if not job_id or server is None:
+            return
+        now = time.monotonic()
+        last = getattr(self, "_api_progress_last_time", 0.0)
+        previous_stage = getattr(self, "_api_progress_stage", None)
+        if stage == previous_stage and now - last < 0.2:
+            return
+        self._api_progress_last_time = now
+        self._api_progress_stage = stage
+        server.registry.update(
+            job_id, stage=stage, detail=str(detail),
+            stage_progress=max(0.0, min(1.0, float(progress))), **fields)
+        if getattr(self, "_api_batch_pipeline", False):
+            spans = {
+                "ingest": (0.0, 8.0),
+                "sdf": (8.0, 55.0),
+                "fit_setup": (55.0, 65.0),
+                "fit": (65.0, 95.0),
+                "result": (95.0, 99.0),
+            }
+            if stage in spans:
+                start, end = spans[stage]
+                progress_set = getattr(self, "_progress_set", None)
+                if callable(progress_set):
+                    progress_set(
+                        start + (end - start) * max(0.0, min(1.0, float(progress))),
+                        f"Unity pose · {stage} · {detail}")
+        status = getattr(self, "_status", None)
+        if status is not None:
+            status.showMessage(f"API fit {job_id[:8]} · {stage}: {detail}")
+
+    def _api_prepare_mesh_arrays(
+        self,
+        verts: np.ndarray,
+        faces: np.ndarray,
+        reuse_topology: bool,
+    ):
+        """Repair a topology once, then reuse its oriented faces for poses."""
+        raw_faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
+        cached_raw = getattr(self, "_api_cached_raw_faces", None)
+        cached_oriented = getattr(self, "_api_cached_oriented_faces", None)
+        if (reuse_topology and cached_raw is not None
+                and cached_oriented is not None
+                and getattr(self, "_api_cached_vertex_count", -1) == len(verts)
+                and np.array_equal(raw_faces, cached_raw)):
+            return load_and_prepare_arrays(
+                verts, cached_oriented, target_scale=1.0,
+                faces_already_oriented=True)
+
+        mesh, transform = load_and_prepare_arrays(
+            verts, raw_faces, target_scale=1.0)
+        self._api_cached_raw_faces = raw_faces.copy()
+        self._api_cached_oriented_faces = np.asarray(
+            mesh.faces, dtype=np.int32).copy()
+        self._api_cached_vertex_count = len(verts)
+        return mesh, transform
+
+    def _api_on_fit_requested_impl(self, job_id: str) -> None:
         if self._api_server is None:
             return
         initial_status = self._api_server.registry.status_dict(job_id)
@@ -3952,15 +5354,44 @@ class MainWindow(QtWidgets.QMainWindow):
         if job is None:
             return
         if self._api_job_id is not None:
-            self._api_server.registry.update(
-                job_id, state="error", error="another fit is in progress")
+            # The bounded registry normally dispatches only one job.  Keep an
+            # accidentally duplicated/late queued signal harmless instead of
+            # destroying that queued job; registry completion will dispatch it
+            # again once the active GPU job releases the consumer slot.
+            return
+        if self._api_has_local_work_in_flight():
+            # The registry intentionally keeps this job as its one dispatched
+            # consumer.  Retry only after the manual worker's completion slot
+            # has cleared its object, preventing a stale ``finished`` callback
+            # from finalizing or deleting the new API worker.
+            self._status.showMessage(
+                f"API fit {job_id[:8]} queued behind local work …")
+            QtCore.QTimer.singleShot(
+                100, lambda pending_id=job_id:
+                self._api_on_fit_requested(pending_id))
             return
         try:
             payload = job.payload
             api_mode = str(payload.get("_api_mode") or payload.get("api_mode") or "")
+            api_options = dict(payload.get("options") or {})
+            batch_pose_request = (
+                api_mode == "fit_pose" and bool(
+                    api_options.get("batch_pipeline", False)
+                    or api_options.get("batchPipeline", False)
+                    or payload.get("batch_pipeline", False)
+                    or payload.get("batchPipeline", False)))
+            self._api_server.registry.update(
+                job_id, stage="ingest", detail="Preparing mesh and rig",
+                stage_progress=0.0)
+            api_num_steps = MainWindow._api_fit_steps_from_options(api_options)
+            if api_num_steps is not None:
+                api_options["num_steps"] = api_num_steps
+            api_primitive_type, api_shape_fit_kwargs = (
+                self._api_resolve_primitive_request(payload, api_options))
             verts = np.asarray(payload["vertices"], dtype=np.float32).reshape(-1, 3)
             faces = np.asarray(payload["faces"], dtype=np.int64).reshape(-1, 3)
-            mesh, transform = load_and_prepare_arrays(verts, faces, target_scale=1.0)
+            mesh, transform = MainWindow._api_prepare_mesh_arrays(
+                self, verts, faces, batch_pose_request)
             nverts = mesh.vertices.view(np.ndarray)
             nfaces = mesh.faces.view(np.ndarray)
             rig_payload, rig_delta, rig_space_reason = correct_unity_rig_space(
@@ -3974,15 +5405,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._api_job_id = job_id
         self._api_norm = transform
-        self._api_options = dict(payload.get("options") or {})
+        self._api_options = api_options
+        self._api_primitive_type = api_primitive_type
+        self._api_shape_fit_kwargs = api_shape_fit_kwargs
+        self._api_batch_pipeline = bool(
+            self._api_options.get("batch_pipeline", False)
+            or self._api_options.get("batchPipeline", False)
+            or payload.get("batch_pipeline", False)
+            or payload.get("batchPipeline", False)
+        )
+        if self._api_batch_pipeline:
+            self._progress_begin("Preparing Unity pose fit …")
         self._api_fit_existing = api_mode == "fit_pose"
         self._api_initial_ellipsoids = None
         self._api_initial_ellipsoid_meta = None
         if self._api_fit_existing:
             try:
                 parsed = self._api_parse_initial_ellipsoids(payload, transform)
-                self._api_initial_ellipsoids = parsed[:3]
-                self._api_initial_ellipsoid_meta = parsed[3]
+                self._api_initial_ellipsoids = parsed[:4]
+                self._api_initial_ellipsoid_meta = parsed[4]
             except Exception as e:
                 self._api_fail(job_id, f"bad ellipsoid payload: {e}")
                 return
@@ -4018,23 +5459,33 @@ class MainWindow(QtWidgets.QMainWindow):
         # a fresh file load does.  Over the Unity bridge the user dials the
         # blowup in once and expects it to persist across fits, so carry the
         # current value across the reset.
-        blowup_vox = self._mesh_settings.blowup_voxels()
-        self._set_base_mesh(nverts, nfaces)
-        # API jobs fit flat in the Python UI (the rig is only overlaid), so the
-        # rigged-mesh-only Mesh-Blowup preview stays disabled here.
-        self._mesh_settings.set_region_available(False)
-        if blowup_vox != 0.0:
-            self._mesh_settings.set_blowup_voxels(blowup_vox)
-            self._on_sdf_blowup_changed(blowup_vox)
-        self._viewer.show_mesh(nverts, nfaces)
-        self._ensure_sdf_idle()
-        self._sdf.set_mesh(nverts, nfaces)
+        blowup_fraction = self._mesh_settings.blowup_fraction()
+        fast_pose_batch = self._api_batch_pipeline and self._api_fit_existing
+        try:
+            if fast_pose_batch:
+                self._set_api_batch_mesh(nverts, nfaces)
+            else:
+                self._set_base_mesh(nverts, nfaces)
+                # API jobs fit flat in the Python UI (the rig is only overlaid),
+                # so the rigged-mesh-only Mesh-Blowup preview stays disabled.
+                self._mesh_settings.set_region_available(False)
+                if blowup_fraction != 0.0:
+                    self._mesh_settings.set_blowup_fraction(blowup_fraction)
+                    self._on_sdf_blowup_changed(blowup_fraction)
+                self._viewer.show_mesh(nverts, nfaces)
+            self._ensure_sdf_idle()
+            self._sdf.set_mesh(nverts, nfaces)
+        except Exception as exc:
+            self._api_fail(job_id, f"mesh/SDF setup failed: {exc}")
+            return
 
         # If Unity supplied rig + skinning, expose it through the normal Rig Mode
         # panel so saved pose-library clips deform the live Unity mesh itself.
         # Without skinning data we fall back to a skeleton-only overlay.
-        rig_panel_ready = self._activate_unity_rig_panel(
-            nverts, nfaces, self._api_rig, transform)
+        rig_panel_ready = False
+        if not fast_pose_batch:
+            rig_panel_ready = self._activate_unity_rig_panel(
+                nverts, nfaces, self._api_rig, transform)
         if (not self._api_fit_existing
                 and self._api_train_correctives
                 and rig_panel_ready
@@ -4049,12 +5500,19 @@ class MainWindow(QtWidgets.QMainWindow):
                         nverts = np.ascontiguousarray(frame0, dtype=np.float32)
                         self._set_base_mesh(nverts, nfaces)
                         self._mesh_settings.set_region_available(False)
-                        if blowup_vox != 0.0:
-                            self._mesh_settings.set_blowup_voxels(blowup_vox)
-                            self._on_sdf_blowup_changed(blowup_vox)
-                        self._viewer.show_mesh(nverts, nfaces)
-                        self._ensure_sdf_idle()
-                        self._sdf.set_mesh(nverts, nfaces)
+                        if blowup_fraction != 0.0:
+                            self._mesh_settings.set_blowup_fraction(
+                                blowup_fraction)
+                            self._on_sdf_blowup_changed(blowup_fraction)
+                        if not self._api_batch_pipeline:
+                            self._viewer.show_mesh(nverts, nfaces)
+                        try:
+                            self._ensure_sdf_idle()
+                            self._sdf.set_mesh(nverts, nfaces)
+                        except Exception as exc:
+                            self._api_fail(
+                                job_id, f"mesh/SDF setup failed: {exc}")
+                            return
         unity_frames_requested = bool(
             self._api_options.get("unity_pose_frames_requested", False)
             or self._api_options.get("unityPoseFramesRequested", False)
@@ -4096,7 +5554,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Make the Unity-pushed mesh appear (and become selected) in the mesh
         # selector, so the user can switch away and come back to it like a file.
-        self._register_unity_mesh_in_combo(nverts, nfaces, self._api_rig, transform)
+        if not self._api_batch_pipeline:
+            self._register_unity_mesh_in_combo(
+                nverts, nfaces, self._api_rig, transform)
 
         # Cancellation can be requested from an HTTP thread while this GUI slot
         # is ingesting a large mesh.  The guarded registry update is the final
@@ -4109,10 +5569,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._api_reset()
             return
         self._api_stage = "sdf"
+        MainWindow._api_publish_progress(
+            self, "sdf", "Computing signed distance field", 0.0)
         self._status.showMessage(
             f"API fit {job_id[:8]} … computing SDF "
             f"(verts={len(nverts)} faces={len(nfaces)})")
-        self._on_compute_all()
+        try:
+            self._on_compute_all()
+        except Exception as exc:
+            if self._api_job_id == job_id:
+                self._api_fail(job_id, f"SDF worker start failed: {exc}")
 
     def _api_show_rig_bones(self, rig: dict | None, transform) -> None:
         """Overlay the posted rig's bind-pose skeleton on the displayed mesh.
@@ -4380,11 +5846,19 @@ class MainWindow(QtWidgets.QMainWindow):
         Batch may explicitly override symmetry, because its shared morph
         database must use the exact hard-mirror pairs produced by this base fit.
         """
-        if (self._api_server is not None
-                and self._api_job_id is not None
-                and self._api_server.registry.is_cancel_requested(
-                    self._api_job_id)):
-            self._api_on_cancel_requested(self._api_job_id)
+        job_id = self._api_job_id
+        if (self._api_server is None or job_id is None
+                or self._api_stage != "sdf"):
+            return
+        try:
+            self._api_start_fit_impl(job_id)
+        except Exception as exc:
+            if self._api_job_id == job_id:
+                self._api_fail(job_id, f"fit worker start failed: {exc}")
+
+    def _api_start_fit_impl(self, job_id: str) -> None:
+        if self._api_server.registry.is_cancel_requested(job_id):
+            self._api_on_cancel_requested(job_id)
             return
 
         if self._api_fit_existing:
@@ -4408,6 +5882,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if (not shape_correctives_requested
                 and not symmetric_base_fit_requested
+                and self._api_primitive_type == "ellipsoid"
                 and self._cmb_fit_scope.currentData() == "bone"
                 and rig and rig.get("bones")
                 and rig.get("boneIndices") is not None
@@ -4434,7 +5909,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self._api_stage = "fit"
-        if symmetric_base_fit_requested:
+        # Bone Separation currently owns only center/radius/rotation buffers.
+        # Route API superquadrics through the full-object optimizer until that
+        # independent UI pipeline also has an epsilon population.
+        if symmetric_base_fit_requested or self._api_primitive_type == "superquadric":
             self._start_full_object_fit()
         else:
             self._on_fit_clicked()
@@ -4445,7 +5923,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self._api_fail(self._api_job_id, "fit-pose did not contain ellipsoids")
             return
 
-        centers, radii, rotations = self._api_initial_ellipsoids
+        try:
+            transform_flags = MainWindow._api_pose_fit_transform_flags(
+                getattr(self, "_settings", None),
+                getattr(self, "_api_options", None),
+            )
+        except ValueError as e:
+            self._api_fail(self._api_job_id, str(e))
+            return
+
+        MainWindow._api_publish_progress(
+            self, "fit_setup", "Building bone-local fit parameters", 0.0)
+
+        centers, radii, rotations, shape_exponents = self._api_initial_ellipsoids
         fit_centers = centers
         fit_radii = radii
         fit_rotations = rotations
@@ -4468,6 +5958,7 @@ class MainWindow(QtWidgets.QMainWindow):
             fit_centers = local.local_centers
             fit_radii = local.local_radii
             fit_rotations = local.local_rotations
+            shape_exponents = local.shape_exponents.copy()
             parameter_options = {
                 "parameter_linear_np": linear,
                 "parameter_offset_np": offset,
@@ -4481,10 +5972,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 "parameter_center_trust_radius_factor": 1.75,
                 "parameter_radii_trust_factor": 2.5,
             }
+        parameter_options = dict(parameter_options or {})
+        parameter_options.update(transform_flags)
+        if self._api_batch_pipeline:
+            # Keep validation/checkpoint cadence unchanged, but avoid copying
+            # every ellipsoid array back to the GUI at each reporting step.
+            parameter_options["emit_intermediate_progress"] = False
         self._api_last = (
             np.asarray(centers, dtype=np.float32).copy(),
             np.asarray(radii, dtype=np.float32).copy(),
             np.asarray(rotations, dtype=np.float32).copy(),
+            np.asarray(shape_exponents, dtype=np.float32).copy(),
         )
         self._api_stage = "fit"
         self.start_optimization(
@@ -4494,28 +5992,58 @@ class MainWindow(QtWidgets.QMainWindow):
             initial_centers=fit_centers,
             initial_radii=fit_radii,
             initial_rotations=fit_rotations,
+            initial_eps=(shape_exponents
+                         if self._api_primitive_type == "superquadric"
+                         else None),
             fixed_population=True,
             parameter_options=parameter_options,
             **self._gather_fit_kwargs(),
         )
 
-    def _api_build_world_preview_payload(self, centers, radii, rotations) -> dict:
-        """Build a transient Unity-world preview for the current optimizer state."""
+    def _api_build_world_preview_payload(
+        self,
+        centers,
+        radii,
+        rotations,
+        shape_exponents=None,
+        *,
+        primitive_type: str | None = None,
+    ) -> dict:
+        """Build a transient Unity-world v4 primitive preview."""
         t = self._api_norm
+        primitive_type = self._api_canonical_primitive_type(
+            primitive_type or getattr(self, "_api_primitive_type", "ellipsoid"))
+        shape_exponents = self._api_shape_exponents_array(
+            shape_exponents,
+            len(centers),
+            primitive_type=primitive_type,
+            allow_missing_ellipsoid=True,
+        )
         centers_o = np.array([t.to_original_point(c) for c in centers],
                              dtype=np.float64)
         radii_o = np.array([t.to_original_length(r) for r in radii],
                            dtype=np.float64)
+        source_meta = (
+            list(getattr(self, "_api_initial_ellipsoid_meta", None) or [])
+            if getattr(self, "_api_fit_existing", False) else [])
         entries = [{
-            "id": int(i),
-            "name": sphere_name("Preview", i),
-            "bone": None,
+            "id": int(source_meta[i].get("id", i))
+                  if i < len(source_meta) else int(i),
+            "name": str(source_meta[i].get("name") or "")
+                    if i < len(source_meta) else sphere_name("Preview", i),
+            "bone": str(source_meta[i].get("bone") or "")
+                    if i < len(source_meta) else None,
             "center": [round(float(v), 7) for v in centers_o[i]],
             "radii": [round(float(v), 7) for v in radii_o[i]],
             "rotation": [round(float(v), 7) for v in rotations[i]],
+            "primitive_type": primitive_type,
+            "shape_exponents": [
+                round(float(v), 7) for v in shape_exponents[i]
+            ],
         } for i in range(len(centers_o))]
         return {
-            "version": 3,
+            "version": 4,
+            "primitive_type": primitive_type,
             "coordinate_system": "unity_world",
             "quaternion_convention": "xyzw",
             "rigged": False,
@@ -4530,6 +6058,8 @@ class MainWindow(QtWidgets.QMainWindow):
         radii_o: np.ndarray,
         rotations: np.ndarray,
         rig: dict,
+        primitive_type: str,
+        shape_exponents: np.ndarray,
     ) -> list[dict]:
         """Return fitted pose ellipsoids with their original Unity identity.
 
@@ -4541,7 +6071,9 @@ class MainWindow(QtWidgets.QMainWindow):
         meta = self._api_initial_ellipsoid_meta or []
         if len(meta) != len(centers_o):
             return assign_ellipsoids_to_bones(
-                centers_o, radii_o, rotations, self._api_verts, rig)
+                centers_o, radii_o, rotations, self._api_verts, rig,
+                primitive_type=primitive_type,
+                shape_exponents=shape_exponents)
 
         if self._api_local_last is not None:
             local_centers, local_radii, local_rotations = self._api_local_last
@@ -4564,6 +6096,10 @@ class MainWindow(QtWidgets.QMainWindow):
                         ],
                         "radii": [
                             round(float(v) / scale, 7) for v in local_radii[i]
+                        ],
+                        "primitive_type": primitive_type,
+                        "shape_exponents": [
+                            round(float(v), 7) for v in shape_exponents[i]
                         ],
                         "attachment_bone_indices": [
                             int(v) for v in
@@ -4603,7 +6139,9 @@ class MainWindow(QtWidgets.QMainWindow):
         fallback_entries = None
         if np.any(assignments < 0):
             fallback_entries = assign_ellipsoids_to_bones(
-                centers_o, radii_o, rotations, self._api_verts, rig)
+                centers_o, radii_o, rotations, self._api_verts, rig,
+                primitive_type=primitive_type,
+                shape_exponents=shape_exponents)
             for i in range(len(assignments)):
                 if assignments[i] >= 0:
                     continue
@@ -4635,6 +6173,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return world_to_bone_local_entries(
             centers_o, radii_o, rotations, assignments, rig,
             source_entries=source_entries,
+            primitive_type=primitive_type,
+            shape_exponents=shape_exponents,
         )
 
     def _api_build_symmetry_payload(self, entries: list[dict]) -> dict | None:
@@ -4682,9 +6222,23 @@ class MainWindow(QtWidgets.QMainWindow):
             "pairs": pairs,
         }
 
-    def _api_build_result_payload(self, centers, radii, rotations) -> dict:
-        """Convert normalized optimizer ellipsoids to Unity API result JSON."""
+    def _api_build_result_payload(
+        self,
+        centers,
+        radii,
+        rotations,
+        shape_exponents=None,
+    ) -> dict:
+        """Convert normalized optimizer primitives to Unity API v4 JSON."""
         t = self._api_norm
+        primitive_type = self._api_canonical_primitive_type(
+            getattr(self, "_api_primitive_type", "ellipsoid"))
+        shape_exponents = self._api_shape_exponents_array(
+            shape_exponents,
+            len(centers),
+            primitive_type=primitive_type,
+            allow_missing_ellipsoid=True,
+        )
         centers_o = np.array([t.to_original_point(c) for c in centers],
                              dtype=np.float64)
         radii_o = np.array([t.to_original_length(r) for r in radii],
@@ -4695,10 +6249,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if rigged:
             if self._api_fit_existing:
                 entries = self._api_build_fit_pose_entries(
-                    centers_o, radii_o, rotations, rig)
+                    centers_o, radii_o, rotations, rig,
+                    primitive_type, shape_exponents)
             else:
                 entries = assign_ellipsoids_to_bones(
-                    centers_o, radii_o, rotations, self._api_verts, rig)
+                    centers_o, radii_o, rotations, self._api_verts, rig,
+                    primitive_type=primitive_type,
+                    shape_exponents=shape_exponents)
         else:
             entries = [{
                 "id": int(i),
@@ -4707,10 +6264,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 "center": [round(float(v), 7) for v in centers_o[i]],
                 "radii": [round(float(v), 7) for v in radii_o[i]],
                 "rotation": [round(float(v), 7) for v in rotations[i]],
+                "primitive_type": primitive_type,
+                "shape_exponents": [
+                    round(float(v), 7) for v in shape_exponents[i]
+                ],
             } for i in range(len(centers_o))]
 
         result = {
-            "version": 3,
+            "version": 4,
+            "primitive_type": primitive_type,
             "coordinate_system": "unity_world",
             "quaternion_convention": "xyzw",
             "rigged": rigged,
@@ -4749,6 +6311,10 @@ class MainWindow(QtWidgets.QMainWindow):
             pose["delta_centers"] = [
                 _unscale_vec3(v) for v in pose.get("delta_centers", [])
             ]
+            for entry in pose.get("ellipsoids", []):
+                if "delta_local_center" in entry:
+                    entry["delta_local_center"] = _unscale_vec3(
+                        entry["delta_local_center"])
         payload["coordinate_system"] = "unity_world_bone_local"
         return payload
 
@@ -4769,22 +6335,31 @@ class MainWindow(QtWidgets.QMainWindow):
         if job_id is None or self._api_server is None:
             return
         try:
+            MainWindow._api_publish_progress(
+                self, "result", "Assembling fitted primitives", 0.0)
             if self._api_last is None:
                 raise RuntimeError("no ellipsoids were produced")
-            centers, radii, rotations = self._api_last
-            result = self._api_build_result_payload(centers, radii, rotations)
+            if len(self._api_last) == 3:
+                centers, radii, rotations = self._api_last
+                shape_exponents = None
+            else:
+                centers, radii, rotations, shape_exponents = self._api_last
+            result = self._api_build_result_payload(
+                centers, radii, rotations, shape_exponents)
             if self._api_train_correctives:
                 if not result.get("rigged"):
                     raise RuntimeError("Train Bone Correctives needs a skinned Unity rig")
                 if not self._rig_panel.shape_fitting_enabled:
+                    fields = {
+                        "state": "done",
+                        "result": result,
+                        "count": int(result.get("count", 0)),
+                        "error": None,
+                    }
+                    if not self._api_batch_pipeline:
+                        fields["preview"] = result
                     self._api_server.registry.update(
-                        job_id,
-                        state="done",
-                        result=result,
-                        preview=result,
-                        count=int(result.get("count", 0)),
-                        error=None,
-                    )
+                        job_id, **fields)
                     self._status.showMessage(
                         f"API fit {job_id[:8]} done — Shape Fitting off, "
                         "using bone-driven base ellipsoids")
@@ -4805,20 +6380,27 @@ class MainWindow(QtWidgets.QMainWindow):
                     raise RuntimeError("could not build bone-local base ellipsoids")
                 self._api_pending_base_result = result
                 self._api_stage = "correctives"
+                fields = {
+                    "state": "running",
+                    "count": int(result.get("count", 0)),
+                    "error": None,
+                }
+                if not self._api_batch_pipeline:
+                    fields["preview"] = result
                 self._api_server.registry.update(
-                    job_id,
-                    state="running",
-                    preview=result,
-                    count=int(result.get("count", 0)),
-                    error=None,
-                )
+                    job_id, **fields)
                 self._status.showMessage(
                     f"API fit {job_id[:8]} base done — training bone correctives")
                 self._on_pose_corrective_fit_clicked(force_full_window=True)
                 return
-            self._api_server.registry.update(
-                job_id, state="done", result=result,
-                preview=result, count=int(result.get("count", 0)))
+            fields = {
+                "state": "done",
+                "result": result,
+                "count": int(result.get("count", 0)),
+            }
+            if not self._api_batch_pipeline:
+                fields["preview"] = result
+            self._api_server.registry.update(job_id, **fields)
             self._status.showMessage(
                 f"API fit {job_id[:8]} done — {result.get('count', 0)} ellipsoids"
                 f" ({'rigged' if result.get('rigged') else 'flat'})")

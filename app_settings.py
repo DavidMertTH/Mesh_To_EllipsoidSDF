@@ -17,7 +17,8 @@ Each *field* is a tuple::
 
     (key, label, kind, minimum, maximum, step, decimals, default, tooltip)
 
-with ``kind`` either ``"int"`` (→ QSpinBox) or ``"float"`` (→ QDoubleSpinBox).
+with ``kind`` ``"bool"`` (→ QCheckBox), ``"int"`` (→ QSpinBox), or
+``"float"`` (→ QDoubleSpinBox).
 """
 
 from __future__ import annotations
@@ -31,6 +32,23 @@ _FILE = Path(__file__).with_name("app_settings.json")
 # ── The spec — single source of truth for the dialog AND the defaults ─────────
 SETTINGS_SPEC = [
     ("Maintenance", [
+        ("Regional population budget", [
+            ("size_region_budget_enabled", "Limit ellipsoids per mesh region", "bool",
+             0, 1, 1, 0, True,
+             "Partition the mesh into coloured surface regions and enforce a\n"
+             "size-dependent hard cap on spawn and split operations."),
+            ("size_region_target_capacity", "Target ellipsoids per region", "int",
+             2, 24, 1, 0, 6,
+             "Controls the partition granularity. Lower values create more,\n"
+             "smaller regions with tighter local population caps."),
+            ("size_region_min_capacity", "Minimum per region", "int",
+             1, 8, 1, 0, 2,
+             "Minimum capacity reserved for every visible mesh region."),
+            ("size_region_area_power", "Size weighting", "float",
+             0.1, 1.0, 0.05, 2, 0.65,
+             "How strongly region surface area controls its cap. Values below\n"
+             "1 give small regions proportionally more capacity; 1 is linear."),
+        ]),
         ("Merge", [
             ("merge_per_round", "Merges per cycle", "int", 0, 50, 1, 0, 3,
              "How many overlapping ellipsoid pairs may be fused into one per\n"
@@ -74,7 +92,8 @@ SETTINGS_SPEC = [
              "Hard-delete an ellipsoid that collapsed into a flat disk:\n"
              "min-axis / median-axis below this ratio."),
             ("degenerate_spike_ratio", "Degenerate spike ratio", "float", 1.0, 20.0, 0.5, 1, 8.0,
-             "Hard-delete an over-pointy spike: max-axis / median-axis above this."),
+             "Maximum long-axis / median-axis ratio. Superquadrics above this\n"
+             "are prioritised for splitting; other primitive types are deleted."),
         ]),
     ]),
 
@@ -104,12 +123,38 @@ SETTINGS_SPEC = [
         ]),
     ]),
 
+    ("Pose refit", [
+        ("Allowed changes after the base fit", [
+            ("pose_fit_position", "Refit position", "bool", 0, 1, 1, 0, True,
+             "Allow primitive positions to be refined during /fit-pose.\n"
+             "With bone-local fitting, locked primitives still follow their\n"
+             "bones. The initial base fit is unaffected."),
+            ("pose_fit_rotation", "Refit rotation", "bool", 0, 1, 1, 0, True,
+             "Allow primitive rotations to be refined during /fit-pose.\n"
+             "With bone-local fitting, locked primitives still rotate with\n"
+             "their bones. The initial base fit is unaffected."),
+            ("pose_fit_scale", "Refit scale", "bool", 0, 1, 1, 0, True,
+             "Allow primitive radii (scale) to change during subsequent\n"
+             "/fit-pose operations. Superquadric shape exponents and bend\n"
+             "remain controlled separately; the base fit is unaffected."),
+        ]),
+    ]),
+
     ("Loss", [
         ("Surface & penalties", [
             ("surface_weight", "Surface weight", "float", 0.0, 20.0, 0.5, 1, 4.0,
              "Extra weight on samples near the zero level set (the surface)."),
             ("surface_sigma_vox", "Surface sigma (vox)", "float", 0.2, 10.0, 0.1, 1, 1.5,
              "Width (in voxels) of the surface-emphasis Gaussian."),
+            ("normal_loss_weight", "Normal loss weight", "float", 0.0, 10.0, 0.1, 1, 1.0,
+             "Match approximation normals to mesh normals near the surface.\n"
+             "0 disables the normal loss."),
+            ("normal_band_vox", "Normal band (vox)", "float", 0.5, 6.0, 0.25, 2, 2.0,
+             "Half-width of the target-SDF band used for normal matching."),
+            ("normal_warmup_frac", "Normal warm-up", "float", 0.0, 1.0, 0.05, 2, 0.20,
+             "Fraction of training used for SDF placement before normal matching starts."),
+            ("normal_ramp_frac", "Normal ramp", "float", 0.0, 1.0, 0.05, 2, 0.20,
+             "Fraction of training over which the normal-loss weight reaches full strength."),
             ("miss_penalty_weight", "Miss penalty", "float", 0.0, 30.0, 0.5, 1, 3.0,
              "Penalty when the target is inside the mesh but the ellipsoids miss it."),
             ("outside_penalty_weight", "Protrusion penalty", "float", 0.0, 50.0, 0.5, 1, 14.0,
@@ -241,6 +286,60 @@ def save(values: dict) -> None:
 # {key: value} dict of the main window's option widgets (margin, ellipsoid
 # counts, SuperFit toggles, learning rate, …) so they survive across sessions.
 _PANEL_FILE = Path(__file__).with_name("panel_settings.json")
+PANEL_SETTINGS_SCHEMA_VERSION = 3
+
+
+def _migrate_panel(data: dict) -> tuple[dict, bool]:
+    """Apply conservative one-time migrations to persisted panel values."""
+    try:
+        version = int(data.get("schema_version", 0))
+    except (TypeError, ValueError):
+        version = 0
+    changed = False
+
+    if version < 2:
+        shapes = data.get("shapes")
+        if isinstance(shapes, dict):
+            for shape_id in ("superquadric", "bent_superquadric"):
+                state = shapes.get(shape_id)
+                if not isinstance(state, dict):
+                    continue
+                try:
+                    legacy_defaults = (
+                        float(state.get("eps1")) == 0.6
+                        and float(state.get("eps2")) == 0.6
+                        and int(state.get("eps_warmup")) == 20
+                    )
+                except (TypeError, ValueError):
+                    legacy_defaults = False
+                if legacy_defaults:
+                    state["eps1"] = 1.0
+                    state["eps2"] = 1.0
+                    state["eps_warmup"] = 5
+                    changed = True
+        data["schema_version"] = 2
+        changed = True
+
+    if version < 3:
+        shared = data.get("shared")
+        if isinstance(shared, dict):
+            if "blowup_fraction" not in shared and "blowup" in shared:
+                try:
+                    # Preserve the former slider's relative position:
+                    # +/-10 vox (old full range) becomes +/-25% local diameter.
+                    old = float(shared["blowup"])
+                    shared["blowup_fraction"] = (
+                        max(-1.0, min(1.0, old / 10.0)) * 0.25)
+                except (TypeError, ValueError):
+                    shared["blowup_fraction"] = 0.0
+                changed = True
+            if "blowup" in shared:
+                del shared["blowup"]
+                changed = True
+        data["schema_version"] = 3
+        changed = True
+
+    return data, changed
 
 
 def load_panel() -> dict:
@@ -249,13 +348,20 @@ def load_panel() -> dict:
         data = json.loads(_PANEL_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    data, changed = _migrate_panel(data)
+    if changed:
+        save_panel(data)
+    return data
 
 
 def save_panel(values: dict) -> None:
     """Persist the options-panel values to disk (best effort)."""
     try:
-        _PANEL_FILE.write_text(json.dumps(values, indent=2, sort_keys=True),
+        payload = dict(values)
+        payload["schema_version"] = PANEL_SETTINGS_SCHEMA_VERSION
+        _PANEL_FILE.write_text(json.dumps(payload, indent=2, sort_keys=True),
                                encoding="utf-8")
     except Exception:
         pass

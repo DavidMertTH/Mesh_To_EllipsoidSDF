@@ -8,6 +8,7 @@ Provides:
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Optional
 
@@ -15,8 +16,11 @@ import numpy as np
 import warp as wp
 
 from sdf_blowup import (
+    BLOWUP_CARRIER_MARGIN_VOXELS,
+    MAX_UI_THICKNESS_FRACTION,
     build_surface_carried_thickness,
     conservative_mirror_min,
+    relative_blowup_extent_voxels,
 )
 from thickness import dilate_zeros, local_thickness
 from sdf_samples import SdfSampleSet
@@ -54,6 +58,7 @@ def _sdf_voxel_grid_kernel(
     nz: int,
     max_dist: float,
     use_winding: int,
+    out_offset: int,
     out_sdf: wp.array(dtype=wp.float32),
 ):
     tid = wp.tid()
@@ -78,13 +83,13 @@ def _sdf_voxel_grid_kernel(
     else:
         q = wp.mesh_query_point(mesh_id, p, max_dist)
     if q.result == 0:
-        out_sdf[tid] = 1.0e6
+        out_sdf[out_offset + tid] = 1.0e6
         return
 
     closest = wp.mesh_eval_position(mesh_id, q.face, q.u, q.v)
     d = wp.length(p - closest)
     s = -1.0 if q.sign < 0.0 else 1.0
-    out_sdf[tid] = d * s
+    out_sdf[out_offset + tid] = d * s
 
 
 @wp.kernel
@@ -173,6 +178,11 @@ class SdfResult:
     nx: int = 0               # per-axis voxel counts; 0 → fall back to ``n``
     ny: int = 0
     nz: int = 0
+    thickness_stride_vox: float = 1.0
+    blowup_thickness_extent_vox: float = 0.0
+    # Largest |thickness fraction| for which ``blowup_thickness`` was carried
+    # far enough into the exterior.  ``None`` means legacy/unknown metadata.
+    blowup_thickness_capacity_fraction: float | None = None
 
     def __post_init__(self):
         # Back-fill per-axis counts for cubic results / older call sites.
@@ -277,12 +287,32 @@ class SdfComputer:
     def __init__(self, device: str | None = None):
         self.device = device or ("cuda" if wp.is_cuda_available() else "cpu")
         self._warp_mesh: Optional[wp.Mesh] = None
+        self._points_wp = None
+        self._indices_wp = None
         self._verts: Optional[np.ndarray] = None
         self._faces: Optional[np.ndarray] = None
+        self._topology_key: tuple[tuple[int, ...], bytes] | None = None
         # Whether the mesh is closed (every edge shared by exactly 2 faces).  A
         # non-watertight mesh has an unreliable normal-based inside/outside sign,
         # so we switch to the (slower but robust) winding-number sign for it.
         self._watertight: bool = True
+        # These counters make the allocation/readback savings observable without
+        # putting timing probes or synchronisation into the hot path.  A single
+        # SdfComputer is deliberately serial; sharing it across concurrent Warp
+        # streams would make the mutable mesh and scratch buffers race.
+        self._reuse_stats = {
+            "set_mesh_calls": 0,
+            "topology_cache_hits": 0,
+            "watertight_checks": 0,
+            "mesh_rebuilds": 0,
+            "mesh_refits": 0,
+            "reused_vertex_bytes": 0,
+            "reused_index_bytes": 0,
+            "grid_kernel_launches": 0,
+            "grid_buffer_allocations": 0,
+            "grid_progress_syncs": 0,
+            "grid_host_readbacks": 0,
+        }
 
     # ── mesh management ───────────────────────────────────────────────────
 
@@ -298,16 +328,125 @@ class SdfComputer:
             verts: (V, 3) float32
             faces: (F, 3) int32
         """
-        self._verts = verts.astype(np.float32, copy=False)
-        self._faces = faces.astype(np.int32, copy=False)
-        self._watertight = self._is_watertight(faces)
-        points_wp = wp.array(self._verts, dtype=wp.vec3, device=self.device)
-        indices_wp = wp.array(
-            faces.astype(np.int32, copy=False).reshape(-1),
-            dtype=wp.int32,
-            device=self.device,
+        # Own both arrays from the start.  API decoders and pose producers may
+        # reuse their input buffers immediately after this call; aliasing them
+        # would let an external in-place edit desynchronise CPU sampling from the
+        # uploaded points/BVH (and would make refit rollback unreliable).
+        vertices = np.array(
+            verts, dtype=np.float32, order="C", copy=True).reshape(-1, 3)
+        face_array = np.array(
+            faces, dtype=np.int32, order="C", copy=True).reshape(-1, 3)
+        if len(vertices) == 0:
+            raise ValueError("verts must contain at least one vertex")
+        if len(face_array) == 0:
+            raise ValueError("faces must contain at least one triangle")
+
+        self._reuse_stats["set_mesh_calls"] += 1
+        topology_key = self._topology_fingerprint(face_array)
+        same_topology = (
+            self._topology_key == topology_key
+            and self._faces is not None
+            and self._indices_wp is not None
         )
-        self._warp_mesh = wp.Mesh(points=points_wp, indices=indices_wp)
+        previous_vertex_count = (
+            int(self._points_wp.shape[0]) if self._points_wp is not None else -1)
+        if ((not same_topology or previous_vertex_count != len(vertices))
+                and (np.any(face_array < 0)
+                     or np.any(face_array >= len(vertices)))):
+            raise ValueError("faces contain an out-of-range vertex index")
+
+        can_refit = (
+            same_topology
+            and self._warp_mesh is not None
+            and previous_vertex_count == len(vertices)
+            and callable(getattr(self._warp_mesh, "refit", None))
+        )
+
+        if can_refit:
+            # ``assign`` reuses the existing device allocation.  Warp guarantees
+            # that Mesh.refit() refreshes the BVH after its points are modified;
+            # both operations are submitted to the same device stream.  Restore
+            # the old points best-effort when either operation raises so the CPU
+            # cache never advertises vertices that the BVH did not accept.
+            old_vertices = self._verts
+            try:
+                self._points_wp.assign(vertices)
+                self._warp_mesh.refit()
+            except Exception:
+                if old_vertices is not None:
+                    try:
+                        self._points_wp.assign(old_vertices)
+                        self._warp_mesh.refit()
+                    except Exception:
+                        # Preserve the original exception.  A second failure can
+                        # only mean Warp left this mesh unusable; callers will not
+                        # see a falsely committed CPU/topology state.
+                        pass
+                raise
+            self._verts = vertices
+            self._reuse_stats["topology_cache_hits"] += 1
+            self._reuse_stats["reused_index_bytes"] += int(face_array.nbytes)
+            self._reuse_stats["mesh_refits"] += 1
+            self._reuse_stats["reused_vertex_bytes"] += int(vertices.nbytes)
+            return
+
+        # Build every topology-dependent resource in locals.  Publishing the
+        # fields only after Mesh construction succeeds makes a failed upload or
+        # BVH build an atomic no-op from the caller's point of view.
+        if same_topology:
+            new_faces = self._faces
+            new_indices_wp = self._indices_wp
+            new_watertight = self._watertight
+        else:
+            new_faces = face_array.copy()
+            new_watertight = self._is_watertight(new_faces)
+            new_indices_wp = wp.array(
+                new_faces.reshape(-1), dtype=wp.int32, device=self.device)
+        new_points_wp = wp.array(
+            vertices, dtype=wp.vec3, device=self.device)
+        new_warp_mesh = wp.Mesh(
+            points=new_points_wp,
+            indices=new_indices_wp,
+            support_winding_number=not new_watertight,
+        )
+
+        self._verts = vertices
+        self._points_wp = new_points_wp
+        self._warp_mesh = new_warp_mesh
+        if same_topology:
+            self._reuse_stats["topology_cache_hits"] += 1
+            self._reuse_stats["reused_index_bytes"] += int(face_array.nbytes)
+        else:
+            self._faces = new_faces
+            self._topology_key = topology_key
+            self._watertight = new_watertight
+            self._indices_wp = new_indices_wp
+            self._reuse_stats["watertight_checks"] += 1
+        self._reuse_stats["mesh_rebuilds"] += 1
+
+    @staticmethod
+    def _topology_fingerprint(faces: np.ndarray) -> tuple[tuple[int, ...], bytes]:
+        """Return a cheap content key for canonical contiguous int32 faces.
+
+        Hashing is linear and allocation-free (apart from the small digest),
+        unlike the sort/unique watertightness test.  The strong 128-bit digest
+        lets independently decoded per-pose arrays hit the same cache.
+        """
+        canonical = np.ascontiguousarray(faces, dtype=np.int32).reshape(-1, 3)
+        digest = hashlib.blake2b(
+            memoryview(canonical).cast("B"), digest_size=16).digest()
+        return canonical.shape, digest
+
+    @property
+    def reuse_stats(self) -> dict[str, int]:
+        """Snapshot of safe reuse and unavoidable device-work counters.
+
+        ``mesh_refits`` measures avoided Mesh/BVH reconstructions.  The grid
+        counters expose how many device allocations, kernel submissions and
+        blocking host readbacks were needed; chunked progress deliberately uses
+        one output allocation/readback for all slabs.
+        """
+        return dict(self._reuse_stats)
 
     @staticmethod
     def _is_watertight(faces: np.ndarray) -> bool:
@@ -328,7 +467,11 @@ class SdfComputer:
 
     def clear(self) -> None:
         self._warp_mesh = None
+        self._points_wp = None
+        self._indices_wp = None
         self._verts = None
+        self._faces = None
+        self._topology_key = None
 
     # ── single-point query ────────────────────────────────────────────────
 
@@ -401,14 +544,33 @@ class SdfComputer:
         if max_extent <= 0.0:
             raise ValueError("Degenerate AABB (extent <= 0).")
 
-        padded_max = max_extent * (1.0 + float(margin))
-        dx = padded_max / float(n)
-        padded = (extent * (1.0 + float(margin))).astype(np.float64)
-        counts = np.maximum(1, np.ceil(padded / dx).astype(np.int64))
-        center = 0.5 * (vmin + vmax)
-        half = 0.5 * counts.astype(np.float64) * dx
-        aabb_min = (center - half).astype(np.float32)
-        aabb_max = (center + half).astype(np.float32)
+        if thickness_result is not None:
+            # Reuse the dense target's exact lattice.  Its margin may have been
+            # enlarged automatically for a relative blowup; recomputing from
+            # the UI margin here would give sparse samples a different dx/AABB.
+            dx = float(thickness_result.dx)
+            counts = np.array(
+                [thickness_result.nx,
+                 thickness_result.ny,
+                 thickness_result.nz],
+                dtype=np.int64,
+            )
+            aabb_min = np.asarray(
+                thickness_result.origin, dtype=np.float32).reshape(3)
+            aabb_max = (
+                aabb_min.astype(np.float64)
+                + counts.astype(np.float64) * dx
+            ).astype(np.float32)
+            padded_max = float(np.max(counts)) * dx
+        else:
+            padded_max = max_extent * (1.0 + float(margin))
+            dx = padded_max / float(n)
+            padded = (extent * (1.0 + float(margin))).astype(np.float64)
+            counts = np.maximum(1, np.ceil(padded / dx).astype(np.int64))
+            center = 0.5 * (vmin + vmax)
+            half = 0.5 * counts.astype(np.float64) * dx
+            aabb_min = (center - half).astype(np.float32)
+            aabb_max = (center + half).astype(np.float32)
 
         tri = verts[faces]
         e1 = tri[:, 1] - tri[:, 0]
@@ -488,6 +650,33 @@ class SdfComputer:
             values = vals
         else:
             values = self.query_points(points, max_dist=float(max_dist))
+
+        # Orient the sampled triangle normals with the signed-distance field.
+        # The band is stored as one complete surface cloud per offset, so the
+        # SDF slope along each cloud's common triangle normal tells us whether
+        # that normal points toward increasing (outside) distance.  Coarse
+        # far-field samples keep a zero normal and are ignored by normal loss.
+        target_normals = np.zeros((len(points), 3), dtype=np.float32)
+        if len(offsets) > 1 and int(surface_samples) > 0:
+            band_values = values[:band_count].reshape(
+                len(offsets), int(surface_samples))
+            offset_world = offsets.astype(np.float64)
+            offset_centered = offset_world - float(np.mean(offset_world))
+            denom = float(np.dot(offset_centered, offset_centered))
+            value_centered = (
+                band_values.astype(np.float64)
+                - np.mean(band_values, axis=0, dtype=np.float64)[None, :]
+            )
+            slope = (
+                np.sum(offset_centered[:, None] * value_centered, axis=0)
+                / max(denom, 1.0e-12)
+            )
+            orientation = np.where(
+                slope >= 0.0, 1.0, -1.0).astype(np.float32)
+            oriented = (nrm * orientation[:, None]).astype(
+                np.float32, copy=False)
+            target_normals[:band_count] = np.concatenate(
+                [oriented for _ in offsets], axis=0)
         if progress_cb is not None:
             progress_cb(0.96, "Sampling sparse feature thickness ...")
 
@@ -570,6 +759,7 @@ class SdfComputer:
             dx=float(dx),
             source="mesh-sparse",
             coarse_mask=coarse_mask,
+            normals=target_normals,
         )
 
     # ── voxel grid ────────────────────────────────────────────────────────
@@ -588,39 +778,67 @@ class SdfComputer:
             nx = ny = nz = int(shape)
         total = nx * ny * nz
         out = wp.empty(total, dtype=wp.float32, device=self.device)
+        self._reuse_stats["grid_buffer_allocations"] += 1
         wp.launch(
             kernel=_sdf_voxel_grid_kernel,
             dim=total,
             inputs=[self._warp_mesh.id, origin, float(dx), nx, ny, nz,
-                    float(max_dist), self._winding_flag, out],
+                    float(max_dist), self._winding_flag, 0, out],
             device=self.device,
         )
-        return out.numpy().reshape((nz, ny, nx)).astype(np.float32, copy=False)
+        self._reuse_stats["grid_kernel_launches"] += 1
+        host = out.numpy()
+        self._reuse_stats["grid_host_readbacks"] += 1
+        return host.reshape((nz, ny, nx)).astype(np.float32, copy=False)
 
     def _launch_grid_chunked(self, aabb_min: np.ndarray, dx: float,
                              shape: tuple, max_dist: float,
                              progress_cb, p0: float, p1: float) -> np.ndarray:
         """Like :meth:`_launch_grid` but computed in z-slabs, reporting progress.
 
-        Each slab is an independent box launch (origin shifted along z), so the
-        kernel is unchanged.  ``progress_cb(frac, msg)`` is called after every
-        slab with ``frac`` interpolated in ``[p0, p1]`` — letting a worker thread
-        drive a progress bar without the per-voxel kernel knowing anything.
+        Each slab is an independent box launch (origin shifted along z), but all
+        launches write into one device buffer.  The complete grid is read back
+        once after the final launch instead of once per slab.  With a progress
+        callback, groups of four launches are synchronised before reporting;
+        this keeps cancellation responsive without starving the device between
+        every small slab.  No extra streams or overlapping mesh mutation are
+        involved.
         """
         nx, ny, nz = int(shape[0]), int(shape[1]), int(shape[2])
-        grid = np.empty((nz, ny, nx), dtype=np.float32)
+        total = nx * ny * nz
+        out = wp.empty(total, dtype=wp.float32, device=self.device)
+        self._reuse_stats["grid_buffer_allocations"] += 1
         # ~20 updates over the grid, at least 1 layer per slab.
         layers = max(1, nz // 20)
         z = 0
+        submitted_since_sync = 0
         while z < nz:
             cz = min(layers, nz - z)
-            slab_min = np.array(
-                [aabb_min[0], aabb_min[1], aabb_min[2] + z * dx], dtype=np.float32)
-            grid[z:z + cz] = self._launch_grid(slab_min, dx, (nx, ny, cz), max_dist)
+            slab_min = wp.vec3(
+                float(aabb_min[0]),
+                float(aabb_min[1]),
+                float(aabb_min[2] + z * dx),
+            )
+            slab_total = nx * ny * cz
+            wp.launch(
+                kernel=_sdf_voxel_grid_kernel,
+                dim=slab_total,
+                inputs=[self._warp_mesh.id, slab_min, float(dx), nx, ny, cz,
+                        float(max_dist), self._winding_flag, z * nx * ny, out],
+                device=self.device,
+            )
+            self._reuse_stats["grid_kernel_launches"] += 1
+            submitted_since_sync += 1
             z += cz
-            if progress_cb is not None:
+            if (progress_cb is not None
+                    and (submitted_since_sync >= 4 or z == nz)):
+                wp.synchronize_device(self.device)
+                self._reuse_stats["grid_progress_syncs"] += 1
                 progress_cb(p0 + (p1 - p0) * (z / nz), f"SDF grid {z}/{nz} layers")
-        return grid
+                submitted_since_sync = 0
+        host = out.numpy()
+        self._reuse_stats["grid_host_readbacks"] += 1
+        return host.reshape((nz, ny, nx)).astype(np.float32, copy=False)
 
     def _coarse_probe(self, aabb_min: np.ndarray, n: int,
                       max_extent: float) -> tuple[np.ndarray, float]:
@@ -714,18 +932,26 @@ class SdfComputer:
                            max_dist: float | None = None,
                            progress_cb=None,
                            symmetry: bool = False,
-                           compute_blowup_thickness: bool = False) -> SdfResult:
+                           compute_blowup_thickness: bool = False,
+                           blowup_thickness_fraction: float | None = None,
+                           guard_voxels_per_side: int = 0) -> SdfResult:
         """
         Compute an axis-aligned voxel grid SDF from the mesh AABB.
 
         Args:
-            n: number of voxels along each axis.
+            n: total voxel count along the longest axis.  Shorter axes use
+                fewer voxels at the same spacing.
             margin: fractional margin added to the bounding box extent (0.0–1.0).
             compute_thickness: also compute the local feature-thickness field
                 (used by the relative under-representation metric).
             compute_blowup_thickness: carry that thickness through the exterior
                 offset band.  Disable while blowup is zero to avoid retaining a
                 second large volume; it can be built lazily from ``thickness``.
+            blowup_thickness_fraction: largest absolute local-thickness
+                fraction the carried exterior field must support.  ``None``
+                reserves the full UI range.
+            guard_voxels_per_side: explicit interpolation/optimizer safety
+                cells outside the fractionally padded core on every axis.
             thickness_max_resolution: if set, compute the expensive thickness
                 field on a downsampled grid whose longest axis is at most this
                 value, then upsample to the SDF grid shape.  ``0``/``None`` keeps
@@ -756,16 +982,33 @@ class SdfComputer:
         if max_extent <= 0.0:
             raise ValueError("Degenerate AABB (extent <= 0).")
 
-        # ``n`` resolves the *longest* axis; ``dx`` follows from it.  Each axis
-        # then gets just enough voxels to cover its own (margin-padded) extent at
-        # that same ``dx`` — so the box hugs the mesh instead of being a cube and
-        # short axes don't waste voxels on empty exterior.  Margin is applied per
-        # axis relative to each axis' own extent.
+        n = int(n)
+        guard = int(guard_voxels_per_side)
+        if guard < 0 or float(guard) != float(guard_voxels_per_side):
+            raise ValueError(
+                "guard_voxels_per_side must be a non-negative integer")
+        if n <= 2 * guard:
+            raise ValueError(
+                "resolution must exceed twice guard_voxels_per_side")
+        margin = float(margin)
+        if not np.isfinite(margin) or margin < 0.0:
+            raise ValueError("margin must be finite and non-negative")
+
+        # ``n`` remains the total longest-axis grid count.  Explicit guard cells
+        # live outside the fractionally padded core on *every* axis, so a narrow
+        # arm/plate receives the same true four-voxel safety band as a long axis.
+        # Encoding that guard in ``margin`` used to shrink it with aspect ratio.
+        core_n = n - 2 * guard
         padded_max = max_extent * (1.0 + float(margin))
-        dx = padded_max / float(n)
+        dx = padded_max / float(core_n)
 
         padded = (extent * (1.0 + float(margin))).astype(np.float64)
-        counts = np.maximum(1, np.ceil(padded / dx).astype(np.int64))
+        core_counts = np.maximum(
+            1, np.ceil(padded / dx - 1.0e-10).astype(np.int64))
+        # Avoid a floating-point ceil turning the longest core axis into n+1.
+        core_counts[np.isclose(
+            extent, max_extent, rtol=1.0e-7, atol=0.0)] = core_n
+        counts = core_counts + 2 * guard
         nx, ny, nz = int(counts[0]), int(counts[1]), int(counts[2])
 
         center = 0.5 * (vmin + vmax)
@@ -778,7 +1021,14 @@ class SdfComputer:
         if max_dist is None or symmetry:
             if progress_cb is not None:
                 progress_cb(0.05, "Probing interior depth …")
-            coarse, coarse_dx = self._coarse_probe(aabb_min, int(n), padded_max)
+            # The cheap probe is cubic; centre that cube independently instead
+            # of starting it at the anisotropic grid's short-axis minimum.
+            # The previous off-centre probe could reject genuine symmetry.
+            full_longest_span = float(np.max(counts)) * float(dx)
+            coarse_origin = (
+                center - 0.5 * full_longest_span).astype(np.float32)
+            coarse, coarse_dx = self._coarse_probe(
+                coarse_origin, int(np.max(counts)), full_longest_span)
         if max_dist is None:
             max_dist = self._cap_from_coarse(coarse, coarse_dx, dx)
 
@@ -802,6 +1052,9 @@ class SdfComputer:
 
         thickness = None
         blowup_thickness = None
+        thickness_stride_vox = 1.0
+        blowup_thickness_extent_vox = 0.0
+        blowup_thickness_capacity_fraction = None
         if compute_thickness:
             if progress_cb is not None:
                 progress_cb(grid_p1, "Computing thickness field …")
@@ -813,6 +1066,14 @@ class SdfComputer:
                     )
             else:
                 _thick_progress = None
+            if (thickness_max_resolution is not None
+                    and int(thickness_max_resolution) > 0):
+                thickness_stride_vox = float(max(
+                    1,
+                    int(np.ceil(
+                        max(grid.shape)
+                        / float(int(thickness_max_resolution)))),
+                ))
             thickness = local_thickness(
                 grid, float(dx),
                 max_resolution=thickness_max_resolution,
@@ -828,8 +1089,25 @@ class SdfComputer:
                 if progress_cb is not None:
                     progress_cb(
                         0.985, "Preparing adaptive SDF blowup field …")
+                carrier_fraction = (
+                    MAX_UI_THICKNESS_FRACTION
+                    if blowup_thickness_fraction is None
+                    else float(blowup_thickness_fraction)
+                )
+                blowup_thickness_extent_vox = (
+                    relative_blowup_extent_voxels(
+                        carrier_fraction, thickness, float(dx))
+                    + BLOWUP_CARRIER_MARGIN_VOXELS
+                )
                 blowup_thickness = build_surface_carried_thickness(
-                    grid, thickness, float(dx))
+                    grid,
+                    thickness,
+                    float(dx),
+                    max_exterior_vox=blowup_thickness_extent_vox,
+                    thickness_stride_vox=thickness_stride_vox,
+                    device=self.device,
+                )
+                blowup_thickness_capacity_fraction = abs(carrier_fraction)
         if progress_cb is not None:
             progress_cb(1.0, "SDF done")
 
@@ -842,6 +1120,10 @@ class SdfComputer:
             aabb_max=aabb_max,
             thickness=thickness,
             blowup_thickness=blowup_thickness,
+            thickness_stride_vox=thickness_stride_vox,
+            blowup_thickness_extent_vox=blowup_thickness_extent_vox,
+            blowup_thickness_capacity_fraction=(
+                blowup_thickness_capacity_fraction),
             nx=nx, ny=ny, nz=nz,
         )
 

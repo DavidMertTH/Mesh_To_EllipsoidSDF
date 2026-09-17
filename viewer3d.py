@@ -27,7 +27,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import theme
 import raymarch
 import sdf_slice as slice_module
-from sdf_blowup import DEFAULT_MAX_THICKNESS_FRACTION
 from widgets import DropGLView
 
 
@@ -397,6 +396,7 @@ RENDER_TRANSPARENT = "transparent"
 RENDER_SOLID = "solid"             # opaque flat-shaded faces (no blend, no light)
 RENDER_LIGHTING = "lighting"
 RENDER_THICKNESS = "thickness"     # mesh-only: local-thickness heatmap
+RENDER_REGION_BUDGET = "region_budget"  # mesh-only: local population caps
 RENDER_RAYMARCH = "raymarch"       # ellipsoids-only: GPU sphere-traced SDF
 
 # Base solid colour for the mesh (brand primary).  Read from ``theme`` at call
@@ -581,7 +581,7 @@ def _build_mesh_item(
         else:
             kw['color'] = (r, g, b, 1.0)
         item = gl.GLMeshItem(**kw)
-    elif mode == RENDER_THICKNESS:
+    elif mode in (RENDER_THICKNESS, RENDER_REGION_BUDGET):
         # Local-thickness heatmap: flat opaque surface, vertex colours shown
         # as-is (no lighting modulation so the colour ramp reads true).  Falls
         # back to a solid surface if the thickness field isn't computed yet.
@@ -589,6 +589,8 @@ def _build_mesh_item(
                   drawFaces=True, drawEdges=False, smooth=True)
         if vertex_colors is not None:
             kw['vertexColors'] = _with_alpha(vertex_colors, 1.0)
+        elif face_colors is not None:
+            kw['faceColors'] = _with_alpha(face_colors, 1.0)
         else:
             kw['color'] = (r, g, b, 1.0)
         item = gl.GLMeshItem(**kw)
@@ -625,7 +627,7 @@ class ViewportOverlay(QtWidgets.QFrame):
     visibilityChanged = QtCore.Signal(str, bool)
     renderModeChanged = QtCore.Signal(str, str)
     ellipsoidMetricChanged = QtCore.Signal(str)
-    # SDF slice plane (movable texture pushed through the volume)
+    # Slice plane (movable texture pushed through the volume)
     sliceToggled = QtCore.Signal(bool)         # on / off
     slicePlaneChanged = QtCore.Signal(str)     # "XY" | "XZ" | "YZ"
     sliceSourceChanged = QtCore.Signal(str)    # "mesh" | "ellipsoids" | "difference"
@@ -641,6 +643,7 @@ class ViewportOverlay(QtWidgets.QFrame):
             ("Solid", RENDER_SOLID),
             ("Lighting", RENDER_LIGHTING),
             ("Thickness", RENDER_THICKNESS),
+            ("Region Budget", RENDER_REGION_BUDGET),
         ),
         "ellipsoids": (
             ("Wireframe", RENDER_WIREFRAME),
@@ -655,7 +658,7 @@ class ViewportOverlay(QtWidgets.QFrame):
     # so the fitted ellipsoids are visible through it.
     _DEFAULT_MODE = {
         "mesh": RENDER_WIREFRAME,
-        "ellipsoids": RENDER_TRANSPARENT,
+        "ellipsoids": RENDER_LIGHTING,
     }
 
     _ELLIPSOID_METRICS = (
@@ -730,7 +733,7 @@ class ViewportOverlay(QtWidgets.QFrame):
         next_row = metric_row + 1
         self._build_raymarch_controls(grid, next_row)
 
-        # ── SDF slice plane ───────────────────────────────────────────
+        # ── slice plane ───────────────────────────────────────────────
         self._build_slice_controls(grid, next_row + 1)
 
     def _build_raymarch_controls(self, grid: QtWidgets.QGridLayout,
@@ -758,7 +761,7 @@ class ViewportOverlay(QtWidgets.QFrame):
         return self._rm_blend_slider.value() / 100.0
 
     def _build_slice_controls(self, grid: QtWidgets.QGridLayout, row: int) -> None:
-        """Toggle + plane/source dropdowns + position slider for the SDF slice."""
+        """Toggle + plane/mode controls for the movable slice."""
         # Thin separator so the slice block reads as its own group.
         sep = QtWidgets.QFrame()
         sep.setFrameShape(QtWidgets.QFrame.HLine)
@@ -767,10 +770,10 @@ class ViewportOverlay(QtWidgets.QFrame):
         grid.addWidget(sep, row, 0, 1, 2)
         row += 1
 
-        self._chk_slice = QtWidgets.QCheckBox("SDF Slice")
+        self._chk_slice = QtWidgets.QCheckBox("Slice")
         self._chk_slice.setChecked(False)
         self._chk_slice.setToolTip(
-            "Push the SDF onto a texture plane and slide it through the volume.")
+            "Show a movable SDF or color-coded error slice in the 3-D view.")
         grid.addWidget(self._chk_slice, row, 0)
 
         self._combo_slice_plane = QtWidgets.QComboBox()
@@ -779,24 +782,46 @@ class ViewportOverlay(QtWidgets.QFrame):
         self._combo_slice_plane.setToolTip("Slice plane (XY, XZ or YZ).")
         grid.addWidget(self._combo_slice_plane, row, 1)
 
-        src_label = QtWidgets.QLabel("Source")
-        self._combo_slice_source = QtWidgets.QComboBox()
-        self._combo_slice_source.addItem("Mesh", "mesh")
-        self._combo_slice_source.addItem("Ellipsoids", "ellipsoids")
-        self._combo_slice_source.addItem("Difference", "difference")
-        self._combo_slice_source.setToolTip(
-            "Slice source: the mesh SDF, the ellipsoid-union SDF, or their\n"
-            "difference (ellipsoid − mesh: where the fit over/under-covers).")
-        grid.addWidget(src_label, row + 1, 0)
-        grid.addWidget(self._combo_slice_source, row + 1, 1)
+        mode_label = QtWidgets.QLabel("Mode")
+        self._combo_slice_mode = QtWidgets.QComboBox()
+        self._combo_slice_mode.addItem("SDF", "sdf")
+        self._combo_slice_mode.addItem(
+            "Error (Color Coded)", "error")
+        self._combo_slice_mode.setToolTip(
+            "SDF shows the selected distance field. Error compares the\n"
+            "ellipsoid fit with the mesh using a color-coded difference map.")
+        grid.addWidget(mode_label, row + 1, 0)
+        grid.addWidget(self._combo_slice_mode, row + 1, 1)
 
-        # Plane + source are ALWAYS visible; only the checkbox toggles the slice
-        # on/off.  The position slider lives in the 3-D viewport (not here).
+        self._slice_sdf_source_label = QtWidgets.QLabel("SDF Source")
+        self._combo_slice_sdf_source = QtWidgets.QComboBox()
+        self._combo_slice_sdf_source.addItem("Mesh", "mesh")
+        self._combo_slice_sdf_source.addItem("Ellipsoids", "ellipsoids")
+        self._combo_slice_sdf_source.setToolTip(
+            "Choose which signed distance field is shown in SDF mode.")
+        grid.addWidget(self._slice_sdf_source_label, row + 2, 0)
+        grid.addWidget(self._combo_slice_sdf_source, row + 2, 1)
+
+        # Plane + mode are always visible; only the checkbox toggles the slice
+        # on/off. The SDF source is irrelevant and hidden in Error mode. The
+        # position slider lives in the 3-D viewport (not here).
         self._chk_slice.toggled.connect(self.sliceToggled)
         self._combo_slice_plane.activated.connect(
             lambda _i: self.slicePlaneChanged.emit(self._combo_slice_plane.currentData()))
-        self._combo_slice_source.activated.connect(
-            lambda _i: self.sliceSourceChanged.emit(self._combo_slice_source.currentData()))
+        self._combo_slice_mode.activated.connect(
+            self._on_slice_mode_activated)
+        self._combo_slice_sdf_source.activated.connect(
+            lambda _i: self.sliceSourceChanged.emit(self.slice_source()))
+        self._sync_slice_mode_controls()
+
+    def _on_slice_mode_activated(self, _index: int) -> None:
+        self._sync_slice_mode_controls()
+        self.sliceSourceChanged.emit(self.slice_source())
+
+    def _sync_slice_mode_controls(self) -> None:
+        show_source = self.slice_mode() == "sdf"
+        self._slice_sdf_source_label.setVisible(show_source)
+        self._combo_slice_sdf_source.setVisible(show_source)
 
     # ── slice accessors (single source of truth = the widgets) ─────────
 
@@ -806,8 +831,13 @@ class ViewportOverlay(QtWidgets.QFrame):
     def slice_plane(self) -> str:
         return self._combo_slice_plane.currentData()
 
+    def slice_mode(self) -> str:
+        return self._combo_slice_mode.currentData()
+
     def slice_source(self) -> str:
-        return self._combo_slice_source.currentData()
+        if self.slice_mode() == "error":
+            return "difference"
+        return self._combo_slice_sdf_source.currentData()
 
     def _make_combo(self, key: str) -> QtWidgets.QComboBox:
         combo = QtWidgets.QComboBox()
@@ -873,6 +903,17 @@ class ViewportOverlay(QtWidgets.QFrame):
         combo = self._combos.get(target)
         return combo.currentData() if combo else None
 
+    def set_render_mode(self, target: str, mode: str) -> None:
+        """Select a mode and notify the viewer exactly like a UI selection."""
+        combo = self._combos.get(target)
+        if combo is None:
+            return
+        index = combo.findData(mode)
+        if index < 0:
+            return
+        combo.setCurrentIndex(index)
+        self.renderModeChanged.emit(target, mode)
+
 
 class SceneViewer3D(_BaseViewer):
     """One viewport showing mesh, skeleton bones and ellipsoids together.
@@ -896,6 +937,10 @@ class SceneViewer3D(_BaseViewer):
         self._mesh_verts: Optional[np.ndarray] = None
         self._mesh_faces: Optional[np.ndarray] = None
         self._thickness_colors: Optional[np.ndarray] = None
+        self._region_budget_face_colors: Optional[np.ndarray] = None
+        self._region_budget_centers: Optional[np.ndarray] = None
+        self._region_budget_caps: Optional[np.ndarray] = None
+        self._region_budget_counts: Optional[np.ndarray] = None
 
         self._ell_centers: Optional[np.ndarray] = None
         self._ell_radii: Optional[np.ndarray] = None
@@ -904,11 +949,12 @@ class SceneViewer3D(_BaseViewer):
         self._ell_base_colors: Optional[np.ndarray] = None
         self._ell_metric_mode = "default"
         self._ell_metric_values: dict[str, np.ndarray] = {}
+        self._slice_data_changed_callbacks: list = []
 
         self._bone_positions: Optional[np.ndarray] = None
         self._bone_parents: Optional[np.ndarray] = None
 
-        # ── SDF slice plane ──
+        # ── slice plane ──
         self._sdf_grid: Optional[np.ndarray] = None      # mesh SDF (nz, ny, nx)
         self._sdf_origin: Optional[np.ndarray] = None
         self._sdf_dx: Optional[float] = None
@@ -916,7 +962,8 @@ class SceneViewer3D(_BaseViewer):
         self._grid_wp = None                             # mesh grid uploaded once
         self._blowup_thickness_wp = None                 # exterior-carried local thickness
         self._blowup_thickness_source: Optional[np.ndarray] = None
-        self._sdf_blowup_vox: float = 0.0                # requested max SDF offset (voxels)
+        self._blowup_thickness_max: float = 0.0
+        self._sdf_blowup_fraction: float = 0.0           # signed local-diameter fraction
         self._slice_lut = slice_module.make_sdf_lut()
         self._slice_lut_wp, self._slice_lut_n = slice_module.make_lut_wp(self._slice_lut)
 
@@ -943,6 +990,7 @@ class SceneViewer3D(_BaseViewer):
         # Exploded per-bone region preview (Bone-Separation verification).
         self._region_preview_item: Optional[gl.GLMeshItem] = None
         self._underrep_item: Optional[gl.GLScatterPlotItem] = None
+        self._region_budget_labels: list[gl.GLTextItem] = []
 
         # ── SuperFit operation gizmos ──
         # Each event is dict(op, c=center(3,), r=radius, birth=step); drawn as a
@@ -1014,15 +1062,73 @@ class SceneViewer3D(_BaseViewer):
         self._slice_slider_frame = QtWidgets.QFrame()
         lay = QtWidgets.QHBoxLayout(self._slice_slider_frame)
         lay.setContentsMargins(12, 5, 12, 5)
+
+        self._slice_play_button = QtWidgets.QToolButton()
+        self._slice_play_button.setObjectName("SlicePlayButton")
+        self._slice_play_button.setAutoRaise(True)
+        self._slice_play_button.setIconSize(QtCore.QSize(18, 18))
+        self._slice_play_button.setFixedSize(28, 28)
+        self._slice_play_button.clicked.connect(self._toggle_slice_animation)
+        lay.addWidget(self._slice_play_button)
+
         self._slice_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self._slice_slider.setRange(0, 0)
-        self._slice_slider.setToolTip("Slide the SDF slice plane through the volume.")
+        self._slice_slider.setToolTip("Move the slice plane through the volume.")
         self._slice_slider.valueChanged.connect(self._on_slice_position_changed)
         lay.addWidget(self._slice_slider)
+
+        self._slice_animation_timer = QtCore.QTimer(self._slice_slider_frame)
+        self._slice_animation_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self._slice_animation_timer.setInterval(33)  # smooth ~30 FPS playback
+        self._slice_animation_timer.timeout.connect(
+            self._advance_slice_animation)
+        self._slice_play_button.setEnabled(False)
+        self._update_slice_play_button()
+
         self._style_slice_slider()
         self._view.add_corner_widget(self._slice_slider_frame, corner="bottom",
                                      margin=12)
         self._slice_slider_frame.setVisible(False)
+
+    def _toggle_slice_animation(self) -> None:
+        if self._slice_animation_timer.isActive():
+            self._stop_slice_animation()
+            return
+        if self._slice_slider.maximum() <= self._slice_slider.minimum():
+            return
+        if self._slice_slider.value() >= self._slice_slider.maximum():
+            self._slice_slider.setValue(self._slice_slider.minimum())
+        self._slice_animation_timer.start()
+        self._update_slice_play_button()
+
+    def _stop_slice_animation(self) -> None:
+        self._slice_animation_timer.stop()
+        self._update_slice_play_button()
+
+    def _advance_slice_animation(self) -> None:
+        minimum = self._slice_slider.minimum()
+        maximum = self._slice_slider.maximum()
+        if maximum <= minimum:
+            self._stop_slice_animation()
+            return
+        value = self._slice_slider.value() + 1
+        if value > maximum:
+            value = minimum
+        self._slice_slider.setValue(value)
+
+    def _update_slice_play_button(self) -> None:
+        playing = self._slice_animation_timer.isActive()
+        icon = (
+            QtWidgets.QStyle.StandardPixmap.SP_MediaPause
+            if playing
+            else QtWidgets.QStyle.StandardPixmap.SP_MediaPlay
+        )
+        self._slice_play_button.setIcon(
+            self._slice_play_button.style().standardIcon(icon))
+        self._slice_play_button.setToolTip(
+            "Pause slice animation" if playing else "Play slice animation")
+        self._slice_play_button.setAccessibleName(
+            "Pause slice animation" if playing else "Play slice animation")
 
     def _style_slice_slider(self) -> None:
         """Translucent glass background so the slider reads over the viewport."""
@@ -1042,6 +1148,9 @@ class SceneViewer3D(_BaseViewer):
         self._slice_slider.setRange(0, n - 1)
         self._slice_slider.setValue(min(cur, n - 1) if keep_value else n // 2)
         self._slice_slider.blockSignals(False)
+        self._slice_play_button.setEnabled(n > 1)
+        if n <= 1:
+            self._stop_slice_animation()
 
     def apply_theme(self) -> None:
         """Re-colour the viewport, overlay and objects for the current theme.
@@ -1067,6 +1176,7 @@ class SceneViewer3D(_BaseViewer):
             self._show_mesh = on
             if self._mesh_item is not None:
                 self._mesh_item.setVisible(on)
+            self._set_region_budget_labels_visible()
         elif key == "skeleton":
             self._show_skeleton = on
             for it in (self._bone_line_item, self._joint_item):
@@ -1093,6 +1203,7 @@ class SceneViewer3D(_BaseViewer):
         if target == "mesh":
             self._mesh_render_mode = mode
             self._rebuild_mesh()
+            self._set_region_budget_labels_visible()
         elif target == "ellipsoids":
             was_rm = self._ell_render_mode == RENDER_RAYMARCH
             self._ell_render_mode = mode
@@ -1249,10 +1360,120 @@ class SceneViewer3D(_BaseViewer):
     # ── mesh ────────────────────────────────────────────────────────────
 
     def show_mesh(self, verts: np.ndarray, faces: np.ndarray) -> None:
+        # A new/deformed mesh invalidates the previous surface partition.
+        self.clear_region_budget(rebuild=False)
         self._mesh_verts = np.ascontiguousarray(verts, dtype=np.float32)
         self._mesh_faces = np.ascontiguousarray(faces)
         self._thickness_colors = None   # invalidated until recomputed
         self._rebuild_mesh()
+
+    def mesh_geometry(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return the currently displayed mesh geometry for read-only analysis."""
+        if self._mesh_verts is None or self._mesh_faces is None:
+            return None
+        return self._mesh_verts, self._mesh_faces
+
+    def set_region_budget(
+        self,
+        face_colors: np.ndarray,
+        centers: np.ndarray,
+        capacities: np.ndarray,
+        region_colors: np.ndarray | None = None,
+        *,
+        activate: bool = True,
+    ) -> None:
+        """Show coloured mesh regions labelled ``current / maximum``."""
+        if self._mesh_faces is None:
+            return
+        colors = np.asarray(face_colors, dtype=np.float32).reshape(-1, 4)
+        region_centers = np.asarray(centers, dtype=np.float32).reshape(-1, 3)
+        caps = np.asarray(capacities, dtype=np.int32).reshape(-1)
+        if len(colors) != len(self._mesh_faces):
+            raise ValueError("region-budget face colors must match mesh faces")
+        if len(region_centers) == 0 or len(region_centers) != len(caps):
+            raise ValueError("region-budget centers/capacities must match")
+        self.clear_region_budget(rebuild=False)
+        self._region_budget_face_colors = np.ascontiguousarray(colors)
+        self._region_budget_centers = np.ascontiguousarray(region_centers)
+        self._region_budget_caps = np.ascontiguousarray(caps)
+        self._region_budget_counts = np.zeros(len(caps), dtype=np.int32)
+
+        label_colors = None
+        if region_colors is not None:
+            candidate = np.asarray(region_colors, dtype=np.float32).reshape(-1, 4)
+            if len(candidate) == len(caps):
+                label_colors = candidate
+        font = QtGui.QFont("Helvetica", 11)
+        font.setBold(True)
+        for index, (center, cap) in enumerate(zip(region_centers, caps)):
+            if label_colors is None:
+                color = QtGui.QColor(255, 255, 255, 255)
+            else:
+                rgba = np.clip(label_colors[index], 0.0, 1.0)
+                luminance = float(
+                    0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2])
+                # Contrast against the patch itself; labels sit directly on it.
+                level = 0 if luminance > 0.58 else 255
+                color = QtGui.QColor(level, level, level, 255)
+            item = gl.GLTextItem(
+                pos=center.copy(), color=color,
+                text=f"0 / {int(cap)}", font=font,
+                alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
+            )
+            self._view.addItem(item)
+            self._region_budget_labels.append(item)
+        self._update_region_budget_counts()
+        if activate:
+            self._overlay.set_render_mode("mesh", RENDER_REGION_BUDGET)
+        else:
+            self._rebuild_mesh()
+            self._set_region_budget_labels_visible()
+
+    def clear_region_budget(self, *, rebuild: bool = True) -> None:
+        for item in self._region_budget_labels:
+            self._view.removeItem(item)
+        self._region_budget_labels = []
+        self._region_budget_face_colors = None
+        self._region_budget_centers = None
+        self._region_budget_caps = None
+        self._region_budget_counts = None
+        if rebuild and self._mesh_render_mode == RENDER_REGION_BUDGET:
+            self._rebuild_mesh()
+
+    def _set_region_budget_labels_visible(self) -> None:
+        visible = bool(
+            self._show_mesh
+            and self._mesh_render_mode == RENDER_REGION_BUDGET
+            and self._region_preview_item is None
+        )
+        for item in self._region_budget_labels:
+            item.setVisible(visible)
+
+    def _update_region_budget_counts(self) -> None:
+        centers = self._region_budget_centers
+        caps = self._region_budget_caps
+        if centers is None or caps is None:
+            return
+        if self._ell_centers is None or len(self._ell_centers) == 0:
+            counts = np.zeros(len(caps), dtype=np.int32)
+        else:
+            counts = np.zeros(len(caps), dtype=np.int32)
+            points = np.asarray(self._ell_centers, dtype=np.float32).reshape(-1, 3)
+            for start in range(0, len(points), 8192):
+                block = points[start:start + 8192]
+                d2 = np.sum(
+                    (block[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+                assignment = np.argmin(d2, axis=1)
+                counts += np.bincount(
+                    assignment, minlength=len(caps)).astype(np.int32)
+        if (self._region_budget_counts is not None
+                and np.array_equal(counts, self._region_budget_counts)):
+            self._set_region_budget_labels_visible()
+            return
+        self._region_budget_counts = counts
+        for item, count, cap in zip(self._region_budget_labels, counts, caps):
+            item.setData(text=f"{int(count)} / {int(cap)}")
+        self._set_region_budget_labels_visible()
 
     def show_thickness(
         self,
@@ -1287,12 +1508,16 @@ class SceneViewer3D(_BaseViewer):
         # In thickness mode, colour vertices by the cached heatmap (if computed).
         vcols = (self._thickness_colors
                  if self._mesh_render_mode == RENDER_THICKNESS else None)
+        fcols = (self._region_budget_face_colors
+                 if self._mesh_render_mode == RENDER_REGION_BUDGET else None)
         self._mesh_item = _build_mesh_item(
             self._mesh_verts, self._mesh_faces, self._mesh_render_mode,
             vertex_colors=vcols,
+            face_colors=fcols,
         )
         self._mesh_item.setVisible(self._show_mesh)
         self._view.addItem(self._mesh_item)
+        self._set_region_budget_labels_visible()
 
     # ── exploded region preview (Bone-Separation verification) ──────────
 
@@ -1322,12 +1547,14 @@ class SceneViewer3D(_BaseViewer):
         self._view.addItem(item)
         if self._mesh_item is not None:
             self._mesh_item.setVisible(False)
+        self._set_region_budget_labels_visible()
 
     def clear_region_preview(self) -> None:
         """Remove the exploded region preview and restore the normal mesh."""
         self._clear_region_preview_item()
         if self._mesh_item is not None:
             self._mesh_item.setVisible(self._show_mesh)
+        self._set_region_budget_labels_visible()
 
     def _clear_region_preview_item(self) -> None:
         if self._region_preview_item is not None:
@@ -1362,9 +1589,12 @@ class SceneViewer3D(_BaseViewer):
         self._apply_ellipsoid_metric_colors()
         self._rm_dirty = True          # population changed → re-upload for raymarch
         self._rebuild_ellipsoids()
-        # Live slice refresh while the ellipsoid-union SDF is the slice source.
-        if self._overlay.slice_enabled() and self._overlay.slice_source() == "ellipsoids":
+        self._update_region_budget_counts()
+        # Both the ellipsoid SDF and the error map depend on the live fit.
+        if (self._overlay.slice_enabled()
+                and self._overlay.slice_source() in ("ellipsoids", "difference")):
             self._update_slice()
+        self._emit_slice_data_changed()
 
     def show_ellipsoids(self, ellipsoid_set) -> None:
         colors = None
@@ -1386,6 +1616,25 @@ class SceneViewer3D(_BaseViewer):
             self._ell_item_mode = None
         if self._ell_render_mode == RENDER_RAYMARCH:
             self._rm_label.clear()
+        self._update_region_budget_counts()
+        self._emit_slice_data_changed()
+
+    def slice_ellipsoid_parameters(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Current fit data used by both 2-D and 3-D error slices."""
+        if (self._ell_centers is None or self._ell_radii is None
+                or self._ell_rotations is None):
+            return None
+        return self._ell_centers, self._ell_radii, self._ell_rotations
+
+    def connect_slice_data_changed(self, callback) -> None:
+        if callback not in self._slice_data_changed_callbacks:
+            self._slice_data_changed_callbacks.append(callback)
+
+    def _emit_slice_data_changed(self) -> None:
+        for callback in tuple(self._slice_data_changed_callbacks):
+            callback()
 
     def set_ellipsoid_metrics(self, metrics: dict | None) -> None:
         """Store current per-ellipsoid quality metrics for viewport heatmaps."""
@@ -1771,7 +2020,7 @@ class SceneViewer3D(_BaseViewer):
                 vertexes=verts, faces=faces, vertexColors=cols)
         self._analysis_item.setVisible(self._show_analysis)
 
-    # ── SDF slice plane ─────────────────────────────────────────────────
+    # ── slice plane ─────────────────────────────────────────────────────
 
     def set_sdf_volume(
         self,
@@ -1793,6 +2042,7 @@ class SceneViewer3D(_BaseViewer):
         if blowup_thickness is None:
             self._blowup_thickness_wp = None
             self._blowup_thickness_source = None
+            self._blowup_thickness_max = 0.0
         else:
             local_thickness = np.ascontiguousarray(
                 blowup_thickness, dtype=np.float32)
@@ -1802,6 +2052,9 @@ class SceneViewer3D(_BaseViewer):
             self._blowup_thickness_wp = slice_module.upload_grid(
                 local_thickness)
             self._blowup_thickness_source = local_thickness
+            self._blowup_thickness_max = (
+                float(np.max(local_thickness))
+                if local_thickness.size else 0.0)
         self._sparse_sample_points = None
         self._sparse_sample_values = None
         self._clear_slice_sparse_samples()
@@ -1823,6 +2076,7 @@ class SceneViewer3D(_BaseViewer):
         if blowup_thickness is None:
             self._blowup_thickness_wp = None
             self._blowup_thickness_source = None
+            self._blowup_thickness_max = 0.0
         else:
             if self._sdf_grid is None:
                 raise ValueError(
@@ -1835,6 +2089,9 @@ class SceneViewer3D(_BaseViewer):
             self._blowup_thickness_wp = slice_module.upload_grid(
                 local_thickness)
             self._blowup_thickness_source = local_thickness
+            self._blowup_thickness_max = (
+                float(np.max(local_thickness))
+                if local_thickness.size else 0.0)
         if (update and self._overlay.slice_enabled()
                 and self._sdf_grid is not None):
             self._update_slice()
@@ -1857,17 +2114,12 @@ class SceneViewer3D(_BaseViewer):
         if self._overlay.slice_enabled() and self._sdf_grid is not None:
             self._update_slice()
 
-    def set_sdf_blowup(self, voxels: float) -> None:
-        """Set the maximum SDF offset in voxels.
-
-        Positive erodes and negative dilates.  Where local thickness is known,
-        the magnitude is capped at 25% of the feature diameter.  The live slice
-        applies the cap on the GPU without rebuilding or re-uploading the grid.
-        """
-        requested = float(voxels)
-        if requested == self._sdf_blowup_vox:
+    def set_sdf_blowup(self, thickness_fraction: float) -> None:
+        """Set the signed fraction of local thickness used by the live slice."""
+        requested = float(thickness_fraction)
+        if requested == self._sdf_blowup_fraction:
             return
-        self._sdf_blowup_vox = requested
+        self._sdf_blowup_fraction = requested
         if (self._overlay.slice_enabled() and self._sdf_grid is not None
                 and self._overlay.slice_source() != "ellipsoids"):
             self._update_slice()
@@ -1879,6 +2131,7 @@ class SceneViewer3D(_BaseViewer):
         if on:
             self._update_slice()
         else:
+            self._stop_slice_animation()
             self._clear_slice()
 
     def _on_slice_plane_changed(self, _plane: str) -> None:
@@ -1925,7 +2178,8 @@ class SceneViewer3D(_BaseViewer):
         nz, ny, nx = self._sdf_grid.shape
         out_band = 3.0 * float(self._sdf_dx)
 
-        blow = self._sdf_blowup_vox * float(self._sdf_dx)
+        max_blow = (
+            self._sdf_blowup_fraction * self._blowup_thickness_max)
         if source == "difference":
             if self._ell_centers is None or len(self._ell_centers) == 0:
                 self._clear_slice()
@@ -1934,9 +2188,8 @@ class SceneViewer3D(_BaseViewer):
                 self._ell_centers, self._ell_radii, self._ell_rotations,
                 self._grid_wp, self._sdf_origin, self._sdf_dx, nx, ny, nz,
                 self._sdf_origin, normal, k, W, H, px, theme.BLUE, theme.YELLOW,
-                offset=blow,
-                thickness_wp=self._blowup_thickness_wp,
-                max_thickness_fraction=DEFAULT_MAX_THICKNESS_FRACTION)
+                thickness_fraction=self._sdf_blowup_fraction,
+                thickness_wp=self._blowup_thickness_wp)
         elif source == "ellipsoids":
             if self._ell_centers is None or len(self._ell_centers) == 0:
                 self._clear_slice()
@@ -1950,14 +2203,13 @@ class SceneViewer3D(_BaseViewer):
             # Conservative colour normalization: adaptive erosion may be
             # locally capped, while dilation can only increase interior depth
             # by at most the requested magnitude.  Geometry remains unaffected.
-            depth = max(self._mesh_depth + max(-blow, 0.0), 1e-4)
+            depth = max(self._mesh_depth + max(-max_blow, 0.0), 1e-4)
             rgba = slice_module.render_mesh(
                 self._grid_wp, self._sdf_origin, self._sdf_dx, nx, ny, nz,
                 self._sdf_origin, normal, k, W, H, px,
                 self._slice_lut_wp, self._slice_lut_n, depth, out_band,
-                offset=blow,
-                thickness_wp=self._blowup_thickness_wp,
-                max_thickness_fraction=DEFAULT_MAX_THICKNESS_FRACTION)
+                thickness_fraction=self._sdf_blowup_fraction,
+                thickness_wp=self._blowup_thickness_wp)
 
         mat = slice_module.slice_transform(
             self._sdf_origin, normal, k, px, self._sdf_dx)

@@ -188,6 +188,49 @@ class SuperquadricStateRegressionTest(unittest.TestCase):
             out_eps, np.repeat(learned, 2, axis=0), atol=1.0e-7)
         self.assertFalse(np.allclose(out_eps[1], [1.1, 1.2]))
 
+    def test_new_per_primitive_eps_is_neutral_but_fixed_keeps_configuration(self) -> None:
+        reference = np.array([[0.31, 0.57]], dtype=np.float32)
+
+        trainable = _worker(
+            sq_eps_mode="per_primitive", sq_eps1=0.4, sq_eps2=0.5)
+        np.testing.assert_array_equal(
+            trainable._new_primitive_eps(2, reference),
+            np.ones((2, 2), dtype=np.float32),
+        )
+
+        fixed = _worker(sq_eps_mode="fixed", sq_eps1=0.4, sq_eps2=0.5)
+        np.testing.assert_array_equal(
+            fixed._new_primitive_eps(2, reference),
+            np.repeat(
+                np.array([[0.4, 0.5]], dtype=np.float32), 2, axis=0),
+        )
+
+    def test_per_primitive_spawn_preserves_survivor_and_appends_neutral_eps(self) -> None:
+        worker = _worker(
+            num_ellipsoids=2,
+            sq_eps_mode="per_primitive",
+            sq_eps1=0.4,
+            sq_eps2=0.5,
+            prune_enabled=False,
+        )
+        learned = np.array([[0.31, 0.57]], dtype=np.float32)
+        centers = np.array([[0.2, 0.2, 0.2]], dtype=np.float32)
+        radii = np.array([[0.08, 0.07, 0.06]], dtype=np.float32)
+        rotations = _identity_quats(1)
+        bend = np.zeros((1, 2), dtype=np.float32)
+
+        worker._compute_coverage_info = lambda *_args, **_kw: {"valid": False}
+        worker._spawn_at_errors = lambda *_args, **_kw: (
+            np.array([[0.35, 0.2, 0.2]], dtype=np.float32),
+            np.array([[0.04, 0.04, 0.04]], dtype=np.float32),
+            _identity_quats(1),
+        )
+
+        out = worker._do_maintenance(
+            centers, radii, rotations, learned, bend)
+        np.testing.assert_allclose(out[3][0], learned[0], atol=1.0e-7)
+        np.testing.assert_array_equal(out[3][1], [1.0, 1.0])
+
     def test_shared_eps_survives_complete_prune_for_spawn_sizing(self) -> None:
         worker = _worker(
             num_ellipsoids=1,
@@ -305,6 +348,53 @@ class SuperquadricStateRegressionTest(unittest.TestCase):
         self.assertEqual(len(out_c), 2)
         self.assertEqual(len(out_c), len(out_r))
         self.assertEqual(len(out_c), len(out_q))
+        np.testing.assert_allclose(out_eps, np.repeat(eps, 2, axis=0))
+        np.testing.assert_allclose(out_bend, np.repeat(bend, 2, axis=0))
+        np.testing.assert_array_equal(worker._last_population_lineage, [0, 0])
+
+    def test_elongated_superquadric_is_split_instead_of_deleted(self) -> None:
+        worker = _worker(
+            primitive_shape="superquadric",
+            superfit=True,
+            superfit_every=1,
+            densify_until_frac=1.0,
+            split_enabled=True,
+            split_per_round=1,
+            spawn_underrep=False,
+            merge_enabled=False,
+            prune_enabled=False,
+            max_ellipsoids=2,
+            num_steps=4,
+            degenerate_spike_ratio=8.0,
+        )
+        worker.blockSignals(True)
+
+        centers = np.array([[0.2, 0.2, 0.2]], dtype=np.float32)
+        radii = np.array([[0.02, 0.02, 0.18]], dtype=np.float32)
+        rotations = _identity_quats(1)
+        eps = np.array([[0.42, 0.68]], dtype=np.float32)
+        bend = np.array([[0.3, -0.1]], dtype=np.float32)
+        buf = worker._alloc_buffers(
+            1, 8, 125, centers, radii, rotations,
+            eps_np=eps, bend_np=bend)
+
+        worker._detect_outside_ellipsoids = \
+            lambda *_args, **_kw: np.empty(0, dtype=int)
+        worker._detect_bridging_ellipsoids = \
+            lambda *_args, **_kw: np.empty(0, dtype=int)
+        worker._detect_protruding_ellipsoids = \
+            lambda *_args, **_kw: np.empty(0, dtype=int)
+        worker._detect_worst_regions = lambda *_args, **_kw: []
+        worker._reserve_split_bone_capacity = lambda *_args, **_kw: True
+
+        result = worker._maybe_superfit(
+            1, buf["pred_centers"], buf["pred_radii"],
+            buf["pred_rot_flat"], buf["pred_eps"], buf["pred_bend"])
+
+        self.assertIsNotNone(result)
+        out_c, out_r, _out_q, out_eps, out_bend = result
+        self.assertEqual(len(out_c), 2)
+        np.testing.assert_allclose(out_r[:, 2], 0.09, atol=1.0e-7)
         np.testing.assert_allclose(out_eps, np.repeat(eps, 2, axis=0))
         np.testing.assert_allclose(out_bend, np.repeat(bend, 2, axis=0))
         np.testing.assert_array_equal(worker._last_population_lineage, [0, 0])

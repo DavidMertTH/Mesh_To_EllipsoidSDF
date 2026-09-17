@@ -3,8 +3,6 @@
 import argparse
 import os
 import sys
-import time
-from pathlib import Path
 
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
@@ -17,158 +15,216 @@ import branding
 import theme
 
 
-# Logical splash size (device-independent pixels); rendered at SS× for crispness.
-_SPLASH_W, _SPLASH_H = 460, 240
-_SS = 2          # supersampling factor for the rendered pixmaps
-_BLUR_RADIUS = 14  # blur strength (in supersampled px) of the not-yet-loaded part
-
-
-def _render_splash_pixmap() -> QtGui.QPixmap:
-    """Render the sharp 'EllipSDF' splash artwork to a supersampled pixmap."""
-    return branding.render_splash_pixmap(_SPLASH_W, _SPLASH_H, _SS)
-    w, h = _SPLASH_W * _SS, _SPLASH_H * _SS
-    pix = QtGui.QPixmap(w, h)
-    dark = theme.is_dark_mode()
-    pix.fill(QtGui.QColor(20, 22, 30) if dark else QtGui.QColor(245, 246, 250))
-
-    painter = QtGui.QPainter(pix)
-    painter.setRenderHint(QtGui.QPainter.Antialiasing)
-    painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
-
-    # "Ellip" in blue, "SDF" in yellow — Syne (the site's heading font).
-    blue = QtGui.QColor(*theme.BLUE)
-    yellow = QtGui.QColor(*theme.YELLOW)
-
-    family = _load_display_font()
-    font = QtGui.QFont(family, 38 * _SS, QtGui.QFont.Bold)
-    painter.setFont(font)
-    fm = QtGui.QFontMetrics(font)
-    w1 = fm.horizontalAdvance("Ellip")
-    w2 = fm.horizontalAdvance("SDF")
-    x = (w - (w1 + w2)) // 2
-    y = h // 2
-
-    painter.setPen(blue)
-    painter.drawText(x, y, "Ellip")
-    painter.setPen(yellow)
-    painter.drawText(x + w1, y, "SDF")
-    # NB: the loading status line is *not* baked in here — it changes per step
-    # and is drawn live in SplashScreen.paintEvent.
-    painter.end()
-    return pix
-
-
-def _blur_pixmap(src: QtGui.QPixmap, radius: float) -> QtGui.QPixmap:
-    """Return a Gaussian-blurred copy of *src* (via QGraphicsBlurEffect)."""
-    scene = QtWidgets.QGraphicsScene()
-    item = QtWidgets.QGraphicsPixmapItem(src)
-    effect = QtWidgets.QGraphicsBlurEffect()
-    effect.setBlurRadius(radius)
-    item.setGraphicsEffect(effect)
-    scene.addItem(item)
-
-    out = QtGui.QImage(src.size(), QtGui.QImage.Format_ARGB32_Premultiplied)
-    out.fill(QtCore.Qt.transparent)
-    painter = QtGui.QPainter(out)
-    rect = QtCore.QRectF(0, 0, src.width(), src.height())
-    scene.render(painter, rect, rect)
-    painter.end()
-    return QtGui.QPixmap.fromImage(out)
+# Logical splash size in device-independent pixels.  Everything is painted as
+# vector geometry, so the wordmark stays sharp on high-DPI displays.
+_SPLASH_W, _SPLASH_H = 600, 280
 
 
 class SplashScreen(QtWidgets.QWidget):
 
-    def __init__(self, sharp: QtGui.QPixmap, blurry: QtGui.QPixmap):
+    def __init__(self):
         super().__init__(
             None,
             QtCore.Qt.SplashScreen
             | QtCore.Qt.FramelessWindowHint
             | QtCore.Qt.WindowStaysOnTopHint,
         )
-        self._sharp = sharp
-        self._blurry = blurry
-        self._progress = 0.0
+        self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
+        self._display_progress = 0.0
+        self._target_progress = 0.0
         self._status = "Loading …"
+        self._finish_animation = None
         self.setFixedSize(_SPLASH_W, _SPLASH_H)
-        # Centre on the primary screen.
-        scr = QtWidgets.QApplication.primaryScreen()
+
+        self._word_path, self._word_bounds = self._build_word_path()
+
+        # Use the screen under the pointer when possible, which is less
+        # surprising on multi-monitor workstations than always using screen 1.
+        scr = QtGui.QGuiApplication.screenAt(QtGui.QCursor.pos())
+        if scr is None:
+            scr = QtWidgets.QApplication.primaryScreen()
         if scr is not None:
             geo = scr.availableGeometry()
             self.move(geo.center().x() - _SPLASH_W // 2,
                       geo.center().y() - _SPLASH_H // 2)
 
+    @staticmethod
+    def _visible_accent() -> QtGui.QColor:
+        accent = QtGui.QColor(*theme.YELLOW)
+        # User-selectable colours may be almost black.  Keep the trace visible
+        # without replacing the chosen hue.
+        if accent.lightness() < 105:
+            accent = accent.lighter(180)
+        return accent
+
+    def _build_word_path(self) -> tuple[QtGui.QPainterPath, QtCore.QRectF]:
+        font = QtGui.QFont(branding.display_font_family())
+        font.setPixelSize(86)
+        font.setWeight(QtGui.QFont.Bold)
+        font.setStyleStrategy(QtGui.QFont.PreferAntialias)
+        raw = QtGui.QPainterPath()
+        raw.addText(0.0, 0.0, font, "EllipSDF")
+        bounds = raw.boundingRect()
+        max_width = 450.0
+        scale = min(1.0, max_width / max(1.0, bounds.width()))
+        transform = QtGui.QTransform()
+        transform.translate(
+            (self.width() - bounds.width() * scale) * 0.5
+            - bounds.x() * scale,
+            145.0 - bounds.center().y() * scale,
+        )
+        transform.scale(scale, scale)
+        path = transform.map(raw)
+        return path, path.boundingRect()
+
     def set_progress(self, frac: float, message: str | None = None,
                      animate: bool = True, duration: float = 0.35) -> None:
-        """Advance the bar to *frac* (0..1), optionally updating the status line.
+        """Reveal progress smoothly with a bounded total animation budget.
 
-        When *animate* is set, the bar glides from its current position to the
-        target with an ease-out curve instead of snapping there — so the jumps
-        between loading milestones look smooth.  The main thread is blocked
-        during the heavy work between milestones, so each call plays as a short
-        "catch-up" glide at that milestone.
+        ``duration`` is the time for the complete 0-to-1 journey, not for each
+        individual loading milestone.  Splitting startup into more callbacks
+        therefore does not make startup progressively slower.
         """
         if message is not None:
             self._status = message
         target = max(0.0, min(1.0, float(frac)))
-        start = self._progress
-        # Snap for backwards moves or when animation is disabled / pointless.
-        if not animate or duration <= 0 or target <= start:
-            self._progress = target
+        self._target_progress = max(self._target_progress, target)
+        start = self._display_progress
+        distance = self._target_progress - start
+        animation_ms = round(max(0.0, duration) * distance * 1000.0)
+        if not animate or animation_ms < 12 or distance <= 0.0:
+            self._display_progress = self._target_progress
             self.repaint()
             QtWidgets.QApplication.processEvents()
             return
 
-        t0 = time.perf_counter()
-        while True:
-            t = (time.perf_counter() - t0) / duration
-            if t >= 1.0:
-                break
-            eased = 1.0 - (1.0 - t) ** 3        # ease-out cubic
-            self._progress = start + (target - start) * eased
-            self.repaint()
-            QtWidgets.QApplication.processEvents()
-            time.sleep(1.0 / 120.0)             # ~120 fps cap, spares the CPU
-        self._progress = target
+        loop = QtCore.QEventLoop(self)
+        animation = QtCore.QVariantAnimation(self)
+        animation.setStartValue(start)
+        animation.setEndValue(self._target_progress)
+        animation.setDuration(animation_ms)
+        animation.setEasingCurve(QtCore.QEasingCurve.InOutCubic)
+
+        def update_progress(value) -> None:
+            self._display_progress = float(value)
+            self.update()
+
+        animation.valueChanged.connect(update_progress)
+        animation.finished.connect(loop.quit)
+        animation.start()
+        loop.exec()
+        self._display_progress = self._target_progress
         self.repaint()
         QtWidgets.QApplication.processEvents()
 
+    def finish(self) -> None:
+        """Reveal the completed wordmark and fade over the ready main window."""
+        self.set_progress(1.0, "Ready")
+        self.raise_()
+        fade = QtCore.QPropertyAnimation(self, b"windowOpacity", self)
+        fade.setDuration(160)
+        fade.setStartValue(1.0)
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        fade.finished.connect(self.close)
+        self._finish_animation = fade
+        fade.start()
+
     def paintEvent(self, ev: QtGui.QPaintEvent) -> None:
         p = QtGui.QPainter(self)
-        p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
-        w, h = self.width(), self.height()
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.setRenderHint(QtGui.QPainter.TextAntialiasing)
+        p.fillRect(self.rect(), QtGui.QColor(39, 40, 44))
+        p.setPen(QtGui.QPen(QtGui.QColor(66, 67, 72), 1.0))
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawRect(QtCore.QRectF(0.5, 0.5,
+                                 self.width() - 1.0, self.height() - 1.0))
 
-        # 1) blurry everywhere
-        p.drawPixmap(self.rect(), self._blurry)
+        progress = max(0.0, min(1.0, self._display_progress))
+        accent = self._visible_accent()
 
-        # 2) sharp on the already-loaded (left) portion
-        reveal = int(round(w * self._progress))
-        if reveal > 0:
-            tgt = QtCore.QRect(0, 0, reveal, h)
-            src = QtCore.QRect(0, 0, reveal * _SS, h * _SS)
-            p.drawPixmap(tgt, self._sharp, src)
+        # A quiet preview of the complete lettering remains in the background.
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.setPen(QtGui.QPen(QtGui.QColor(225, 226, 230, 31), 1.1,
+                            QtCore.Qt.SolidLine, QtCore.Qt.RoundCap,
+                            QtCore.Qt.RoundJoin))
+        p.drawPath(self._word_path)
 
-        # 3) the bar's leading edge — a bright vertical line (the brand yellow)
-        if 0.0 < self._progress < 1.0:
-            edge = QtGui.QColor(*theme.YELLOW)
-            p.fillRect(QtCore.QRect(reveal - 2, 0, 3, h), edge)
+        # Loading reveals the actual wordmark from left to right.  A soft edge
+        # makes it feel drawn rather than abruptly cropped.
+        reveal_x = (self._word_bounds.left()
+                    + self._word_bounds.width() * progress)
+        if progress > 0.0:
+            p.save()
+            p.setClipRect(QtCore.QRectF(
+                self._word_bounds.left() - 8.0,
+                self._word_bounds.top() - 10.0,
+                max(0.0, reveal_x - self._word_bounds.left() + 8.0),
+                self._word_bounds.height() + 20.0,
+            ))
+            word_gradient = QtGui.QLinearGradient(
+                self._word_bounds.left(), 0.0,
+                self._word_bounds.right(), 0.0)
+            word_gradient.setColorAt(0.0, QtGui.QColor(239, 240, 243))
+            word_gradient.setColorAt(0.66, QtGui.QColor(239, 240, 243))
+            word_gradient.setColorAt(1.0, accent)
+            p.setBrush(QtGui.QBrush(word_gradient))
+            p.setPen(QtGui.QPen(QtGui.QColor(250, 250, 252, 185), 0.8,
+                                QtCore.Qt.SolidLine, QtCore.Qt.RoundCap,
+                                QtCore.Qt.RoundJoin))
+            p.drawPath(self._word_path)
+            p.restore()
 
-        # 4) live status line at the bottom — what's loading right now
+            if progress < 0.995:
+                edge = QtGui.QLinearGradient(reveal_x - 18.0, 0.0,
+                                             reveal_x + 5.0, 0.0)
+                edge.setColorAt(0.0, QtGui.QColor(
+                    accent.red(), accent.green(), accent.blue(), 0))
+                edge.setColorAt(0.72, QtGui.QColor(
+                    accent.red(), accent.green(), accent.blue(), 55))
+                edge.setColorAt(1.0, QtGui.QColor(
+                    accent.red(), accent.green(), accent.blue(), 0))
+                p.fillRect(QtCore.QRectF(reveal_x - 18.0,
+                                         self._word_bounds.top() - 12.0,
+                                         23.0,
+                                         self._word_bounds.height() + 24.0),
+                           edge)
+
+        # Restrained status text and a two-pixel progress line.
         if self._status:
-            dark = theme.is_dark_mode()
-            p.setPen(QtGui.QColor(170, 172, 182) if dark
-                     else QtGui.QColor(110, 112, 122))
+            p.setPen(QtGui.QColor(158, 159, 165))
             sf = QtGui.QFont("Segoe UI", 9)
             p.setFont(sf)
-            p.drawText(QtCore.QRect(0, h - 30, w, 22),
-                       QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
+            p.drawText(QtCore.QRect(30, self.height() - 62,
+                                    self.width() - 60, 20),
+                       QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
                        self._status)
+
+        p.setFont(QtGui.QFont("Segoe UI", 8))
+        p.setPen(QtGui.QColor(128, 129, 135))
+        p.drawText(QtCore.QRect(30, self.height() - 62,
+                                self.width() - 60, 20),
+                   QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+                   f"{round(progress * 100):d}%")
+
+        bar = QtCore.QRectF(30.0, self.height() - 30.0,
+                            self.width() - 60.0, 2.0)
+        p.fillRect(bar, QtGui.QColor(76, 77, 82))
+        if progress > 0.0:
+            fill = QtCore.QRectF(
+                bar.left(), bar.top(), bar.width() * progress, bar.height())
+            bar_gradient = QtGui.QLinearGradient(
+                bar.left(), 0.0, bar.right(), 0.0)
+            muted_accent = QtGui.QColor(accent)
+            muted_accent.setAlpha(205)
+            bar_gradient.setColorAt(0.0, QtGui.QColor(195, 196, 201))
+            bar_gradient.setColorAt(1.0, muted_accent)
+            p.fillRect(fill, bar_gradient)
         p.end()
 
 
 def _make_splash() -> SplashScreen:
-    sharp = _render_splash_pixmap()
-    blurry = _blur_pixmap(sharp, _BLUR_RADIUS * _SS)
-    return SplashScreen(sharp, blurry)
+    return SplashScreen()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -246,10 +302,7 @@ def main():
     # Windowed fullscreen (maximised, not exclusive): fills the screen but keeps
     # the title bar/taskbar and — importantly — lets combo-box popups show on top.
     win.showMaximized()
-    splash.set_progress(1.0, "Done")   # glide to fully sharp; bar covers the screen
-    time.sleep(0.20)           # brief hold so the crisp logo is visible
-    QtWidgets.QApplication.processEvents()
-    splash.close()
+    splash.finish()
     sys.exit(pg.exec())
 
 

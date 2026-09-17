@@ -1,5 +1,5 @@
 """
-ellipsoid_exporter.py — Export bone-local ellipsoids to JSON for Unity import.
+ellipsoid_exporter.py — Export bone-local primitives to JSON for Unity import.
 
 Coordinate system used in this file (matches our internal representation):
   Right-hand, Y-up (same as FBX default, Blender, Maya).
@@ -28,7 +28,7 @@ def export_ellipsoids(
     skeleton: Skeleton,
     filepath: str | Path,
 ) -> int:
-    """Export bone-local ellipsoid data to a JSON file for Unity.
+    """Export bone-local ellipsoid/superquadric data for Unity.
 
     Parameters
     ----------
@@ -50,9 +50,21 @@ def export_ellipsoids(
         bone_name = skeleton.bones[bi].name
         local_index = counts[bone_name]
         counts[bone_name] += 1
+        primitive_type = str(
+            getattr(bone_local, "primitive_type", "ellipsoid") or "ellipsoid")
+        shape_exponents = getattr(bone_local, "shape_exponents", None)
+        eps = (
+            shape_exponents[i]
+            if shape_exponents is not None
+            else (1.0, 1.0)
+        )
         entries.append({
+            "id":             int(i),
             "name":           sphere_name(bone_name, local_index),
             "bone":           bone_name,
+            "bone_index":     bi,
+            "primitive_type": primitive_type,
+            "shape_exponents": [round(float(v), 7) for v in eps],
             # offset from bone origin, expressed in bone's orientation frame
             "local_center":   [round(float(v), 7) for v in bone_local.local_centers[i]],
             # ellipsoid semi-axes (half-extents)
@@ -62,10 +74,13 @@ def export_ellipsoids(
             **attachment_entry_fields(bone_local, i, skeleton),
         })
 
+    primitive_type = str(
+        getattr(bone_local, "primitive_type", "ellipsoid") or "ellipsoid")
     payload = {
-        "version":               2,
+        "version":               4,
         "coordinate_system":     "right_hand_y_up",
         "quaternion_convention": "xyzw",
+        "primitive_type":        primitive_type,
         "count":                 len(entries),
         "ellipsoids":            entries,
     }
@@ -73,5 +88,5 @@ def export_ellipsoids(
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
-    print(f"[Exporter] {len(entries)} ellipsoids → {filepath}")
+    print(f"[Exporter] {len(entries)} {primitive_type} primitives -> {filepath}")
     return len(entries)

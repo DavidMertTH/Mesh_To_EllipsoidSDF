@@ -43,6 +43,34 @@ def sphere_name(bodypart: str | None, number: int) -> str:
     return f"Sphere_{safe}_{int(number)}"
 
 
+def _primitive_shape_state(
+    primitive_type: str | None,
+    shape_exponents: np.ndarray | None,
+    count: int,
+) -> tuple[str, np.ndarray]:
+    """Return validated homogeneous primitive metadata for JSON mapping."""
+    kind = str(primitive_type or "ellipsoid").strip().lower()
+    if kind not in ("ellipsoid", "superquadric"):
+        raise ValueError(
+            "primitive_type must be 'ellipsoid' or 'superquadric'")
+    if shape_exponents is None:
+        eps = np.ones((int(count), 2), dtype=np.float32)
+    else:
+        eps = np.asarray(shape_exponents, dtype=np.float32).reshape(-1, 2)
+        if len(eps) != int(count):
+            raise ValueError(
+                "shape_exponents must contain one pair per primitive")
+        if (not np.isfinite(eps).all()
+                or np.any(eps < 0.1)
+                or np.any(eps > 2.0)):
+            raise ValueError(
+                "shape_exponents must be finite and inside [0.1, 2.0]")
+        eps = np.ascontiguousarray(eps, dtype=np.float32)
+    if kind == "ellipsoid":
+        eps = np.ones((int(count), 2), dtype=np.float32)
+    return kind, eps
+
+
 def attachment_entry_fields(
     bone_local,
     ellipsoid_index: int,
@@ -154,6 +182,8 @@ def assign_ellipsoids_to_bones(
     world_rotations: np.ndarray,
     mesh_vertices: np.ndarray,
     rig: dict[str, Any],
+    primitive_type: str = "ellipsoid",
+    shape_exponents: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     """Assign ellipsoids to bones and return Unity-ready, bone-local entries.
 
@@ -175,12 +205,16 @@ def assign_ellipsoids_to_bones(
     if int(joints.max(initial=0)) >= skeleton.num_bones:
         raise ValueError("boneIndices reference a bone beyond rig.bones")
 
+    primitive_type, shape_exponents = _primitive_shape_state(
+        primitive_type, shape_exponents, len(world_centers))
     mapper = BoneEllipsoidMapper(skeleton)
     bl = mapper.assign_to_bones(
         np.asarray(world_centers, dtype=np.float64),
         np.asarray(world_radii, dtype=np.float64),
         np.asarray(world_rotations, dtype=np.float64),
         verts, joints, weights, pose=None,
+        primitive_type=primitive_type,
+        shape_exponents=shape_exponents,
     )
 
     entries: list[dict[str, Any]] = []
@@ -200,6 +234,10 @@ def assign_ellipsoids_to_bones(
             "radii": [round(float(v), 7) for v in bl.local_radii[i]],
             "rotation": [round(float(v), 7) for v in world_rotations[i]],
             "local_rotation": [round(float(v), 7) for v in bl.local_rotations[i]],
+            "primitive_type": primitive_type,
+            "shape_exponents": [
+                round(float(v), 7) for v in shape_exponents[i]
+            ],
             **attachment_entry_fields(bl, i, skeleton),
         })
     return entries
@@ -212,6 +250,8 @@ def world_to_bone_local_entries(
     bone_assignments: np.ndarray,
     rig: dict[str, Any],
     source_entries: list[dict[str, Any]] | None = None,
+    primitive_type: str = "ellipsoid",
+    shape_exponents: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     """Convert ellipsoids with *known* bone assignments to bone-local entries.
 
@@ -226,6 +266,8 @@ def world_to_bone_local_entries(
     """
     bones = rig.get("bones") or []
     skeleton = build_skeleton_from_bones(bones)
+    primitive_type, shape_exponents = _primitive_shape_state(
+        primitive_type, shape_exponents, len(world_centers))
     mapper = BoneEllipsoidMapper(skeleton)
 
     assignments = np.asarray(bone_assignments).astype(np.int32)
@@ -239,6 +281,8 @@ def world_to_bone_local_entries(
         pose=None,
         attachment_joints=attachment_joints,
         attachment_weights=attachment_weights,
+        primitive_type=primitive_type,
+        shape_exponents=shape_exponents,
     )
 
     entries: list[dict[str, Any]] = []
@@ -274,6 +318,10 @@ def world_to_bone_local_entries(
             "radii": [round(float(v), 7) for v in bl.local_radii[i]],
             "rotation": [round(float(v), 7) for v in world_rotations[i]],
             "local_rotation": [round(float(v), 7) for v in bl.local_rotations[i]],
+            "primitive_type": primitive_type,
+            "shape_exponents": [
+                round(float(v), 7) for v in shape_exponents[i]
+            ],
             **attachment_entry_fields(bl, i, skeleton),
         })
     return entries

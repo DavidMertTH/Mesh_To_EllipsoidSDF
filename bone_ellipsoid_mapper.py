@@ -6,9 +6,9 @@ Core concept:
   For any given pose, bone transforms map them to world space.
   Training gradients flow through the bone transform back to the local parameters.
 
-  world_center   = bone_rot ⊗ local_center + bone_pos
+  world_center   = bone_affine(local_center)
   world_rotation = bone_rot ⊗ local_rotation
-  world_radii    = local_radii   (rigid bones — no scaling)
+  world_radii    = local_radii   (scale intentionally does not change radii)
 
 Workflow:
   1. Optimise ellipsoids in T-pose world space (existing pipeline)
@@ -93,9 +93,13 @@ if _HAS_WARP:
 
 @dataclass
 class BoneLocalEllipsoids:
-    """Ellipsoid parameters in bone-local space.
+    """Primitive parameters in bone-local space.
 
     These are the **trainable** parameters that persist across poses.
+    ``primitive_type`` and ``shape_exponents`` are additive so older callers
+    that only provide ellipsoid geometry remain source compatible.  Shape
+    exponents are dimensionless and therefore pass through bone transforms
+    unchanged.
     """
     local_centers: np.ndarray     # (N, 3) float32 — offset from bone origin
     local_radii: np.ndarray       # (N, 3) float32 — semi-axis lengths
@@ -103,10 +107,39 @@ class BoneLocalEllipsoids:
     bone_assignments: np.ndarray  # (N,) int32     — which bone each belongs to
     attachment_joints: np.ndarray | None = None
     attachment_weights: np.ndarray | None = None
+    primitive_type: str = "ellipsoid"
+    shape_exponents: np.ndarray | None = None
     num_ellipsoids: int = 0
 
     def __post_init__(self):
         self.num_ellipsoids = len(self.local_centers)
+        primitive_type = str(self.primitive_type or "ellipsoid").strip().lower()
+        if primitive_type not in ("ellipsoid", "superquadric"):
+            raise ValueError(
+                "primitive_type must be 'ellipsoid' or 'superquadric'")
+        self.primitive_type = primitive_type
+
+        if self.shape_exponents is None:
+            exponents = np.ones((self.num_ellipsoids, 2), dtype=np.float32)
+        else:
+            exponents = np.asarray(
+                self.shape_exponents, dtype=np.float32).reshape(-1, 2)
+            if len(exponents) != self.num_ellipsoids:
+                raise ValueError(
+                    "shape_exponents must contain one [eps1, eps2] pair "
+                    "per primitive")
+            if (not np.isfinite(exponents).all()
+                    or np.any(exponents < 0.1)
+                    or np.any(exponents > 2.0)):
+                raise ValueError(
+                    "shape_exponents must be finite and inside [0.1, 2.0]")
+            exponents = np.ascontiguousarray(exponents, dtype=np.float32)
+        if primitive_type == "ellipsoid":
+            # Keep legacy ellipsoids canonical even if a stale serializer left
+            # unrelated exponent values behind.
+            exponents = np.ones((self.num_ellipsoids, 2), dtype=np.float32)
+        self.shape_exponents = exponents
+
         if self.attachment_joints is None or self.attachment_weights is None:
             self.attachment_joints = None
             self.attachment_weights = None
@@ -161,12 +194,110 @@ def _blend_quaternions(quats: list[np.ndarray], weights: list[float]) -> np.ndar
     return _normalize_quat(acc)
 
 
+def _solve_affine_linear(linear: np.ndarray, value: np.ndarray) -> np.ndarray:
+    """Apply an inverse affine linear part, tolerating degenerate input."""
+    linear = np.asarray(linear, dtype=np.float64).reshape(3, 3)
+    value = np.asarray(value, dtype=np.float64).reshape(3)
+    try:
+        result = np.linalg.solve(linear, value)
+    except np.linalg.LinAlgError:
+        result = np.linalg.pinv(linear) @ value
+    if not np.isfinite(result).all():
+        result = np.linalg.pinv(linear) @ value
+    return result
+
+
+def _affine_delta_transform(
+    bind_transform: np.ndarray,
+    pose_transform: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the affine ``pose @ inverse(bind)`` point transform."""
+    bind = np.asarray(bind_transform, dtype=np.float64).reshape(4, 4)
+    pose = np.asarray(pose_transform, dtype=np.float64).reshape(4, 4)
+    bind_linear = bind[:3, :3]
+    pose_linear = pose[:3, :3]
+    try:
+        delta_linear = np.linalg.solve(
+            bind_linear.T, pose_linear.T,
+        ).T
+    except np.linalg.LinAlgError:
+        delta_linear = pose_linear @ np.linalg.pinv(bind_linear)
+    if not np.isfinite(delta_linear).all():
+        delta_linear = pose_linear @ np.linalg.pinv(bind_linear)
+    delta_offset = pose[:3, 3] - delta_linear @ bind[:3, 3]
+    return delta_linear, delta_offset
+
+
+def _attachment_center_parameter_transform(
+    bone_local: "BoneLocalEllipsoids",
+    bind_transforms: np.ndarray,
+    pose_transforms: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the full-affine local-to-world map for ellipsoid centers."""
+    bind_world = np.asarray(bind_transforms, dtype=np.float64).reshape(-1, 4, 4)
+    pose_world = np.asarray(pose_transforms, dtype=np.float64).reshape(-1, 4, 4)
+    if len(bind_world) != len(pose_world):
+        raise ValueError("bind and pose transform arrays must have equal length")
+
+    n_bones = len(bind_world)
+    n_ellipsoids = bone_local.num_ellipsoids
+    linear = np.zeros((n_ellipsoids, 3, 3), dtype=np.float32)
+    offset = np.zeros((n_ellipsoids, 3), dtype=np.float32)
+    use_attachments = (
+        bone_local.attachment_joints is not None
+        and bone_local.attachment_weights is not None
+        and bone_local.attachment_joints.shape[0] == n_ellipsoids
+        and bone_local.attachment_joints.shape == bone_local.attachment_weights.shape
+    )
+
+    for i in range(n_ellipsoids):
+        primary = int(bone_local.bone_assignments[i])
+        if primary < 0 or primary >= n_bones:
+            raise ValueError(f"ellipsoid {i} references invalid primary bone {primary}")
+
+        if use_attachments:
+            joints = np.asarray(bone_local.attachment_joints[i], dtype=np.int32)
+            weights = np.asarray(bone_local.attachment_weights[i], dtype=np.float64)
+            valid = (weights > 1.0e-8) & (joints >= 0) & (joints < n_bones)
+            joints = joints[valid]
+            weights = weights[valid]
+        else:
+            joints = np.zeros(0, dtype=np.int32)
+            weights = np.zeros(0, dtype=np.float64)
+        if len(joints) == 0 or float(weights.sum()) <= 1.0e-12:
+            joints = np.array([primary], dtype=np.int32)
+            weights = np.array([1.0], dtype=np.float64)
+        else:
+            weights = weights / float(weights.sum())
+
+        blended_linear = np.zeros((3, 3), dtype=np.float64)
+        blended_offset = np.zeros(3, dtype=np.float64)
+        for joint, weight in zip(joints, weights):
+            delta_linear, delta_offset = _affine_delta_transform(
+                bind_world[int(joint)], pose_world[int(joint)])
+            blended_linear += float(weight) * delta_linear
+            blended_offset += float(weight) * delta_offset
+
+        primary_bind = bind_world[primary]
+        linear[i] = (
+            blended_linear @ primary_bind[:3, :3]
+        ).astype(np.float32)
+        offset[i] = (
+            blended_linear @ primary_bind[:3, 3] + blended_offset
+        ).astype(np.float32)
+
+    return linear, offset
+
+
 def attachment_parameter_transform(
     bone_local: "BoneLocalEllipsoids",
     bind_positions: np.ndarray,
     bind_rotations: np.ndarray,
     pose_positions: np.ndarray,
     pose_rotations: np.ndarray,
+    *,
+    bind_transforms: np.ndarray | None = None,
+    pose_transforms: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build the fixed local-to-world map for one rig pose.
 
@@ -239,6 +370,13 @@ def attachment_parameter_transform(
             _blend_quaternions(delta_quats, delta_weights),
             bind_q[primary],
         )).astype(np.float32)
+
+    if (bind_transforms is None) != (pose_transforms is None):
+        raise ValueError(
+            "bind_transforms and pose_transforms must be provided together")
+    if bind_transforms is not None:
+        linear, offset = _attachment_center_parameter_transform(
+            bone_local, bind_transforms, pose_transforms)
 
     return linear, offset, rotation_prefix
 
@@ -351,6 +489,8 @@ class BoneEllipsoidMapper:
         skin_joints: np.ndarray,
         skin_weights: np.ndarray,
         pose: Pose | None = None,
+        primitive_type: str = "ellipsoid",
+        shape_exponents: np.ndarray | None = None,
     ) -> BoneLocalEllipsoids:
         """Assign each ellipsoid to its nearest bone and convert to bone-local space.
 
@@ -414,6 +554,8 @@ class BoneEllipsoidMapper:
             bone_assignments, pose,
             attachment_joints=attachment_joints,
             attachment_weights=attachment_weights,
+            primitive_type=primitive_type,
+            shape_exponents=shape_exponents,
         )
 
         self._bone_local = bone_local
@@ -430,13 +572,14 @@ class BoneEllipsoidMapper:
         pose: Pose | None = None,
         attachment_joints: np.ndarray | None = None,
         attachment_weights: np.ndarray | None = None,
+        primitive_type: str = "ellipsoid",
+        shape_exponents: np.ndarray | None = None,
     ) -> BoneLocalEllipsoids:
         """Convert world-space ellipsoid params to bone-local space.
 
-        For each ellipsoid assigned to bone B:
-          local_center = inv(bone_rot) ⊗ (world_center - bone_pos)
-          local_rot    = inv(bone_rot) ⊗ world_rot
-          local_radii  = world_radii   (no scaling)
+        Centers use the complete affine bone transform, including scale (and
+        any hierarchy-induced shear). Rotations keep the existing quaternion
+        semantics and radii intentionally pass through unchanged.
         """
         N = len(world_centers)
         world_transforms = self.skeleton.compute_world_transforms(pose)
@@ -456,13 +599,11 @@ class BoneEllipsoidMapper:
         local_radii = world_radii.copy().astype(np.float32)
         local_rotations = np.zeros((N, 4), dtype=np.float32)
 
-        bind_t = np.zeros((self.skeleton.num_bones, 3), dtype=np.float64)
         bind_q = np.zeros((self.skeleton.num_bones, 4), dtype=np.float64)
-        pose_t = np.zeros((self.skeleton.num_bones, 3), dtype=np.float64)
         pose_q = np.zeros((self.skeleton.num_bones, 4), dtype=np.float64)
         for bi in range(self.skeleton.num_bones):
-            bind_t[bi], bind_q[bi], _ = mat4_decompose(bind_transforms[bi])
-            pose_t[bi], pose_q[bi], _ = mat4_decompose(world_transforms[bi])
+            _, bind_q[bi], _ = mat4_decompose(bind_transforms[bi])
+            _, pose_q[bi], _ = mat4_decompose(world_transforms[bi])
 
         for i in range(N):
             primary = int(bone_assignments[i])
@@ -485,32 +626,34 @@ class BoneEllipsoidMapper:
                 delta_quats: list[np.ndarray] = []
                 delta_weights: list[float] = []
                 for joint, weight in zip(joints, weights):
-                    rb = _quat_to_matrix(bind_q[int(joint)])
-                    rp = _quat_to_matrix(pose_q[int(joint)])
-                    Aj = rp @ rb.T
+                    joint = int(joint)
+                    Aj, bj = _affine_delta_transform(
+                        bind_transforms[joint], world_transforms[joint])
                     A += float(weight) * Aj
-                    b += float(weight) * (pose_t[int(joint)] - Aj @ bind_t[int(joint)])
-                    dq = quat_multiply(pose_q[int(joint)], quat_inverse(bind_q[int(joint)]))
+                    b += float(weight) * bj
+                    dq = quat_multiply(pose_q[joint], quat_inverse(bind_q[joint]))
                     delta_quats.append(dq)
                     delta_weights.append(float(weight))
 
-                try:
-                    bind_center = np.linalg.solve(
-                        A, world_centers[i].astype(np.float64) - b)
-                except np.linalg.LinAlgError:
-                    bind_center = np.linalg.pinv(A) @ (
-                        world_centers[i].astype(np.float64) - b)
+                bind_center = _solve_affine_linear(
+                    A, world_centers[i].astype(np.float64) - b)
 
                 q_bind_primary_inv = quat_inverse(bind_q[primary])
-                local_c = quat_rotate(q_bind_primary_inv, bind_center - bind_t[primary])
+                primary_bind = bind_transforms[primary]
+                local_c = _solve_affine_linear(
+                    primary_bind[:3, :3],
+                    bind_center - primary_bind[:3, 3],
+                )
                 blend_delta = _blend_quaternions(delta_quats, delta_weights)
                 bind_world_q = quat_multiply(quat_inverse(blend_delta), q_world)
                 q_local = quat_multiply(q_bind_primary_inv, bind_world_q)
             else:
-                # Center: inv_rot(world_center - bone_pos)
-                delta = world_centers[i].astype(np.float64) - pose_t[primary]
+                pose_transform = world_transforms[primary]
+                local_c = _solve_affine_linear(
+                    pose_transform[:3, :3],
+                    world_centers[i].astype(np.float64) - pose_transform[:3, 3],
+                )
                 q_inv = quat_inverse(pose_q[primary])
-                local_c = quat_rotate(q_inv, delta)
                 q_local = quat_multiply(q_inv, q_world)
 
             local_centers[i] = local_c.astype(np.float32)
@@ -525,6 +668,8 @@ class BoneEllipsoidMapper:
                                else np.asarray(attachment_joints, dtype=np.int32).copy()),
             attachment_weights=(None if not use_attachments
                                 else np.asarray(attachment_weights, dtype=np.float32).copy()),
+            primitive_type=primitive_type,
+            shape_exponents=shape_exponents,
         )
 
     # ── Local → World (NumPy, for visualisation) ─────────────────────
@@ -573,7 +718,14 @@ class BoneEllipsoidMapper:
             bind_t[bi], bind_q[bi], _ = mat4_decompose(bind_world[bi])
             pose_t[bi], pose_q[bi], _ = mat4_decompose(pose_world[bi])
         return attachment_parameter_transform(
-            bone_local, bind_t, bind_q, pose_t, pose_q)
+            bone_local,
+            bind_t,
+            bind_q,
+            pose_t,
+            pose_q,
+            bind_transforms=bind_world,
+            pose_transforms=pose_world,
+        )
 
     # ── Local → World (Warp, for differentiable training) ────────────
 

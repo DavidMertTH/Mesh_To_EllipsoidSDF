@@ -595,7 +595,8 @@ def _load_fbx_rigged(
     if len(rig.bones) == 0:
         raise ValueError(f"No bones found in {path.name}.")
 
-    # ── Mesh geometry — from FBX parser directly ──
+    # ── Mesh geometry — parser has already applied Model/Geometric TRS
+    # into the same FBX world space used by cluster TransformLink matrices. ──
     if rig.mesh is None or len(rig.mesh.vertices) == 0:
         raise ValueError(
             f"Could not extract mesh geometry from {path.name}. "

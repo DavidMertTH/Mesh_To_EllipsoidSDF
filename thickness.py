@@ -220,26 +220,38 @@ def local_thickness(
     offsets = _sphere_offset_cache()
     total = int(len(radii))
     report_every = max(1, total // 60)
-
-    for k, ((z, y, x), r) in enumerate(zip(idx, radii)):
-        diam = 2.0 * float(r)
-        if thick[z, y, x] >= diam:
-            if progress_cb is not None and (k % report_every == 0):
-                progress_cb(0.22 + 0.70 * (k / max(total, 1)),
-                            f"Thickness spheres {k}/{total}")
-            continue  # already covered by a larger inscribed sphere
-        offs = offsets(float(r))
-        zz = z + offs[:, 0]
-        yy = y + offs[:, 1]
-        xx = x + offs[:, 2]
-        valid = (zz >= 0) & (zz < nz) & (yy >= 0) & (yy < ny) & (xx >= 0) & (xx < nx)
-        zz, yy, xx = zz[valid], yy[valid], xx[valid]
-        cur = thick[zz, yy, xx]
-        upd = cur < diam
-        thick[zz[upd], yy[upd], xx[upd]] = diam
-        if progress_cb is not None and (k % report_every == 0):
-            progress_cb(0.22 + 0.70 * (k / max(total, 1)),
-                        f"Thickness spheres {k}/{total}")
+    next_report = 0
+    # Most centres are already covered by a larger sphere.  Test small blocks
+    # with NumPy before entering Python; recheck each surviving centre after
+    # earlier splats in that block so the result stays bit-for-bit unchanged.
+    for start in range(0, total, 256):
+        end = min(start + 256, total)
+        block = idx[start:end]
+        eligible = np.flatnonzero(
+            thick[block[:, 0], block[:, 1], block[:, 2]]
+            < 2.0 * radii[start:end])
+        for local_index in eligible:
+            k = start + int(local_index)
+            z, y, x = idx[k]
+            r = radii[k]
+            diam = 2.0 * float(r)
+            if thick[z, y, x] >= diam:
+                continue  # covered by an earlier splat in this block
+            offs = offsets(float(r))
+            zz = z + offs[:, 0]
+            yy = y + offs[:, 1]
+            xx = x + offs[:, 2]
+            valid = (zz >= 0) & (zz < nz) & (yy >= 0) & (yy < ny) & (xx >= 0) & (xx < nx)
+            zz, yy, xx = zz[valid], yy[valid], xx[valid]
+            inside_splat = interior[zz, yy, xx]
+            zz, yy, xx = zz[inside_splat], yy[inside_splat], xx[inside_splat]
+            cur = thick[zz, yy, xx]
+            upd = cur < diam
+            thick[zz[upd], yy[upd], xx[upd]] = diam
+        if progress_cb is not None and end >= next_report:
+            progress_cb(0.22 + 0.70 * (end / max(total, 1)),
+                        f"Thickness spheres {end}/{total}")
+            next_report = end + report_every
 
     # Floor every interior voxel and convert to world units.
     if progress_cb is not None:

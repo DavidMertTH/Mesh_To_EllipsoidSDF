@@ -186,6 +186,13 @@ class BoneSeparationController:
         self._cursor += 1
         self._start_next_sdf()
 
+    def on_region_fit_failed(self, msg: str) -> None:
+        """Abort instead of treating a failed optimizer as an empty bone."""
+        if self._done:
+            return
+        self._done = True
+        self._host.bonesep_failed(f"region fit failed: {msg}")
+
     def _finalize(self) -> None:
         """All fit-bones done: reflect mirror partners and hand back the union."""
         if self._done:

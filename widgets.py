@@ -2,12 +2,12 @@
 widgets.py — Reusable Qt widgets for the SDF viewer application.
 
   - DropGLView:  GLViewWidget that accepts file drag-and-drop.
-  - SdfSlicePanel: Right-side panel showing an XY slice of the SDF grid.
+  - SdfSlicePanel: Right-side panel showing an XY SDF or fit-error slice.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -16,7 +16,8 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
 import theme
-from sdf_blowup import apply_thickness_limited_blowup
+import sdf_slice as slice_module
+from sdf_blowup import apply_thickness_relative_blowup
 from sdf_colormap import make_sdf_lut, colorize_sdf_slice
 
 
@@ -221,11 +222,11 @@ class DropGLView(gl.GLViewWidget):
             self.fileDropped.emit(path)
 
 
-# ── SDF slice panel ──────────────────────────────────────────────────────────
+# ── slice panel ──────────────────────────────────────────────────────────────
 
 class SdfSlicePanel(QtWidgets.QWidget):
     """
-    Panel that displays an XY slice through a 3-D SDF grid.
+    Panel that displays an XY SDF or color-coded fit-error slice.
 
     Signals:
         computeRequested(int)  – emitted when the user clicks Compute.
@@ -239,7 +240,8 @@ class SdfSlicePanel(QtWidgets.QWidget):
         self._lut = make_sdf_lut()
         self._sdf_grid: Optional[np.ndarray] = None
         self._blowup_thickness: Optional[np.ndarray] = None
-        self._sdf_blowup_vox: float = 0.0
+        self._blowup_thickness_max: float = 0.0
+        self._sdf_blowup_fraction: float = 0.0
         self._raw_sdf_depth: float = 1.0e-4
         self._sdf_origin = np.zeros(3, dtype=np.float32)
         self._dx: float = 1.0                 # voxel size (for the exterior band)
@@ -247,6 +249,9 @@ class SdfSlicePanel(QtWidgets.QWidget):
         self._sparse_values: Optional[np.ndarray] = None
         self._sparse_scatter: Optional[pg.ScatterPlotItem] = None
         self._max_sparse_points_per_slice = 20_000
+        self._error_source_provider: Optional[
+            Callable[[], tuple[np.ndarray, np.ndarray, np.ndarray] | None]
+        ] = None
         # Default grid resolution.  The host lowers this (→ 64) when no CUDA GPU
         # is present, since the n³ SDF runs on the CPU there and 512³ is far too
         # heavy.  Not persisted, so it is re-applied per session.
@@ -272,6 +277,7 @@ class SdfSlicePanel(QtWidgets.QWidget):
             -float(np.min(self._sdf_grid)), 1.0e-4)
         if blowup_thickness is None:
             self._blowup_thickness = None
+            self._blowup_thickness_max = 0.0
         else:
             local_thickness = np.asarray(
                 blowup_thickness, dtype=np.float32)
@@ -281,6 +287,9 @@ class SdfSlicePanel(QtWidgets.QWidget):
             # Keep the SdfResult-owned array by reference; copying a 512³
             # carrier just for the 2-D panel would waste hundreds of MiB.
             self._blowup_thickness = local_thickness
+            self._blowup_thickness_max = (
+                float(np.max(local_thickness))
+                if local_thickness.size else 0.0)
         if dx is not None:
             self._dx = max(float(dx), 1e-9)
         if origin is not None:
@@ -294,15 +303,18 @@ class SdfSlicePanel(QtWidgets.QWidget):
         self.slider_z.setSingleStep(1)
         self.slider_z.setPageStep(max(1, n // 32))
         self.slider_z.blockSignals(False)
+        self._slice_play_button.setEnabled(n > 1)
+        if n <= 1:
+            self._stop_slice_animation()
 
         self._update_slice()
 
-    def set_sdf_blowup(self, voxels: float) -> None:
-        """Set the requested maximum offset and redraw only the visible slice."""
-        requested = float(voxels)
-        if requested == self._sdf_blowup_vox:
+    def set_sdf_blowup(self, thickness_fraction: float) -> None:
+        """Set the signed local-thickness fraction and redraw the slice."""
+        requested = float(thickness_fraction)
+        if requested == self._sdf_blowup_fraction:
             return
-        self._sdf_blowup_vox = requested
+        self._sdf_blowup_fraction = requested
         self._update_slice()
 
     def set_blowup_thickness(
@@ -316,6 +328,7 @@ class SdfSlicePanel(QtWidgets.QWidget):
             return
         if blowup_thickness is None:
             self._blowup_thickness = None
+            self._blowup_thickness_max = 0.0
         else:
             local_thickness = np.asarray(
                 blowup_thickness, dtype=np.float32)
@@ -324,6 +337,9 @@ class SdfSlicePanel(QtWidgets.QWidget):
                 raise ValueError(
                     "blowup_thickness must have the same shape as grid")
             self._blowup_thickness = local_thickness
+            self._blowup_thickness_max = (
+                float(np.max(local_thickness))
+                if local_thickness.size else 0.0)
         if update:
             self._update_slice()
 
@@ -352,6 +368,24 @@ class SdfSlicePanel(QtWidgets.QWidget):
     def requested_n(self) -> int:
         return int(self.spin_n.value())
 
+    def set_error_source_provider(
+        self,
+        provider: Callable[
+            [], tuple[np.ndarray, np.ndarray, np.ndarray] | None
+        ] | None,
+    ) -> None:
+        """Supply the latest fitted ellipsoids without duplicating their state."""
+        self._error_source_provider = provider
+        self.refresh_error_slice()
+
+    def refresh_error_slice(self) -> None:
+        """Refresh only when the visible mode depends on fitted ellipsoids."""
+        if self.slice_mode() == "error":
+            self._update_slice()
+
+    def slice_mode(self) -> str:
+        return str(self._combo_slice_mode.currentData())
+
     # ── internal ──────────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -359,7 +393,7 @@ class SdfSlicePanel(QtWidgets.QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        title = QtWidgets.QLabel("SDF XY Slice")
+        title = QtWidgets.QLabel("Slice")
         # Inherit the theme's text colour (palette) so the heading stays legible
         # in dark mode — a bare stylesheet without a colour falls back to black.
         title.setStyleSheet(
@@ -380,6 +414,22 @@ class SdfSlicePanel(QtWidgets.QWidget):
 
         form.addRow("Grid n:", self.spin_n)
         form.addRow("", self.btn_compute)
+
+        self._combo_slice_mode = QtWidgets.QComboBox()
+        self._combo_slice_mode.addItem("SDF", "sdf")
+        self._combo_slice_mode.addItem(
+            "Error (Color Coded)", "error")
+        self._combo_slice_mode.setToolTip(
+            "SDF shows the mesh distance field. Error compares the fitted\n"
+            "ellipsoids with the mesh using a color-coded difference map.")
+        self._combo_slice_mode.currentIndexChanged.connect(
+            self._on_slice_mode_changed)
+        form.addRow("Mode:", self._combo_slice_mode)
+
+        self._slice_mode_hint = QtWidgets.QLabel()
+        self._slice_mode_hint.setWordWrap(True)
+        self._slice_mode_hint.setVisible(False)
+        form.addRow("", self._slice_mode_hint)
         layout.addLayout(form)
 
         # Image view
@@ -412,17 +462,85 @@ class SdfSlicePanel(QtWidgets.QWidget):
         except Exception:
             self.img_xy.addItem(self._sparse_scatter)
 
-        # Z slider
+        # Playback + Z slider
+        slice_navigation = QtWidgets.QHBoxLayout()
+        slice_navigation.setContentsMargins(0, 0, 0, 0)
+        slice_navigation.setSpacing(6)
+
+        self._slice_play_button = QtWidgets.QToolButton()
+        self._slice_play_button.setObjectName("SlicePanelPlayButton")
+        self._slice_play_button.setAutoRaise(True)
+        self._slice_play_button.setIconSize(QtCore.QSize(18, 18))
+        self._slice_play_button.setFixedSize(28, 28)
+        self._slice_play_button.clicked.connect(self._toggle_slice_animation)
+        self._slice_play_button.setEnabled(False)
+        slice_navigation.addWidget(self._slice_play_button)
+
         self.slider_z = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.slider_z.setRange(0, 127)
         self.slider_z.setValue(64)
         self.slider_z.valueChanged.connect(self._update_slice)
-        layout.addWidget(self.slider_z)
+        slice_navigation.addWidget(self.slider_z, 1)
+        layout.addLayout(slice_navigation)
+
+        self._slice_animation_timer = QtCore.QTimer(self)
+        self._slice_animation_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self._slice_animation_timer.setInterval(33)  # smooth ~30 FPS playback
+        self._slice_animation_timer.timeout.connect(
+            self._advance_slice_animation)
+        self._update_slice_play_button()
 
         self.apply_theme()
 
+    def _on_slice_mode_changed(self, _index: int) -> None:
+        self._update_slice()
+
+    def _toggle_slice_animation(self) -> None:
+        if self._slice_animation_timer.isActive():
+            self._stop_slice_animation()
+            return
+        if self.slider_z.maximum() <= self.slider_z.minimum():
+            return
+        if self.slider_z.value() >= self.slider_z.maximum():
+            self.slider_z.setValue(self.slider_z.minimum())
+        self._slice_animation_timer.start()
+        self._update_slice_play_button()
+
+    def _stop_slice_animation(self) -> None:
+        self._slice_animation_timer.stop()
+        self._update_slice_play_button()
+
+    def _advance_slice_animation(self) -> None:
+        minimum = self.slider_z.minimum()
+        maximum = self.slider_z.maximum()
+        if maximum <= minimum:
+            self._stop_slice_animation()
+            return
+        value = self.slider_z.value() + 1
+        if value > maximum:
+            value = minimum
+        self.slider_z.setValue(value)
+
+    def _update_slice_play_button(self) -> None:
+        playing = self._slice_animation_timer.isActive()
+        icon = (
+            QtWidgets.QStyle.StandardPixmap.SP_MediaPause
+            if playing
+            else QtWidgets.QStyle.StandardPixmap.SP_MediaPlay
+        )
+        self._slice_play_button.setIcon(
+            self._slice_play_button.style().standardIcon(icon))
+        self._slice_play_button.setToolTip(
+            "Pause slice animation" if playing else "Play slice animation")
+        self._slice_play_button.setAccessibleName(
+            "Pause slice animation" if playing else "Play slice animation")
+
+    def hideEvent(self, event) -> None:
+        self._stop_slice_animation()
+        super().hideEvent(event)
+
     def apply_theme(self):
-        """Recolour the SDF slice for the current theme.
+        """Recolour the current slice for the current theme.
 
         Rebuilds the colormap LUT (its dark/light extreme and brand colours
         follow the theme) and re-renders; the slice is pre-coloured into an RGBA
@@ -434,6 +552,7 @@ class SdfSlicePanel(QtWidgets.QWidget):
 
     def _update_slice(self):
         if self._sdf_grid is None:
+            self._set_slice_mode_hint("")
             return
         n = self._sdf_grid.shape[0]
         iz = max(0, min(n - 1, int(self.slider_z.value())))
@@ -442,28 +561,53 @@ class SdfSlicePanel(QtWidgets.QWidget):
             None if self._blowup_thickness is None
             else self._blowup_thickness[iz, :, :]
         )
-        adjusted_slice = apply_thickness_limited_blowup(
+        adjusted_slice = apply_thickness_relative_blowup(
             raw_slice,
-            self._sdf_blowup_vox * float(self._dx),
+            self._sdf_blowup_fraction,
             thickness_slice,
-            float(self._dx),
         )
         slice2d = np.ascontiguousarray(adjusted_slice.T)   # [a0, a1]
 
-        # Colour exactly like the 3-D slice: interior blends surface->deepest
-        # across the whole interior (full colour only at the deepest point),
-        # exterior fades within a few voxels.  depth is per-volume (deepest
-        # interior magnitude of the WHOLE grid, so the colour scale is stable
-        # while scrolling through Z).
-        # Conservative and stable while moving the slider.  The displayed zero
-        # surface itself is exact; this value controls only colour normalization.
-        requested = self._sdf_blowup_vox * float(self._dx)
-        depth = max(
-            self._raw_sdf_depth + max(-requested, 0.0),
-            1.0e-4,
-        )
-        out_band = 3.0 * float(self._dx)
-        rgba = colorize_sdf_slice(slice2d, self._lut, depth, out_band)
+        if self.slice_mode() == "error":
+            params = (
+                None if self._error_source_provider is None
+                else self._error_source_provider()
+            )
+            if params is None or len(params[0]) == 0:
+                self._set_slice_mode_hint(
+                    "Error becomes available when fitted ellipsoids exist.")
+                rgba = np.empty(slice2d.shape + (4,), dtype=np.uint8)
+                rgba[..., :3] = np.asarray((128, 128, 138), dtype=np.uint8)
+                rgba[..., 3] = 255
+            else:
+                self._set_slice_mode_hint(
+                    f"<span style='color:{theme.BLUE_HEX}'>■</span> "
+                    "Under-coverage &nbsp; "
+                    f"<span style='color:{theme.YELLOW_HEX}'>■</span> "
+                    "Over-coverage &nbsp; "
+                    "Transparent: agreement")
+                centers, radii, rotations = params
+                width, height = slice2d.shape
+                points = slice_module.slice_points(
+                    self._sdf_origin, 2, iz, width, height,
+                    self._dx, self._dx)
+                ellipsoid_sdf = slice_module.ellipsoid_slice_sdf(
+                    centers, radii, rotations, points).reshape(width, height)
+                rgba = slice_module.slice_rgba_error(
+                    ellipsoid_sdf, slice2d, theme.BLUE, theme.YELLOW)
+        else:
+            self._set_slice_mode_hint("")
+            # Colour exactly like the 3-D slice: interior blends
+            # surface->deepest across the whole interior (full colour only at
+            # the deepest point), while the exterior fades within a few voxels.
+            requested = (
+                self._sdf_blowup_fraction * self._blowup_thickness_max)
+            depth = max(
+                self._raw_sdf_depth + max(-requested, 0.0),
+                1.0e-4,
+            )
+            out_band = 3.0 * float(self._dx)
+            rgba = colorize_sdf_slice(slice2d, self._lut, depth, out_band)
         # Pre-coloured RGBA → must be shown RAW.  ImageView otherwise applies a
         # LUT and (worse) levels=[0,1] to the uint8 image, scaling every channel
         # value >=1 up to 255 == washed-out white.  Use an identity 0..255 level
@@ -475,6 +619,10 @@ class SdfSlicePanel(QtWidgets.QWidget):
         self.img_xy.setImage(rgba, autoLevels=False, autoHistogramRange=False,
                              levels=(0, 255))
         self._update_sparse_overlay(iz)
+
+    def _set_slice_mode_hint(self, text: str) -> None:
+        self._slice_mode_hint.setText(text)
+        self._slice_mode_hint.setVisible(bool(text))
 
     def _update_sparse_overlay(self, iz: int) -> None:
         if self._sparse_scatter is None:

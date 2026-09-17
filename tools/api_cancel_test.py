@@ -101,21 +101,22 @@ class JobRegistryCancelTests(unittest.TestCase):
         job_id = "3" * 32
         registry.reserve_if_idle(job_id)
         outcome, _ = registry.request_cancel(job_id)
-        self.assertEqual(outcome, "accepted")
+        # A reservation that was never dispatched owns no worker and can be
+        # canceled immediately without a GUI acknowledgement.
+        self.assertEqual(outcome, "canceled")
         outcome, status = registry.attach_payload(job_id, CUBE)
-        self.assertEqual(outcome, "canceling")
-        self.assertEqual(status["state"], "canceling")
+        self.assertEqual(outcome, "canceled")
+        self.assertEqual(status["state"], "canceled")
         self.assertIsNone(registry.get(job_id).payload)
         self.assertFalse(registry.discard_reservation(job_id))
 
-    def test_atomic_add_respects_canceling_job(self):
+    def test_atomic_add_reopens_after_undispatched_job_is_canceled(self):
         registry = JobRegistry()
         job = registry.add_if_idle(CUBE)
         self.assertIsNotNone(job)
         self.assertIsNone(registry.add_if_idle(CUBE))
-        registry.request_cancel(job.id)
-        self.assertIsNone(registry.add_if_idle(CUBE))
-        registry.complete_cancel(job.id)
+        outcome, _ = registry.request_cancel(job.id)
+        self.assertEqual(outcome, "canceled")
         self.assertIsNotNone(registry.add_if_idle(CUBE))
 
     def test_canceling_remains_busy_and_rejects_late_completion(self):
@@ -285,16 +286,19 @@ class ApiCancelRouteTests(unittest.TestCase):
                 self.server.registry.status_dict(job_id)["state"], "queued")
             self.assertIsNone(self.server.registry.get(job_id).payload)
 
-            # Reservation itself enforces the single-fit constraint, before
-            # the first request has uploaded or parsed its body.
+            # An uploading reservation consumes bounded capacity, but does not
+            # block another complete request from using the sole dispatch slot.
             code, body = _request(f"{self.base}/fit", "POST", CUBE)
-            self.assertEqual(code, 409)
+            self.assertEqual(code, 202)
+            second_job_id = body["job_id"]
+            self.assertEqual(self.fit_events, [second_job_id])
 
             code, body = _request(
                 f"{self.base}/fit/{job_id}/cancel", "POST")
-            self.assertEqual(code, 202)
+            self.assertEqual(code, 200)
             self.assertEqual(body["job_id"], job_id)
-            self.assertEqual(self.cancel_events, [job_id])
+            self.assertEqual(body["state"], "canceled")
+            self.assertEqual(self.cancel_events, [])
 
             connection.send(raw)
             response = connection.getresponse()
@@ -305,10 +309,16 @@ class ApiCancelRouteTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(self.fit_events, [])
+        self.assertEqual(self.fit_events, [second_job_id])
         self.assertIsNone(self.server.registry.get(job_id).payload)
         self.assertEqual(
             self.server.registry.status_dict(job_id)["state"], "canceled")
+        self.assertTrue(self.server.registry.has_active())
+
+        # Clean up the independently dispatched second request.
+        code, _ = _request(
+            f"{self.base}/fit/{second_job_id}/cancel", "POST")
+        self.assertEqual(code, 202)
         self.assertFalse(self.server.registry.has_active())
 
     def test_unknown_and_finished_cancel_responses(self):
@@ -327,7 +337,7 @@ class ApiCancelRouteTests(unittest.TestCase):
         self.assertEqual(body["state"], "done")
         self.assertEqual(self.cancel_events, [])
 
-    def test_canceling_http_job_stays_busy_until_gui_acknowledges_stop(self):
+    def test_canceling_active_job_holds_dispatch_but_not_queue_admission(self):
         self.server.bridge.cancel_requested.disconnect()
         code, body = _request(f"{self.base}/fit", "POST", CUBE)
         self.assertEqual(code, 202)
@@ -342,9 +352,18 @@ class ApiCancelRouteTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertTrue(body["busy"])
         code, body = _request(f"{self.base}/fit", "POST", CUBE)
-        self.assertEqual(code, 409)
+        self.assertEqual(code, 202)
+        queued_job_id = body["job_id"]
+        self.assertEqual(body["queue_position"], 1)
+        self.assertNotIn(queued_job_id, self.fit_events)
 
         self.server.registry.complete_cancel(job_id)
+        code, body = _request(f"{self.base}/ping")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["busy"])
+        self.assertIn(queued_job_id, self.fit_events)
+
+        self.server.registry.complete_cancel(queued_job_id)
         code, body = _request(f"{self.base}/ping")
         self.assertEqual(code, 200)
         self.assertFalse(body["busy"])

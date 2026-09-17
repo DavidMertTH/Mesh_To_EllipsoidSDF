@@ -543,7 +543,7 @@ class SyntheticPoseLibraryTest(unittest.TestCase):
             r"Mathf\.Clamp\(\s*value\s*,\s*-1f\s*,\s*1f\s*\)\s*;",
         )
 
-    def test_self_intersection_guard_preserves_authored_fingers(self) -> None:
+    def test_self_intersection_guard_can_attenuate_blocked_hands(self) -> None:
         guard = _block_after(
             "void ApplyHumanPoseWithSelfIntersectionGuard(")
         restore_pattern = (
@@ -552,8 +552,8 @@ class SyntheticPoseLibraryTest(unittest.TestCase):
         )
         restores = list(re.finditer(restore_pattern, guard))
         self.assertEqual(
-            len(restores), 2,
-            "Body attenuation and its fallback must restore target fingers",
+            len(restores), 1,
+            "Only the first correction stage may preserve target fingers",
         )
 
         lerp = guard.index("Mathf.Lerp(")
@@ -562,14 +562,16 @@ class SyntheticPoseLibraryTest(unittest.TestCase):
         self.assertGreater(restores[0].start(), lerp)
         self.assertLess(restores[0].end(), loop_set_pose)
 
+        hand_stage = guard.index(
+            "the collision can be caused by the palm/fingers themselves")
+        self.assertLess(restores[0].end(), hand_stage)
+        self.assertNotIn("RestoreFingerChannels(", guard[hand_stage:])
+
         fallback_start = min(
             guard.index("Array.Copy("),
             guard.index("Array.Clear("),
         )
-        fallback_set_pose = guard.index(
-            "_humanPoseHandler.SetHumanPose(ref pose);", loop_set_pose + 1)
-        self.assertGreater(restores[1].start(), fallback_start)
-        self.assertLess(restores[1].end(), fallback_set_pose)
+        self.assertGreater(fallback_start, hand_stage)
 
         desired_snapshot = guard.index(
             "float[] desired = (float[])pose.muscles.Clone();")
@@ -595,6 +597,34 @@ class SyntheticPoseLibraryTest(unittest.TestCase):
         self.assertIn("muscles[index] = desired[index];", restore)
         self.assertNotIn("SetMuscleAbsolute", restore)
         self.assertNotIn("SetMuscleOffset", restore)
+
+    def test_hand_collision_guard_samples_the_complete_hand_shape(self) -> None:
+        collision = _block_after("bool HasLikelySelfIntersection()")
+        for call in (
+            "BuildHandCollisionSamples(",
+            "HandShapesTooClose(",
+            "HandShapeNearSphere(",
+            "HandShapeNearSegment(",
+            "HandShapeNearTransformSegment(",
+        ):
+            self.assertIn(call, collision)
+        self.assertIn("handCollisionClearanceMultiplier", collision)
+
+        samples = _block_after("void BuildHandCollisionSamples(")
+        for side in ("Left", "Right"):
+            for finger in ("Thumb", "Index", "Middle", "Ring", "Little"):
+                self.assertIn(
+                    f"HumanBodyBones.{side}{finger}Distal", samples)
+        digit = _block_after("static void AppendHandDigitCollisionSamples(")
+        self.assertIn("tip += finalSegment * 0.65f;", digit)
+
+    def test_animation_poses_use_the_same_self_collision_guard(self) -> None:
+        animation = _block_after("bool ApplyAnimationFrame(")
+        self.assertIn(
+            "ApplyHumanPoseWithSelfIntersectionGuard(\n"
+            "                    PosePreset.None, ref pose);",
+            animation,
+        )
 
     def test_flags_are_unique_and_all_presets_are_selected(self) -> None:
         bits = _enum_bits()

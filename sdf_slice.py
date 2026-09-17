@@ -1,6 +1,6 @@
 """
-sdf_slice.py — planar slices through a 3-D SDF volume for the movable
-texture plane in the 3-D viewport.
+sdf_slice.py — planar SDF and fit-error slices for the 2-D Slice panel and the
+movable texture plane in the 3-D viewport.
 
 The slice plane is perpendicular to one world axis ("normal").  Plane labels map
 to that normal axis:  XY → z,  XZ → y,  YZ → x.  A 2-D slice is turned into an
@@ -144,6 +144,40 @@ def slice_rgba_diff(diff: np.ndarray, primary_rgb, secondary_rgb,
     rgba = np.empty(diff.shape + (4,), dtype=np.ubyte)
     rgba[..., :3] = np.clip(rgb, 0, 255).astype(np.ubyte)
     rgba[..., 3] = 255                                      # opaque ramp
+    return np.ascontiguousarray(rgba)
+
+
+def slice_rgba_error(ellipsoid_sdf: np.ndarray, mesh_sdf: np.ndarray,
+                     under_rgb, over_rgb) -> np.ndarray:
+    """Transparent, color-coded coverage error between two SDF slices.
+
+    Only the symmetric difference of the two interiors is an actual coverage
+    error. Mesh-inside/fit-outside pixels are under-coverage; fit-inside/
+    mesh-outside pixels are over-coverage. Agreement and the far field stay
+    transparent instead of filling the complete slice plane with irrelevant
+    signed-distance differences.
+    """
+    ell = np.asarray(ellipsoid_sdf, dtype=np.float32)
+    mesh = np.asarray(mesh_sdf, dtype=np.float32)
+    if ell.shape != mesh.shape:
+        raise ValueError("ellipsoid and mesh SDF slices must have equal shape")
+
+    under = (mesh < 0.0) & (ell >= 0.0)
+    over = (ell < 0.0) & (mesh >= 0.0)
+    mismatch = under | over
+    rgba = np.zeros(ell.shape + (4,), dtype=np.uint8)
+    if not np.any(mismatch):
+        return np.ascontiguousarray(rgba)
+
+    error = np.abs(ell - mesh)
+    scale = max(float(np.max(error[mismatch])), 1.0e-4)
+    strength = np.sqrt(np.clip(error / scale, 0.0, 1.0))
+    under_color = np.asarray(under_rgb, dtype=np.uint8)[:3]
+    over_color = np.asarray(over_rgb, dtype=np.uint8)[:3]
+    rgba[under, :3] = under_color
+    rgba[over, :3] = over_color
+    rgba[..., 3][mismatch] = np.clip(
+        96.0 + 159.0 * strength[mismatch], 0.0, 255.0).astype(np.uint8)
     return np.ascontiguousarray(rgba)
 
 
@@ -341,38 +375,24 @@ def _grid_field_kernel(
 
 
 @wp.func
-def _thickness_limited_grid_value(
+def _thickness_relative_grid_value(
     value: wp.float32,
     thickness: wp.float32,
-    requested_offset: wp.float32,
-    dx: wp.float32,
-    max_thickness_fraction: wp.float32,
+    thickness_fraction: wp.float32,
 ) -> wp.float32:
-    effective = requested_offset
+    effective = 0.0
     if thickness > 0.0:
-        direction = 1.0
-        if requested_offset < 0.0:
-            direction = -1.0
-        effective = direction * wp.min(
-            wp.abs(requested_offset),
-            max_thickness_fraction * thickness,
-        )
-    else:
-        # Missing thickness can be an unresolved thin feature.  Keep it
-        # unchanged everywhere; a large negative offset must not pull a
-        # distant unresolved sample into a false exterior surface band.
-        effective = 0.0
+        effective = thickness_fraction * thickness
     return value + effective
 
 
 @wp.kernel
-def _adaptive_grid_field_kernel(
+def _relative_grid_field_kernel(
     grid: wp.array(dtype=wp.float32),
     thickness: wp.array(dtype=wp.float32),
     gorigin: wp.vec3, dx: float, nx: int, ny: int, nz: int,
     p0: wp.vec3, step0: wp.vec3, step1: wp.vec3, H: int,
-    offset: float,
-    max_thickness_fraction: float,
+    thickness_fraction: float,
     out: wp.array(dtype=wp.float32),
 ):
     # Apply the cap independently at all eight grid corners before trilinear
@@ -393,29 +413,23 @@ def _adaptive_grid_field_kernel(
     nynx = ny * nx
     b = iz0 * nynx + iy0 * nx + ix0
 
-    v000 = _thickness_limited_grid_value(
-        grid[b], thickness[b], offset, dx, max_thickness_fraction)
-    v100 = _thickness_limited_grid_value(
-        grid[b + 1], thickness[b + 1], offset, dx,
-        max_thickness_fraction)
-    v010 = _thickness_limited_grid_value(
-        grid[b + nx], thickness[b + nx], offset, dx,
-        max_thickness_fraction)
-    v110 = _thickness_limited_grid_value(
-        grid[b + nx + 1], thickness[b + nx + 1], offset, dx,
-        max_thickness_fraction)
-    v001 = _thickness_limited_grid_value(
-        grid[b + nynx], thickness[b + nynx], offset, dx,
-        max_thickness_fraction)
-    v101 = _thickness_limited_grid_value(
-        grid[b + nynx + 1], thickness[b + nynx + 1], offset, dx,
-        max_thickness_fraction)
-    v011 = _thickness_limited_grid_value(
-        grid[b + nynx + nx], thickness[b + nynx + nx], offset, dx,
-        max_thickness_fraction)
-    v111 = _thickness_limited_grid_value(
+    v000 = _thickness_relative_grid_value(
+        grid[b], thickness[b], thickness_fraction)
+    v100 = _thickness_relative_grid_value(
+        grid[b + 1], thickness[b + 1], thickness_fraction)
+    v010 = _thickness_relative_grid_value(
+        grid[b + nx], thickness[b + nx], thickness_fraction)
+    v110 = _thickness_relative_grid_value(
+        grid[b + nx + 1], thickness[b + nx + 1], thickness_fraction)
+    v001 = _thickness_relative_grid_value(
+        grid[b + nynx], thickness[b + nynx], thickness_fraction)
+    v101 = _thickness_relative_grid_value(
+        grid[b + nynx + 1], thickness[b + nynx + 1], thickness_fraction)
+    v011 = _thickness_relative_grid_value(
+        grid[b + nynx + nx], thickness[b + nynx + nx], thickness_fraction)
+    v111 = _thickness_relative_grid_value(
         grid[b + nynx + nx + 1], thickness[b + nynx + nx + 1],
-        offset, dx, max_thickness_fraction)
+        thickness_fraction)
     c00 = v000 * (1.0 - fx) + v100 * fx
     c10 = v010 * (1.0 - fx) + v110 * fx
     c01 = v001 * (1.0 - fx) + v101 * fx
@@ -466,7 +480,10 @@ def _maxabs_diff_kernel(
     out_max: wp.array(dtype=wp.float32),
 ):
     tid = wp.tid()
-    wp.atomic_max(out_max, 0, wp.abs(ell[tid] - mesh[tid]))
+    ell_inside = ell[tid] < 0.0
+    mesh_inside = mesh[tid] < 0.0
+    if ell_inside != mesh_inside:
+        wp.atomic_max(out_max, 0, wp.abs(ell[tid] - mesh[tid]))
 
 
 @wp.kernel
@@ -475,19 +492,26 @@ def _color_diff_kernel(
     scale: float, prim: wp.vec3, sec: wp.vec3, mid: wp.vec3,
     rgba: wp.array(dtype=wp.uint8),
 ):
-    # Opaque diverging ramp secondary <- mid -> primary == slice_rgba_diff.
+    # Transparent agreement; primary=under-coverage, secondary=over-coverage.
     tid = wp.tid()
-    v = wp.clamp((ell[tid] - mesh[tid]) / scale, -1.0, 1.0)
-    mag = wp.abs(v)
-    if v >= 0.0:
-        col = mid * (1.0 - mag) + prim * mag
-    else:
-        col = mid * (1.0 - mag) + sec * mag
     o = tid * 4
-    rgba[o + 0] = wp.uint8(wp.clamp(col[0], 0.0, 255.0))
-    rgba[o + 1] = wp.uint8(wp.clamp(col[1], 0.0, 255.0))
-    rgba[o + 2] = wp.uint8(wp.clamp(col[2], 0.0, 255.0))
-    rgba[o + 3] = wp.uint8(255)
+    ell_inside = ell[tid] < 0.0
+    mesh_inside = mesh[tid] < 0.0
+    if ell_inside == mesh_inside:
+        rgba[o + 0] = wp.uint8(0)
+        rgba[o + 1] = wp.uint8(0)
+        rgba[o + 2] = wp.uint8(0)
+        rgba[o + 3] = wp.uint8(0)
+    else:
+        col = prim
+        if ell_inside:
+            col = sec
+        mag = wp.sqrt(wp.clamp(
+            wp.abs(ell[tid] - mesh[tid]) / scale, 0.0, 1.0))
+        rgba[o + 0] = wp.uint8(wp.clamp(col[0], 0.0, 255.0))
+        rgba[o + 1] = wp.uint8(wp.clamp(col[1], 0.0, 255.0))
+        rgba[o + 2] = wp.uint8(wp.clamp(col[2], 0.0, 255.0))
+        rgba[o + 3] = wp.uint8(96.0 + 159.0 * mag)
 
 
 def _plane_basis(origin, normal_idx, k, px, dx):
@@ -551,13 +575,12 @@ def render_ellipsoid(centers, radii, rotations, origin, normal_idx, k, W, H,
 
 
 def render_mesh(grid_wp, gorigin, dx, nx, ny, nz, origin, normal_idx, k, W, H,
-                px, lut_wp, n_lut, depth, out_band, offset=0.0,
-                gamma=SLICE_INTERIOR_GAMMA, thickness_wp=None,
-                max_thickness_fraction=0.25):
+                px, lut_wp, n_lut, depth, out_band, thickness_fraction=0.0,
+                gamma=SLICE_INTERIOR_GAMMA, thickness_wp=None):
     """GPU-render the (trilinearly interpolated) mesh slice → uint8 RGBA.
 
-    ``offset`` is the requested SDF blowup.  With ``thickness_wp`` its magnitude
-    is capped per voxel by ``max_thickness_fraction`` of local feature thickness.
+    ``thickness_fraction`` offsets every resolved sample by that signed share
+    of its local feature diameter.  Missing thickness stays unchanged.
     """
     dev = best_device()
     M = int(W) * int(H)
@@ -570,14 +593,14 @@ def render_mesh(grid_wp, gorigin, dx, nx, ny, nz, origin, normal_idx, k, W, H,
     if thickness_wp is None:
         wp.launch(
             _grid_field_kernel, dim=M,
-            inputs=[grid_wp, *common, float(offset), field],
+            inputs=[grid_wp, *common, 0.0, field],
             device=dev)
     else:
         wp.launch(
-            _adaptive_grid_field_kernel, dim=M,
+            _relative_grid_field_kernel, dim=M,
             inputs=[
-                grid_wp, thickness_wp, *common, float(offset),
-                float(max_thickness_fraction), field,
+                grid_wp, thickness_wp, *common,
+                float(thickness_fraction), field,
             ],
             device=dev)
     rgba = wp.empty(M * 4, dtype=wp.uint8, device=dev)
@@ -590,12 +613,12 @@ def render_mesh(grid_wp, gorigin, dx, nx, ny, nz, origin, normal_idx, k, W, H,
 
 def render_diff(centers, radii, rotations, grid_wp, gorigin, dx, nx, ny, nz,
                 origin, normal_idx, k, W, H, px, primary_rgb, secondary_rgb,
-                mid_rgb=(128, 128, 138), offset=0.0, thickness_wp=None,
-                max_thickness_fraction=0.25):
-    """GPU-render ellipsoid−mesh on a diverging two-colour ramp → uint8 RGBA.
+                mid_rgb=(128, 128, 138), thickness_fraction=0.0,
+                thickness_wp=None):
+    """GPU-render transparent, color-coded fit coverage error → uint8 RGBA.
 
-    ``offset`` is added to the mesh SDF.  With ``thickness_wp`` the same local
-    thickness cap used by the fitting target is applied before interpolation.
+    ``thickness_fraction`` applies the same local-diameter-relative transform
+    used by the fitting target before interpolation.
     """
     dev = best_device()
     n_e = int(np.asarray(centers).shape[0])
@@ -619,14 +642,14 @@ def render_diff(centers, radii, rotations, grid_wp, gorigin, dx, nx, ny, nz,
     if thickness_wp is None:
         wp.launch(
             _grid_field_kernel, dim=M,
-            inputs=[grid_wp, *common, float(offset), mesh],
+            inputs=[grid_wp, *common, 0.0, mesh],
             device=dev)
     else:
         wp.launch(
-            _adaptive_grid_field_kernel, dim=M,
+            _relative_grid_field_kernel, dim=M,
             inputs=[
-                grid_wp, thickness_wp, *common, float(offset),
-                float(max_thickness_fraction), mesh,
+                grid_wp, thickness_wp, *common,
+                float(thickness_fraction), mesh,
             ],
             device=dev)
     mx = wp.zeros(1, dtype=wp.float32, device=dev)

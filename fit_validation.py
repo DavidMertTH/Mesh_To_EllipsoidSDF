@@ -13,7 +13,7 @@ from typing import Mapping
 
 import numpy as np
 
-from sdf_samples import SdfSampleSet
+from sdf_samples import SdfSampleSet, sdf_grid_normals
 
 
 __all__ = [
@@ -56,6 +56,7 @@ class ValidationSample:
     thickness: np.ndarray | None = None
     thickness_reference: float | None = None
     coarse_mask: np.ndarray | None = None
+    normals: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         points = np.ascontiguousarray(self.points, dtype=np.float32).reshape(-1, 3)
@@ -86,6 +87,14 @@ class ValidationSample:
             if coarse.size != size:
                 raise ValueError("validation coarse-mask/value count mismatch")
 
+        normals = self.normals
+        if normals is not None:
+            normals = np.ascontiguousarray(normals, dtype=np.float32).reshape(-1, 3)
+            if normals.shape[0] != size:
+                raise ValueError("validation normal/value count mismatch")
+            if not np.isfinite(normals).all():
+                raise ValueError("validation normals must be finite")
+
         reference = self.thickness_reference
         if reference is not None:
             reference = float(reference)
@@ -101,6 +110,7 @@ class ValidationSample:
         object.__setattr__(self, "dx", float(self.dx))
         object.__setattr__(self, "thickness", None if thickness is None else thickness.copy())
         object.__setattr__(self, "coarse_mask", None if coarse is None else coarse.copy())
+        object.__setattr__(self, "normals", None if normals is None else normals.copy())
         object.__setattr__(self, "thickness_reference", reference)
 
     @property
@@ -243,6 +253,7 @@ def stratified_validation_from_grid(
     surface_band: float | None = None,
     surface_fraction: float = 0.5,
     seed: int = 0,
+    include_normals: bool = True,
 ) -> ValidationSample:
     """Build a reproducible surface/inside/outside sample from a dense grid.
 
@@ -281,6 +292,9 @@ def stratified_validation_from_grid(
         base[2] + (iz.astype(np.float32) + 0.5) * spacing,
     )).astype(np.float32)
     flat_thick = None if thick is None else thick.reshape(-1)
+    flat_normals = (
+        sdf_grid_normals(values, spacing).reshape(-1, 3)
+        if include_normals else None)
     return ValidationSample(
         points=points,
         values=values.reshape(-1)[indices],
@@ -289,6 +303,7 @@ def stratified_validation_from_grid(
         dx=spacing,
         thickness=None if flat_thick is None else flat_thick[indices],
         thickness_reference=_positive_thickness_median(flat_thick),
+        normals=None if flat_normals is None else flat_normals[indices],
     )
 
 
@@ -300,6 +315,7 @@ def stratified_validation_from_samples(
     surface_fraction: float = 0.5,
     coarse_fraction: float = 0.2,
     seed: int = 0,
+    include_normals: bool = True,
 ) -> ValidationSample:
     """Build a reproducible validation subset from ``SdfSampleSet``.
 
@@ -334,18 +350,21 @@ def stratified_validation_from_samples(
         thickness_reference=_positive_thickness_median(samples.thickness),
         coarse_mask=(None if samples.coarse_mask is None
                      else samples.coarse_mask[indices]),
+        normals=(None if not include_normals or samples.normals is None
+                 else samples.normals[indices]),
     )
 
 
 @dataclass(frozen=True)
 class ValidationLoss:
-    """Mean loss and its additive, already-weighted components."""
+    """Mean loss and its additive, already-weighted SDF/normal components."""
 
     total: float
     reconstruction: float
     miss: float
     outside: float
     coarse_far_field: float
+    normal: float
     mean_weight: float
     sample_count: int
 
@@ -364,6 +383,7 @@ def evaluate_validation_loss(
     prediction: np.ndarray,
     sample: ValidationSample,
     *,
+    prediction_normals: np.ndarray | None = None,
     huber_delta: float,
     clamp_limit: float = 0.1,
     miss_weight: float = 3.0,
@@ -375,8 +395,10 @@ def evaluate_validation_loss(
     thickness_reference: float | None = None,
     coarse_far_weight: float = 0.15,
     coarse_huber_delta: float | None = None,
+    normal_weight: float = 0.0,
+    normal_band: float | None = None,
 ) -> ValidationLoss:
-    """Evaluate the production SDF loss using NumPy.
+    """Evaluate the production SDF plus optional surface-normal loss using NumPy.
 
     The base term applies classic Huber to the difference of soft-clamped SDFs.
     ``huber_delta`` is intentionally mandatory; production normally passes
@@ -407,6 +429,7 @@ def evaluate_validation_loss(
         "thin_weight": float(thin_weight),
         "thin_max_factor": float(thin_max_factor),
         "coarse_far_weight": float(coarse_far_weight),
+        "normal_weight": float(normal_weight),
     }
     if not all(np.isfinite(value) for value in scalar_values.values()):
         raise ValueError("loss parameters must be finite")
@@ -414,7 +437,7 @@ def evaluate_validation_loss(
         raise ValueError("Huber deltas, clamp limit and surface sigma must be positive")
     if any(scalar_values[name] < 0.0 for name in (
             "miss_weight", "surface_weight", "outside_weight",
-            "thin_weight", "coarse_far_weight")):
+            "thin_weight", "coarse_far_weight", "normal_weight")):
         raise ValueError("loss weights must be non-negative")
     if float(thin_max_factor) < 1.0:
         raise ValueError("thin_max_factor must be at least one")
@@ -423,6 +446,7 @@ def evaluate_validation_loss(
         return ValidationLoss(
             total=float("inf"), reconstruction=float("inf"), miss=float("inf"),
             outside=float("inf"), coarse_far_field=float("inf"),
+            normal=float("inf"),
             mean_weight=float("inf"), sample_count=sample.size)
 
     target = sample.values.astype(np.float64, copy=False)
@@ -469,16 +493,53 @@ def evaluate_validation_loss(
         coarse_values[coarse] = float(coarse_far_weight) * _huber_slope_one(
             coarse_error, coarse_delta)
 
+    normal_values = np.zeros_like(target)
+    if (float(normal_weight) > 0.0 and sample.normals is not None
+            and prediction_normals is not None):
+        pred_normals = np.asarray(prediction_normals, dtype=np.float64).reshape(-1, 3)
+        if pred_normals.shape[0] != sample.size:
+            raise ValueError("prediction-normal/validation sample count mismatch")
+        if not np.isfinite(pred_normals).all():
+            return ValidationLoss(
+                total=float("inf"), reconstruction=float("inf"), miss=float("inf"),
+                outside=float("inf"), coarse_far_field=float("inf"),
+                normal=float("inf"), mean_weight=float("inf"),
+                sample_count=sample.size)
+        target_normals = sample.normals.astype(np.float64, copy=False)
+        pred_lengths = np.linalg.norm(pred_normals, axis=1)
+        target_lengths = np.linalg.norm(target_normals, axis=1)
+        band_width = (2.0 * sample.dx if normal_band is None
+                      else float(normal_band))
+        if not np.isfinite(band_width) or band_width <= 0.0:
+            raise ValueError("normal_band must be finite and positive")
+        valid = (
+            (np.abs(target) <= band_width)
+            & (pred_lengths > 1.0e-8)
+            & (target_lengths > 1.0e-8)
+        )
+        if np.any(valid):
+            cosine = np.einsum(
+                "ij,ij->i",
+                pred_normals[valid] / pred_lengths[valid, None],
+                target_normals[valid] / target_lengths[valid, None],
+            )
+            normal_values[valid] = (
+                float(normal_weight) * float(sample.dx)
+                * (1.0 - np.clip(cosine, -1.0, 1.0))
+            )
+
     reconstruction = float(np.mean(reconstruction_values))
     miss = float(np.mean(miss_values))
     outside = float(np.mean(outside_values))
     coarse_far = float(np.mean(coarse_values))
+    normal = float(np.mean(normal_values))
     return ValidationLoss(
-        total=reconstruction + miss + outside + coarse_far,
+        total=reconstruction + miss + outside + coarse_far + normal,
         reconstruction=reconstruction,
         miss=miss,
         outside=outside,
         coarse_far_field=coarse_far,
+        normal=normal,
         mean_weight=float(np.mean(weights)),
         sample_count=sample.size,
     )

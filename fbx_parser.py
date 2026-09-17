@@ -6,7 +6,7 @@ Extracts only what we need:
   - Skeleton hierarchy (bone names, transforms, parent-child)
   - Skin weights (vertex → bone assignments + weights)
   - Animation keyframes (bone transforms over time)
-  - Mesh geometry reference IDs (actual mesh loaded via trimesh)
+  - Mesh geometry in the same FBX world space as the skeleton bind pose
 
 Supports FBX versions 7100–7700 (covers Blender, Maya, Mixamo exports).
 
@@ -266,6 +266,10 @@ class FbxMeshData:
     """Mesh geometry extracted from FBX."""
     vertices: np.ndarray    # (V, 3) float32
     faces: np.ndarray       # (F, 3) int32 — triangulated
+    geometry_to_world: np.ndarray = field(
+        default_factory=lambda: np.eye(4, dtype=np.float64),
+    )
+    model_fbx_id: int = 0
 
 
 @dataclass
@@ -276,6 +280,256 @@ class FbxRigData:
     anim_curves: List[FbxAnimCurve]
     num_mesh_vertices: int
     mesh: Optional[FbxMeshData] = None
+
+
+_FBX_ROTATION_ORDERS = ("XYZ", "XZY", "YZX", "YXZ", "ZXY", "ZYX")
+
+
+def _translation_matrix(value: np.ndarray) -> np.ndarray:
+    out = np.eye(4, dtype=np.float64)
+    out[:3, 3] = np.asarray(value, dtype=np.float64).reshape(3)
+    return out
+
+
+def _scale_matrix(value: np.ndarray) -> np.ndarray:
+    out = np.eye(4, dtype=np.float64)
+    out[0, 0], out[1, 1], out[2, 2] = (
+        np.asarray(value, dtype=np.float64).reshape(3)
+    )
+    return out
+
+
+def _model_vec3_property(
+    model: FbxNode,
+    name: str,
+    default: tuple[float, float, float],
+) -> np.ndarray:
+    prop = model.find_property_node(name)
+    if prop is None:
+        return np.asarray(default, dtype=np.float64)
+    return np.asarray([
+        prop.prop_value(4, default[0]),
+        prop.prop_value(5, default[1]),
+        prop.prop_value(6, default[2]),
+    ], dtype=np.float64)
+
+
+def _model_int_property(model: FbxNode, name: str, default: int) -> int:
+    prop = model.find_property_node(name)
+    if prop is None:
+        return int(default)
+    try:
+        return int(prop.prop_value(4, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _euler_to_matrix_ordered(
+    euler_deg: np.ndarray,
+    order_index: int = 0,
+) -> np.ndarray:
+    """Return an FBX Euler rotation as a homogeneous column-vector matrix."""
+    order = (
+        _FBX_ROTATION_ORDERS[order_index]
+        if 0 <= int(order_index) < len(_FBX_ROTATION_ORDERS)
+        else "XYZ"
+    )
+    radians = np.radians(np.asarray(euler_deg, dtype=np.float64).reshape(3))
+    cx, sx = np.cos(radians[0]), np.sin(radians[0])
+    cy, sy = np.cos(radians[1]), np.sin(radians[1])
+    cz, sz = np.cos(radians[2]), np.sin(radians[2])
+    rotations = {
+        "X": np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, cx, -sx],
+            [0.0, sx, cx],
+        ], dtype=np.float64),
+        "Y": np.array([
+            [cy, 0.0, sy],
+            [0.0, 1.0, 0.0],
+            [-sy, 0.0, cy],
+        ], dtype=np.float64),
+        "Z": np.array([
+            [cz, -sz, 0.0],
+            [sz, cz, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64),
+    }
+    rotation = np.eye(3, dtype=np.float64)
+    for axis in order:
+        # FBX's XYZ order applies X, then Y, then Z to a point. With column
+        # vectors that is Rz @ Ry @ Rx, hence each new axis pre-multiplies.
+        rotation = rotations[axis] @ rotation
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = rotation
+    return out
+
+
+def _model_local_transform(model: FbxNode) -> np.ndarray:
+    """Evaluate the FBX node-local transform including pivots and pre/post R."""
+    translation = _model_vec3_property(
+        model, "Lcl Translation", (0.0, 0.0, 0.0))
+    rotation = _model_vec3_property(
+        model, "Lcl Rotation", (0.0, 0.0, 0.0))
+    scaling = _model_vec3_property(
+        model, "Lcl Scaling", (1.0, 1.0, 1.0))
+    rotation_offset = _model_vec3_property(
+        model, "RotationOffset", (0.0, 0.0, 0.0))
+    rotation_pivot = _model_vec3_property(
+        model, "RotationPivot", (0.0, 0.0, 0.0))
+    pre_rotation = _model_vec3_property(
+        model, "PreRotation", (0.0, 0.0, 0.0))
+    post_rotation = _model_vec3_property(
+        model, "PostRotation", (0.0, 0.0, 0.0))
+    scaling_offset = _model_vec3_property(
+        model, "ScalingOffset", (0.0, 0.0, 0.0))
+    scaling_pivot = _model_vec3_property(
+        model, "ScalingPivot", (0.0, 0.0, 0.0))
+    rotation_order = _model_int_property(model, "RotationOrder", 0)
+
+    pre = _euler_to_matrix_ordered(pre_rotation, rotation_order)
+    local_rotation = _euler_to_matrix_ordered(rotation, rotation_order)
+    post = _euler_to_matrix_ordered(post_rotation, rotation_order)
+    try:
+        post_inverse = np.linalg.inv(post)
+    except np.linalg.LinAlgError:
+        post_inverse = np.eye(4, dtype=np.float64)
+
+    # Autodesk FBX transform evaluation order. Geometric transforms are not
+    # included here because they affect geometry only and are not inherited.
+    return (
+        _translation_matrix(translation)
+        @ _translation_matrix(rotation_offset)
+        @ _translation_matrix(rotation_pivot)
+        @ pre
+        @ local_rotation
+        @ post_inverse
+        @ _translation_matrix(-rotation_pivot)
+        @ _translation_matrix(scaling_offset)
+        @ _translation_matrix(scaling_pivot)
+        @ _scale_matrix(scaling)
+        @ _translation_matrix(-scaling_pivot)
+    )
+
+
+def _model_geometric_transform(model: FbxNode) -> np.ndarray:
+    """Return the non-inherited FBX GeometricTranslation/Rotation/Scaling."""
+    translation = _model_vec3_property(
+        model, "GeometricTranslation", (0.0, 0.0, 0.0))
+    rotation = _model_vec3_property(
+        model, "GeometricRotation", (0.0, 0.0, 0.0))
+    scaling = _model_vec3_property(
+        model, "GeometricScaling", (1.0, 1.0, 1.0))
+    rotation_order = _model_int_property(model, "RotationOrder", 0)
+    return (
+        _translation_matrix(translation)
+        @ _euler_to_matrix_ordered(rotation, rotation_order)
+        @ _scale_matrix(scaling)
+    )
+
+
+def _extract_bind_pose_matrices(objects: FbxNode) -> Dict[int, np.ndarray]:
+    """Extract authoritative Model world matrices from FBX BindPose objects."""
+    matrices: Dict[int, np.ndarray] = {}
+    for obj in objects.children:
+        if obj.name != "Pose":
+            continue
+        pose_kind = " ".join((
+            str(obj.prop_value(1, "")), str(obj.prop_value(2, "")),
+        )).replace(" ", "").lower()
+        if "bindpose" not in pose_kind:
+            continue
+        for pose_node in obj.find_all("PoseNode"):
+            node = pose_node.find("Node")
+            matrix = pose_node.find("Matrix")
+            if node is None or matrix is None:
+                continue
+            raw = matrix.prop_value(0)
+            if not isinstance(raw, np.ndarray) or raw.size != 16:
+                continue
+            world = raw.reshape(4, 4).T.astype(np.float64)
+            if np.all(np.isfinite(world)):
+                matrices.setdefault(int(node.prop_value(0, 0)), world)
+    return matrices
+
+
+def _model_world_transform(
+    model_id: int,
+    models: Dict[int, FbxNode],
+    parents_map: Dict[int, List[int]],
+    bind_pose_matrices: Dict[int, np.ndarray],
+    cache: Dict[int, np.ndarray],
+    visiting: Optional[set[int]] = None,
+) -> np.ndarray:
+    """Resolve a Model's world transform, preferring its bind-pose matrix."""
+    if model_id in cache:
+        return cache[model_id]
+    if model_id in bind_pose_matrices:
+        cache[model_id] = bind_pose_matrices[model_id].copy()
+        return cache[model_id]
+    model = models.get(model_id)
+    if model is None:
+        return np.eye(4, dtype=np.float64)
+
+    active = set() if visiting is None else visiting
+    if model_id in active:
+        return _model_local_transform(model)
+    active.add(model_id)
+    parent_id = next(
+        (pid for pid in parents_map.get(model_id, []) if pid in models),
+        None,
+    )
+    local = _model_local_transform(model)
+    if parent_id is None:
+        world = local
+    else:
+        world = _model_world_transform(
+            parent_id, models, parents_map, bind_pose_matrices, cache, active,
+        ) @ local
+    active.remove(model_id)
+    cache[model_id] = world
+    return world
+
+
+def _geometry_to_world_transform(
+    model_id: int,
+    models: Dict[int, FbxNode],
+    parents_map: Dict[int, List[int]],
+    bind_pose_matrices: Dict[int, np.ndarray],
+    cache: Optional[Dict[int, np.ndarray]] = None,
+) -> np.ndarray:
+    """Return ModelGlobal @ GeometricTRS for vertices owned by ``model_id``."""
+    model = models.get(model_id)
+    if model is None:
+        return np.eye(4, dtype=np.float64)
+    world = _model_world_transform(
+        model_id, models, parents_map, bind_pose_matrices,
+        {} if cache is None else cache,
+    )
+    return world @ _model_geometric_transform(model)
+
+
+def _transform_mesh_geometry(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    transform: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply a homogeneous transform and preserve outward triangle winding."""
+    points = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+    homogeneous = np.concatenate(
+        [points, np.ones((len(points), 1), dtype=np.float64)], axis=1)
+    transformed_h = (np.asarray(transform, dtype=np.float64) @ homogeneous.T).T
+    w = transformed_h[:, 3:4]
+    if np.any(np.abs(w) <= 1.0e-12):
+        raise ValueError("FBX mesh Model transform produced points at infinity")
+    transformed = (transformed_h[:, :3] / w).astype(np.float32)
+    if not np.all(np.isfinite(transformed)):
+        raise ValueError("FBX mesh Model transform produced non-finite vertices")
+
+    out_faces = np.asarray(faces, dtype=np.int32).copy()
+    if np.linalg.det(np.asarray(transform, dtype=np.float64)[:3, :3]) < 0.0:
+        out_faces = out_faces[:, [0, 2, 1]]
+    return transformed, out_faces
 
 
 def extract_rig_data(path: Path) -> FbxRigData:
@@ -331,7 +585,7 @@ def extract_rig_data(path: Path) -> FbxRigData:
     # ── Parse Models (bones + mesh) ──
     models: Dict[int, FbxNode] = {}
     bone_infos: Dict[int, FbxBoneInfo] = {}
-    mesh_model_id: int = 0
+    mesh_model_ids: List[int] = []
 
     for obj in objects.children:
         if obj.name != "Model":
@@ -352,7 +606,7 @@ def extract_rig_data(path: Path) -> FbxRigData:
             _extract_transforms(obj, info)
             bone_infos[fbx_id] = info
         elif obj_type == "Mesh":
-            mesh_model_id = fbx_id
+            mesh_model_ids.append(fbx_id)
 
     # ── Resolve bone parent-child via connections ──
     # A bone may have multiple OO parents (anim nodes, skin clusters, etc.)
@@ -362,6 +616,26 @@ def extract_rig_data(path: Path) -> FbxRigData:
             if pid in bone_infos:
                 info.parent_id = pid
                 break
+
+    # Geometry is stored in its owning Model's local space, while cluster
+    # TransformLink matrices are FBX-world bind transforms. Resolve the exact
+    # Geometry → Model connection and move vertices into that same world space.
+    geometry_ids = {
+        int(obj.prop_value(0, 0))
+        for obj in objects.children
+        if obj.name == "Geometry"
+    }
+    geometry_to_model: Dict[int, int] = {}
+    for conn_type, child_id, parent_id in conn_list:
+        if conn_type != "OO":
+            continue
+        if child_id in models and parent_id in geometry_ids:
+            # Reversed connections are accepted for defensive compatibility.
+            geometry_to_model.setdefault(parent_id, child_id)
+        elif child_id in geometry_ids and parent_id in models:
+            geometry_to_model.setdefault(child_id, parent_id)
+    bind_pose_matrices = _extract_bind_pose_matrices(objects)
+    model_world_cache: Dict[int, np.ndarray] = {}
 
     # ── Parse Geometry → extract mesh ──
     num_verts = 0
@@ -388,9 +662,24 @@ def extract_rig_data(path: Path) -> FbxRigData:
                             pvi = poly_node.prop_value(0)
                             if isinstance(pvi, np.ndarray) and len(pvi) >= 3:
                                 faces = _triangulate_fbx_polygons(pvi)
+                                geometry_id = int(obj.prop_value(0, 0))
+                                model_id = geometry_to_model.get(geometry_id, 0)
+                                if model_id == 0 and len(mesh_model_ids) == 1:
+                                    model_id = mesh_model_ids[0]
+                                geometry_to_world = _geometry_to_world_transform(
+                                    model_id,
+                                    models,
+                                    parents_map,
+                                    bind_pose_matrices,
+                                    model_world_cache,
+                                )
+                                vertices, faces = _transform_mesh_geometry(
+                                    vertices, faces, geometry_to_world)
                                 mesh_data = FbxMeshData(
                                     vertices=vertices,
                                     faces=faces,
+                                    geometry_to_world=geometry_to_world,
+                                    model_fbx_id=model_id,
                                 )
                 if mesh_data is not None:
                     break  # Found usable mesh

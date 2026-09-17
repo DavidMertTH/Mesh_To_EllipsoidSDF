@@ -5,16 +5,16 @@ Two controls:
   * Rotation (X/Y/Z degrees) — slider AND a number field per axis; rotates the
     loaded mesh.  For a rigged FBX the host applies the rotation across every
     pose (and the skeleton) and re-computes the SDF asynchronously.
-  * SDF Blowup — a requested maximum offset for the SDF (positive erodes /
-    surface inward, negative dilates).  The local magnitude is capped at 25% of
-    feature thickness so thin structures are protected.  Shown live in the SDF
-    slice and baked into the fit target.
+  * SDF Blowup — a signed percentage of local feature thickness (positive
+    erodes / surface inward, negative dilates).  Shown live in the Slice panel
+    and baked into the fit target.
   * Mesh Blowup — an exploded view of the per-bone region submeshes (the carving
     used by Bone-Separation mode): a toggle plus a slider that pushes each bone's
     submesh radially outward so the regions can be inspected/verified.  Only
     available when a rigged mesh is loaded.
 
-Pure UI: emits ``rotationChanged(rx, ry, rz)`` (degrees), ``blowupChanged(voxels)``,
+Pure UI: emits ``rotationChanged(rx, ry, rz)`` (degrees),
+``blowupChanged(thickness_fraction)``,
 ``regionPreviewToggled(on)`` and ``regionBlowupChanged(factor)``; the MainWindow
 does the actual work.
 """
@@ -25,8 +25,7 @@ import numpy as np
 from PySide6 import QtCore, QtWidgets
 
 from sdf_blowup import (
-    DEFAULT_MAX_THICKNESS_FRACTION,
-    MAX_UI_BLOWUP_VOXELS,
+    MAX_UI_THICKNESS_FRACTION,
 )
 
 
@@ -62,13 +61,14 @@ class MeshSettingsPanel(QtWidgets.QWidget):
     """Rotation (X/Y/Z, slider + number) + SDF blowup controls for the mesh."""
 
     rotationChanged = QtCore.Signal(float, float, float)   # degrees
-    blowupChanged = QtCore.Signal(float)                   # voxels (× dx by viewer)
+    blowupChanged = QtCore.Signal(float)                   # signed local-diameter fraction
     regionPreviewToggled = QtCore.Signal(bool)             # exploded preview on/off
     regionBlowupChanged = QtCore.Signal(float)             # explosion factor
 
-    _BLOWUP_STEPS = 10          # slider int → /10 voxels
+    _BLOWUP_STEPS_PER_PERCENT = 4  # quarter-percentage-point slider steps
     _BLOWUP_RANGE = int(round(
-        MAX_UI_BLOWUP_VOXELS * _BLOWUP_STEPS))
+        100.0 * MAX_UI_THICKNESS_FRACTION
+        * _BLOWUP_STEPS_PER_PERCENT))
     _REGION_STEPS = 100         # slider int → /100 explosion factor
     _REGION_RANGE = 300         # 0.0 … 3.0× explosion
 
@@ -113,19 +113,17 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         self._blowup.setRange(-self._BLOWUP_RANGE, self._BLOWUP_RANGE)
         self._blowup.setValue(0)
         self._blowup.setToolTip(
-            "Request a maximum SDF offset in voxels.\n"
+            "Offset each surface region by a percentage of its own thickness.\n"
             "Positive erodes (surface inward), negative dilates.\n"
-            f"Locally capped at "
-            f"{100.0 * DEFAULT_MAX_THICKNESS_FRACTION:.0f}% of mesh thickness "
-            "to protect thin parts.\n"
+            "This is independent of voxel size and pose bounds.\n"
             "Live in the slice and baked into the fit target.")
-        self._lbl_blowup = QtWidgets.QLabel("0.0 vox")
+        self._lbl_blowup = QtWidgets.QLabel("0.0 %")
         self._lbl_blowup.setMinimumWidth(56)
         self._blowup.valueChanged.connect(self._on_blowup)
         brow = QtWidgets.QHBoxLayout()
         brow.addWidget(self._blowup)
         brow.addWidget(self._lbl_blowup)
-        bform.addRow("Max offset:", brow)
+        bform.addRow("Local thickness:", brow)
         self._btn_reset_blowup = QtWidgets.QPushButton("Reset blowup")
         self._btn_reset_blowup.clicked.connect(self.reset_blowup)
         bform.addRow(self._btn_reset_blowup)
@@ -177,9 +175,9 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         self.rotationChanged.emit(*self.rotation_deg())
 
     def _on_blowup(self, v: int) -> None:
-        vox = v / float(self._BLOWUP_STEPS)
-        self._lbl_blowup.setText(f"{vox:+.1f} vox")
-        self.blowupChanged.emit(vox)
+        fraction = v / float(100 * self._BLOWUP_STEPS_PER_PERCENT)
+        self._lbl_blowup.setText(f"{100.0 * fraction:+.1f} %")
+        self.blowupChanged.emit(fraction)
 
     def _on_region_toggled(self, on: bool) -> None:
         self._region.setEnabled(on)
@@ -197,8 +195,10 @@ class MeshSettingsPanel(QtWidgets.QWidget):
                 float(self._rot_spins["Y"].value()),
                 float(self._rot_spins["Z"].value()))
 
-    def blowup_voxels(self) -> float:
-        return self._blowup.value() / float(self._BLOWUP_STEPS)
+    def blowup_fraction(self) -> float:
+        """Signed fraction of the current region's local feature diameter."""
+        return self._blowup.value() / float(
+            100 * self._BLOWUP_STEPS_PER_PERCENT)
 
     def region_preview_enabled(self) -> bool:
         return self._chk_region.isChecked()
@@ -221,14 +221,16 @@ class MeshSettingsPanel(QtWidgets.QWidget):
             self._region.blockSignals(False)
             self._lbl_region.setText("0.00×")
 
-    def set_blowup_voxels(self, vox: float) -> None:
+    def set_blowup_fraction(self, fraction: float) -> None:
         """Set the blowup slider without emitting (caller updates the viewer)."""
-        v = int(round(float(vox) * self._BLOWUP_STEPS))
+        v = int(round(
+            float(fraction) * 100 * self._BLOWUP_STEPS_PER_PERCENT))
         v = max(-self._BLOWUP_RANGE, min(self._BLOWUP_RANGE, v))
         self._blowup.blockSignals(True)
         self._blowup.setValue(v)
         self._blowup.blockSignals(False)
-        self._lbl_blowup.setText(f"{v / float(self._BLOWUP_STEPS):+.1f} vox")
+        shown = v / float(self._BLOWUP_STEPS_PER_PERCENT)
+        self._lbl_blowup.setText(f"{shown:+.1f} %")
 
     def reset_rotation(self) -> None:
         for a in ("X", "Y", "Z"):
@@ -240,7 +242,7 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         self._blowup.blockSignals(True)
         self._blowup.setValue(0)
         self._blowup.blockSignals(False)
-        self._lbl_blowup.setText("0.0 vox")
+        self._lbl_blowup.setText("0.0 %")
         self.blowupChanged.emit(0.0)
 
     def reset(self) -> None:
@@ -249,7 +251,7 @@ class MeshSettingsPanel(QtWidgets.QWidget):
             for w in (self._rot_sliders[a], self._rot_spins[a]):
                 w.blockSignals(True); w.setValue(0); w.blockSignals(False)
         self._blowup.blockSignals(True); self._blowup.setValue(0); self._blowup.blockSignals(False)
-        self._lbl_blowup.setText("0.0 vox")
+        self._lbl_blowup.setText("0.0 %")
         self._chk_region.blockSignals(True); self._chk_region.setChecked(False); self._chk_region.blockSignals(False)
         self._region.blockSignals(True); self._region.setValue(0); self._region.blockSignals(False)
         self._region.setEnabled(False)

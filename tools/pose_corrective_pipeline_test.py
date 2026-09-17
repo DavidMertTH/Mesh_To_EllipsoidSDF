@@ -96,7 +96,9 @@ def run_case(mesh_name: str, clip_name: str, pose_count: int = 3) -> None:
         device=best_device(),
     )
 
-    def on_target(idx, name, vertices, faces, centers, radii, rotations, pose):
+    def on_target(
+            idx, name, vertices, faces, centers, radii, rotations,
+            shape_exponents, pose):
         events.append(("target", int(idx)))
         target_names.append(str(name))
         target_vertices.append(np.asarray(vertices, dtype=np.float32).copy())
@@ -106,6 +108,7 @@ def run_case(mesh_name: str, clip_name: str, pose_count: int = 3) -> None:
             np.testing.assert_allclose(radii, exp_r, rtol=1.0e-5, atol=1.0e-5)
             np.testing.assert_allclose(
                 np.abs(rotations), np.abs(exp_q), rtol=1.0e-5, atol=1.0e-5)
+            np.testing.assert_allclose(shape_exponents, base.shape_exponents)
         roundtrip = mapper.world_to_local(
             centers,
             radii,
@@ -123,13 +126,15 @@ def run_case(mesh_name: str, clip_name: str, pose_count: int = 3) -> None:
         assert np.asarray(vertices).shape == rig.vertices.shape
         assert np.asarray(faces).shape == rig.faces.shape
 
-    def on_fit(idx, _step, _loss, centers, radii, rotations):
+    def on_fit(
+            idx, _step, _loss, centers, radii, rotations, shape_exponents):
         idx = int(idx)
         events.append(("fit", idx))
         assert ("target", idx) in events, "fit emitted before target visual"
         assert np.asarray(centers).shape == base.local_centers.shape
         assert np.asarray(radii).shape == base.local_radii.shape
         assert np.asarray(rotations).shape == base.local_rotations.shape
+        assert np.asarray(shape_exponents).shape == base.shape_exponents.shape
 
     worker.pose_target_visual.connect(on_target)
     worker.pose_fit_progress.connect(on_fit)
@@ -141,18 +146,25 @@ def run_case(mesh_name: str, clip_name: str, pose_count: int = 3) -> None:
     assert len(target_vertices) == len(poses)
     assert _max_vertex_delta(target_vertices) > 1.0e-4
     payload = worker.result.to_json(rig.skeleton)
-    assert payload["version"] == 2
+    assert payload["version"] == 4
+    assert payload["primitive_type"] == "ellipsoid"
     assert len(payload["base"]) == base.num_ellipsoids
     assert all(entry.get("attachment_bone_indices") for entry in payload["base"])
     assert all(entry.get("attachment_weights") for entry in payload["base"])
+    assert all(entry.get("primitive_type") == "ellipsoid"
+               for entry in payload["base"])
+    assert all(entry.get("shape_exponents") == [1.0, 1.0]
+               for entry in payload["base"])
 
     for idx, key in enumerate(worker.result.keys):
         assert key.delta_centers.shape == base.local_centers.shape
         assert key.delta_rotations.shape == base.local_rotations.shape
         assert key.delta_log_radii.shape == base.local_radii.shape
+        assert key.delta_log_shape_exponents.shape == base.shape_exponents.shape
         assert np.isfinite(key.delta_centers).all()
         assert np.isfinite(key.delta_rotations).all()
         assert np.isfinite(key.delta_log_radii).all()
+        assert np.isfinite(key.delta_log_shape_exponents).all()
         center_limits = 1.75 * np.max(base.local_radii, axis=1)
         assert np.all(np.linalg.norm(key.delta_centers, axis=1) <= center_limits + 2e-5)
         assert np.max(np.abs(key.delta_log_radii)) <= np.log(2.5) + 2e-5

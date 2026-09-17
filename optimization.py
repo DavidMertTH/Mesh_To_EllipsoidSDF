@@ -27,12 +27,12 @@ from ellipsoid import Ellipsoid, EllipsoidSet, best_device
 from underrepresentation import relative_underrep_samples
 from thickness import dilate_zeros
 from sdf_blowup import (
-    DEFAULT_MAX_THICKNESS_FRACTION,
-    apply_thickness_limited_blowup,
+    apply_thickness_relative_blowup,
     conservative_mirror_min,
+    relative_blowup_extent_voxels,
 )
 from sdf_compute import _sample_voxel_field_trilinear
-from sdf_samples import SdfSampleSet, UploadedSdfSamples
+from sdf_samples import SdfSampleSet, UploadedSdfSamples, sdf_grid_normals
 from fit_validation import (
     BestCheckpoint,
     Patience,
@@ -47,6 +47,8 @@ from superquadric_geometry import (
     surface_points as _sq_surface_points,
     volume as _sq_volume,
 )
+
+_SQ_GRID_PRED_CHUNK_SIZE = 4_194_304  # 16 MiB of float32 output per launch
 
 
 # ── Warp kernels ──────────────────────────────────────────────────────────────
@@ -317,6 +319,39 @@ def _rmse_loss_kernel_batch(
         over_scale = wp.max(surface_sigma, float(1.0e-6))
         over_penalty = over * over / over_scale
         wp.atomic_add(loss, 0, w * outside_weight * over_penalty / float(batch_size))
+
+
+@wp.kernel
+def _normal_loss_kernel_batch(
+    pred_normals: wp.array(dtype=wp.vec3),
+    target_normals: wp.array(dtype=wp.vec3),
+    sdf_target: wp.array(dtype=wp.float32),
+    indices: wp.array(dtype=wp.int32),
+    loss: wp.array(dtype=wp.float32),
+    batch_size: int,
+    weight: float,
+    band: float,
+):
+    """Cosine normal loss in a narrow target-SDF surface band.
+
+    Zero vectors mark unavailable or ambiguous normals and are ignored.  The
+    caller supplies ``weight`` in world units so this dimensionless angular term
+    stays comparable to the reconstruction loss across voxel resolutions.
+    """
+    bid = wp.tid()
+    tid = indices[bid]
+    if wp.abs(sdf_target[tid]) <= band:
+        pn = pred_normals[bid]
+        tn = target_normals[tid]
+        plen = wp.length(pn)
+        tlen = wp.length(tn)
+        if plen > float(1.0e-8) and tlen > float(1.0e-8):
+            cosine = wp.clamp(
+                wp.dot(pn / plen, tn / tlen), -1.0, 1.0)
+            wp.atomic_add(
+                loss, 0,
+                weight * (1.0 - cosine) / float(batch_size),
+            )
 
 
 @wp.kernel
@@ -794,10 +829,27 @@ def _sphere_softmin_kernel_batch(
 
 
 @wp.func
-def _sq_logaddexp(a: float, b: float) -> float:
-    """Two-term log-sum-exp whose exponent arguments are always non-positive."""
+def _sq_logaddexp_weights(a: float, b: float) -> wp.vec3:
+    """Return log-sum-exp and both mixture weights using the same exponentials."""
     m = wp.max(a, b)
-    return m + wp.log(wp.exp(a - m) + wp.exp(b - m))
+    ea = wp.exp(a - m)
+    eb = wp.exp(b - m)
+    total = ea + eb
+    inv_sum = 1.0 / total
+    return wp.vec3(m + wp.log(total), ea * inv_sum, eb * inv_sum)
+
+
+@wp.func
+def _sq_log_safe_ratio(numerator: float, denominator: float) -> float:
+    """Use one log for ordinary ratios without losing the extreme-value path."""
+    ratio = numerator / denominator
+    result = float(0.0)
+    if ratio < float(1.0e30):
+        result = wp.log(ratio)
+    else:
+        # The quotient can overflow float32 even when both logarithms are finite.
+        result = wp.log(numerator) - wp.log(denominator)
+    return result
 
 
 @wp.func
@@ -824,21 +876,23 @@ def _sq_log_beta_grad(lp: wp.vec3, r: wp.vec3,
     sy = wp.max(ay, ry * tiny_u)
     sz = wp.max(az, rz * tiny_u)
 
-    lx = (2.0 / se2) * (wp.log(sx) - wp.log(rx))
-    ly = (2.0 / se2) * (wp.log(sy) - wp.log(ry))
-    lz = (2.0 / se1) * (wp.log(sz) - wp.log(rz))
-    la = _sq_logaddexp(lx, ly)
+    lx = (2.0 / se2) * _sq_log_safe_ratio(sx, rx)
+    ly = (2.0 / se2) * _sq_log_safe_ratio(sy, ry)
+    lz = (2.0 / se1) * _sq_log_safe_ratio(sz, rz)
+    xy_mix = _sq_logaddexp_weights(lx, ly)
+    la = xy_mix[0]
     lxy = (se2 / se1) * la
-    lf = _sq_logaddexp(lxy, lz)
+    shape_mix = _sq_logaddexp_weights(lxy, lz)
+    lf = shape_mix[0]
     log_beta = 0.5 * se1 * lf
 
     # Mixture weights give an overflow-free analytic gradient of log(beta):
     #   d log(beta)/dx = w_xy * w_x / x, and analogously for y/z.
     # x/safe_abs(x)^2 is a finite signed reciprocal with value zero on an axis.
-    wx = wp.exp(lx - la)
-    wy = wp.exp(ly - la)
-    wxy = wp.exp(lxy - lf)
-    wz = wp.exp(lz - lf)
+    wx = xy_mix[1]
+    wy = xy_mix[2]
+    wxy = shape_mix[1]
+    wz = shape_mix[2]
     # Divide sequentially so an otherwise harmless very large coordinate cannot
     # overflow while forming safe_abs^2.
     gx = wxy * wx * (lp[0] / sx) / sx
@@ -1012,6 +1066,43 @@ def _superquadric_sdf_kernel_batch(
 
 
 @wp.kernel
+def _superquadric_sdf_grid_chunk(
+    centers: wp.array(dtype=wp.vec3),
+    radii: wp.array(dtype=wp.vec3),
+    rot_flat: wp.array(dtype=wp.float32),
+    eps: wp.array(dtype=wp.float32),
+    bend: wp.array(dtype=wp.float32),
+    num_e: int,
+    origin: wp.vec3,
+    dx: float,
+    nx: int,
+    ny: int,
+    flat_offset: int,
+    out_sdf: wp.array(dtype=wp.float32),
+):
+    """Inference-only bent-SQ union over consecutive grid voxels."""
+    bid = wp.tid()
+    tid = flat_offset + bid
+    ix = tid % nx
+    iy = (tid // nx) % ny
+    iz = tid // (nx * ny)
+    p = origin + wp.vec3(
+        (float(ix) + 0.5) * dx, (float(iy) + 0.5) * dx, (float(iz) + 0.5) * dx)
+    closest = float(1.0e6)
+    for i in range(num_e):
+        base = i * 4
+        q = wp.normalize(wp.quat(
+            rot_flat[base + 0], rot_flat[base + 1],
+            rot_flat[base + 2], rot_flat[base + 3]))
+        be = i * 2
+        d = _bent_sq_distance(
+            p, centers[i], radii[i], q,
+            eps[be], eps[be + 1], bend[be], bend[be + 1])
+        closest = wp.min(closest, d)
+    out_sdf[bid] = closest
+
+
+@wp.kernel
 def _superquadric_sdf_kernel_points(
     centers: wp.array(dtype=wp.vec3),
     radii: wp.array(dtype=wp.vec3),
@@ -1117,6 +1208,187 @@ def _superquadric_softmin_kernel_points(
         d = _bent_sq_distance(
             p, centers[i], radii[i], q,
             eps[be], eps[be + 1], bend[be], bend[be + 1])
+        m_prev = m_cache[bid, i]
+        s_prev = s_cache[bid, i]
+        if d < m_prev:
+            m_cache[bid, i + 1] = d
+            s_cache[bid, i + 1] = s_prev * wp.exp(-k * (m_prev - d)) + 1.0
+        else:
+            m_cache[bid, i + 1] = m_prev
+            s_cache[bid, i + 1] = s_prev + wp.exp(-k * (d - m_prev))
+    m = m_cache[bid, num_e]
+    s = s_cache[bid, num_e]
+    out_sdf[bid] = m - wp.log(s) / k
+
+
+@wp.kernel
+def _plain_superquadric_sdf_kernel_batch(
+    centers: wp.array(dtype=wp.vec3),
+    radii: wp.array(dtype=wp.vec3),
+    rot_flat: wp.array(dtype=wp.float32),
+    eps: wp.array(dtype=wp.float32),
+    min_d: wp.array2d(dtype=wp.float32),
+    num_e: int,
+    origin: wp.vec3,
+    dx: float,
+    nx: int,
+    ny: int,
+    nz: int,
+    indices: wp.array(dtype=wp.int32),
+    out_sdf: wp.array(dtype=wp.float32),
+):
+    """Hard union for straight SQs, without inverse-bend arithmetic."""
+    bid = wp.tid()
+    tid = indices[bid]
+    ix = tid % nx
+    iy = (tid // nx) % ny
+    iz = tid // (nx * ny)
+    p = origin + wp.vec3(
+        (float(ix) + 0.5) * dx, (float(iy) + 0.5) * dx, (float(iz) + 0.5) * dx)
+    min_d[bid, 0] = 1.0e6
+    for i in range(num_e):
+        base = i * 4
+        q = wp.normalize(wp.quat(
+            rot_flat[base + 0], rot_flat[base + 1],
+            rot_flat[base + 2], rot_flat[base + 3]))
+        be = i * 2
+        d = _sq_distance(p, centers[i], radii[i], q, eps[be], eps[be + 1])
+        min_d[bid, i + 1] = wp.min(min_d[bid, i], d)
+    out_sdf[bid] = min_d[bid, num_e]
+
+
+@wp.kernel
+def _plain_superquadric_sdf_grid_chunk(
+    centers: wp.array(dtype=wp.vec3),
+    radii: wp.array(dtype=wp.vec3),
+    rot_flat: wp.array(dtype=wp.float32),
+    eps: wp.array(dtype=wp.float32),
+    num_e: int,
+    origin: wp.vec3,
+    dx: float,
+    nx: int,
+    ny: int,
+    flat_offset: int,
+    out_sdf: wp.array(dtype=wp.float32),
+):
+    """Inference-only straight-SQ union without a per-primitive scan."""
+    bid = wp.tid()
+    tid = flat_offset + bid
+    ix = tid % nx
+    iy = (tid // nx) % ny
+    iz = tid // (nx * ny)
+    p = origin + wp.vec3(
+        (float(ix) + 0.5) * dx, (float(iy) + 0.5) * dx, (float(iz) + 0.5) * dx)
+    closest = float(1.0e6)
+    for i in range(num_e):
+        base = i * 4
+        q = wp.normalize(wp.quat(
+            rot_flat[base + 0], rot_flat[base + 1],
+            rot_flat[base + 2], rot_flat[base + 3]))
+        be = i * 2
+        d = _sq_distance(p, centers[i], radii[i], q, eps[be], eps[be + 1])
+        closest = wp.min(closest, d)
+    out_sdf[bid] = closest
+
+
+@wp.kernel
+def _plain_superquadric_sdf_kernel_points(
+    centers: wp.array(dtype=wp.vec3),
+    radii: wp.array(dtype=wp.vec3),
+    rot_flat: wp.array(dtype=wp.float32),
+    eps: wp.array(dtype=wp.float32),
+    min_d: wp.array2d(dtype=wp.float32),
+    num_e: int,
+    points: wp.array(dtype=wp.vec3),
+    indices: wp.array(dtype=wp.int32),
+    out_sdf: wp.array(dtype=wp.float32),
+):
+    bid = wp.tid()
+    p = points[indices[bid]]
+    min_d[bid, 0] = 1.0e6
+    for i in range(num_e):
+        base = i * 4
+        q = wp.normalize(wp.quat(
+            rot_flat[base + 0], rot_flat[base + 1],
+            rot_flat[base + 2], rot_flat[base + 3]))
+        be = i * 2
+        d = _sq_distance(p, centers[i], radii[i], q, eps[be], eps[be + 1])
+        min_d[bid, i + 1] = wp.min(min_d[bid, i], d)
+    out_sdf[bid] = min_d[bid, num_e]
+
+
+@wp.kernel
+def _plain_superquadric_softmin_kernel_batch(
+    centers: wp.array(dtype=wp.vec3),
+    radii: wp.array(dtype=wp.vec3),
+    rot_flat: wp.array(dtype=wp.float32),
+    eps: wp.array(dtype=wp.float32),
+    m_cache: wp.array2d(dtype=wp.float32),
+    s_cache: wp.array2d(dtype=wp.float32),
+    num_e: int,
+    origin: wp.vec3,
+    dx: float,
+    nx: int,
+    ny: int,
+    nz: int,
+    indices: wp.array(dtype=wp.int32),
+    out_sdf: wp.array(dtype=wp.float32),
+    k: float,
+):
+    bid = wp.tid()
+    tid = indices[bid]
+    ix = tid % nx
+    iy = (tid // nx) % ny
+    iz = tid // (nx * ny)
+    p = origin + wp.vec3(
+        (float(ix) + 0.5) * dx, (float(iy) + 0.5) * dx, (float(iz) + 0.5) * dx)
+    m_cache[bid, 0] = 1.0e6
+    s_cache[bid, 0] = 0.0
+    for i in range(num_e):
+        base = i * 4
+        q = wp.normalize(wp.quat(
+            rot_flat[base + 0], rot_flat[base + 1],
+            rot_flat[base + 2], rot_flat[base + 3]))
+        be = i * 2
+        d = _sq_distance(p, centers[i], radii[i], q, eps[be], eps[be + 1])
+        m_prev = m_cache[bid, i]
+        s_prev = s_cache[bid, i]
+        if d < m_prev:
+            m_cache[bid, i + 1] = d
+            s_cache[bid, i + 1] = s_prev * wp.exp(-k * (m_prev - d)) + 1.0
+        else:
+            m_cache[bid, i + 1] = m_prev
+            s_cache[bid, i + 1] = s_prev + wp.exp(-k * (d - m_prev))
+    m = m_cache[bid, num_e]
+    s = s_cache[bid, num_e]
+    out_sdf[bid] = m - wp.log(s) / k
+
+
+@wp.kernel
+def _plain_superquadric_softmin_kernel_points(
+    centers: wp.array(dtype=wp.vec3),
+    radii: wp.array(dtype=wp.vec3),
+    rot_flat: wp.array(dtype=wp.float32),
+    eps: wp.array(dtype=wp.float32),
+    m_cache: wp.array2d(dtype=wp.float32),
+    s_cache: wp.array2d(dtype=wp.float32),
+    num_e: int,
+    points: wp.array(dtype=wp.vec3),
+    indices: wp.array(dtype=wp.int32),
+    out_sdf: wp.array(dtype=wp.float32),
+    k: float,
+):
+    bid = wp.tid()
+    p = points[indices[bid]]
+    m_cache[bid, 0] = 1.0e6
+    s_cache[bid, 0] = 0.0
+    for i in range(num_e):
+        base = i * 4
+        q = wp.normalize(wp.quat(
+            rot_flat[base + 0], rot_flat[base + 1],
+            rot_flat[base + 2], rot_flat[base + 3]))
+        be = i * 2
+        d = _sq_distance(p, centers[i], radii[i], q, eps[be], eps[be + 1])
         m_prev = m_cache[bid, i]
         s_prev = s_cache[bid, i]
         if d < m_prev:
@@ -1257,6 +1529,160 @@ def _capsule_softmin_kernel_batch(
     m = m_cache[bid, num_e]
     s = s_cache[bid, num_e]
     out_sdf[bid] = m - wp.log(s) / k
+
+
+# ── Surface normals for first-order geometric fitting ──────────────────────────
+
+@wp.func
+def _primitive_surface_normal(
+    p: wp.vec3,
+    c: wp.vec3,
+    r: wp.vec3,
+    q: wp.quat,
+    e1: float,
+    e2: float,
+    kx: float,
+    ky: float,
+    shape_kind: int,
+) -> wp.vec3:
+    """Analytic outward normal of one primitive's implicit surface family.
+
+    ``shape_kind``: 0 ellipsoid, 1 sphere, 2 bent superquadric,
+    3 capsule, 4 straight superquadric.
+    The direction is valid off the zero set as well, which is useful while the
+    scalar SDF term is still pulling the primitive surface into place.
+    """
+    lp = wp.quat_rotate_inv(q, p - c)
+    local_normal = wp.vec3(0.0, 0.0, 0.0)
+    if shape_kind == 1:
+        local_normal = lp
+    elif shape_kind == 2:
+        z = lp[2]
+        ulp = wp.vec3(
+            lp[0] - 0.5 * kx * z * z,
+            lp[1] - 0.5 * ky * z * z,
+            z,
+        )
+        data = _sq_log_beta_grad(ulp, r, e1, e2)
+        grad_u = wp.vec3(data[1], data[2], data[3])
+        local_normal = wp.vec3(
+            grad_u[0],
+            grad_u[1],
+            grad_u[2] - kx * z * grad_u[0] - ky * z * grad_u[1],
+        )
+    elif shape_kind == 4:
+        data = _sq_log_beta_grad(lp, r, e1, e2)
+        local_normal = wp.vec3(data[1], data[2], data[3])
+    elif shape_kind == 3:
+        qz = wp.clamp(lp[2], -r[2], r[2])
+        local_normal = wp.vec3(lp[0], lp[1], lp[2] - qz)
+    else:
+        rx = wp.max(wp.abs(r[0]), float(1.0e-8))
+        ry = wp.max(wp.abs(r[1]), float(1.0e-8))
+        rz = wp.max(wp.abs(r[2]), float(1.0e-8))
+        local_normal = wp.vec3(
+            lp[0] / (rx * rx),
+            lp[1] / (ry * ry),
+            lp[2] / (rz * rz),
+        )
+    world_normal = wp.quat_rotate(q, local_normal)
+    length = wp.length(world_normal)
+    result = wp.vec3(0.0, 0.0, 0.0)
+    if length > float(1.0e-8):
+        result = world_normal / length
+    return result
+
+
+@wp.func
+def _last_hard_min_winner(
+    min_d: wp.array2d(dtype=wp.float32),
+    bid: int,
+    num_e: int,
+) -> int:
+    """Return the last strict running-min update (ties keep the first)."""
+    winner = int(-1)
+    for i in range(num_e):
+        if min_d[bid, i + 1] < min_d[bid, i]:
+            winner = i
+    return winner
+
+
+@wp.kernel
+def _primitive_normal_kernel_batch(
+    centers: wp.array(dtype=wp.vec3),
+    radii: wp.array(dtype=wp.vec3),
+    rot_flat: wp.array(dtype=wp.float32),
+    eps: wp.array(dtype=wp.float32),
+    bend: wp.array(dtype=wp.float32),
+    min_d: wp.array2d(dtype=wp.float32),
+    num_e: int,
+    shape_kind: int,
+    origin: wp.vec3,
+    dx: float,
+    nx: int,
+    ny: int,
+    nz: int,
+    indices: wp.array(dtype=wp.int32),
+    out_normals: wp.array(dtype=wp.vec3),
+):
+    """Select the hard-union winner's normal at dense voxel samples."""
+    bid = wp.tid()
+    tid = indices[bid]
+    ix = tid % nx
+    iy = (tid // nx) % ny
+    iz = tid // (nx * ny)
+    p = origin + wp.vec3(
+        (float(ix) + 0.5) * dx,
+        (float(iy) + 0.5) * dx,
+        (float(iz) + 0.5) * dx,
+    )
+    winner = _last_hard_min_winner(min_d, bid, num_e)
+    if winner >= 0:
+        base = winner * 4
+        q = wp.normalize(wp.quat(
+            rot_flat[base + 0], rot_flat[base + 1],
+            rot_flat[base + 2], rot_flat[base + 3]))
+        be = winner * 2
+        out_normals[bid] = _primitive_surface_normal(
+            p, centers[winner], radii[winner], q,
+            eps[be], eps[be + 1], bend[be], bend[be + 1],
+            shape_kind,
+        )
+    else:
+        out_normals[bid] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def _primitive_normal_kernel_points(
+    centers: wp.array(dtype=wp.vec3),
+    radii: wp.array(dtype=wp.vec3),
+    rot_flat: wp.array(dtype=wp.float32),
+    eps: wp.array(dtype=wp.float32),
+    bend: wp.array(dtype=wp.float32),
+    min_d: wp.array2d(dtype=wp.float32),
+    num_e: int,
+    shape_kind: int,
+    points: wp.array(dtype=wp.vec3),
+    indices: wp.array(dtype=wp.int32),
+    out_normals: wp.array(dtype=wp.vec3),
+):
+    """Select the hard-union winner's normal at arbitrary world points."""
+    bid = wp.tid()
+    p = points[indices[bid]]
+    winner = _last_hard_min_winner(min_d, bid, num_e)
+    if winner >= 0:
+        base = winner * 4
+        q = wp.normalize(wp.quat(
+            rot_flat[base + 0], rot_flat[base + 1],
+            rot_flat[base + 2], rot_flat[base + 3]))
+        be = winner * 2
+        out_normals[bid] = _primitive_surface_normal(
+            p, centers[winner], radii[winner], q,
+            eps[be], eps[be + 1], bend[be], bend[be + 1],
+            shape_kind,
+        )
+    else:
+        out_normals[bid] = wp.vec3(0.0, 0.0, 0.0)
 
 
 # ── Range-restricted SGD (SuperFit isolated local fitting) ──────────────────────
@@ -1958,6 +2384,7 @@ class OptimizationWorker(QtCore.QThread):
     """
 
     step_visual      = QtCore.Signal(int, float, object, object, object, object)
+    step_status      = QtCore.Signal(int, float)  # scalar-only GPU progress
     step_sdf         = QtCore.Signal(int, float, object, object, object)  # (step, loss, ell_grid, ur_points, ur_values)
     maintenance_done = QtCore.Signal(int, int, int, int)
     phase_changed    = QtCore.Signal(str)   # "global" | "local"
@@ -1967,7 +2394,7 @@ class OptimizationWorker(QtCore.QThread):
     op_events        = QtCore.Signal(int, object)  # (step, [(op:str, center:(3,), radius:float), ...])
     analysis_regions = QtCore.Signal(int, object)  # (step, {'over'|'under'|'bridge': [(center, radius), ...]})
     ellipsoid_metrics = QtCore.Signal(int, object)  # (step, {metric_name: np.ndarray(N,)})
-    finished         = QtCore.Signal()
+    failed           = QtCore.Signal(str)
 
     DEFAULT_BATCH_FRACTION = 0.125
 
@@ -1994,6 +2421,10 @@ class OptimizationWorker(QtCore.QThread):
         surface_weight: float = 4.0,
         surface_sigma_vox: float = 1.5,
         loss_huber_delta_vox: float = 0.5,
+        normal_loss_weight: float = 1.0,
+        normal_band_vox: float = 2.0,
+        normal_warmup_frac: float = 0.20,
+        normal_ramp_frac: float = 0.20,
         validation_sample_size: int = 4096,
         validation_every: int | None = None,
         validation_patience: int | None = 12,
@@ -2032,6 +2463,8 @@ class OptimizationWorker(QtCore.QThread):
         bone_aware: bool = False,
         bone_centers_np: np.ndarray | None = None,
         bone_expected_counts_np: np.ndarray | None = None,
+        spatial_budget_centers_np: np.ndarray | None = None,
+        spatial_budget_caps_np: np.ndarray | None = None,
         bone_span_weight: float = 0.4,
         bone_span_tol: float = 0.35,
         bone_span_soft: float = 0.15,
@@ -2040,6 +2473,9 @@ class OptimizationWorker(QtCore.QThread):
         lr_decay_k: float = 7.0,
         lr_mult_radii: float = 2.0,
         lr_mult_rot: float = 1.0,
+        optimize_centers: bool = True,
+        optimize_rotations: bool = True,
+        optimize_radii: bool = True,
         center_step_radius_frac: float = 0.5,
         center_step_min_vox: float = 0.25,
         center_step_max_vox: float = 4.0,
@@ -2048,10 +2484,7 @@ class OptimizationWorker(QtCore.QThread):
         soft_union_vox_end: float = 0.6,
         sdf_samples: SdfSampleSet | None = None,
         thickness_np: np.ndarray | None = None,
-        sdf_blowup_offset: float = 0.0,
-        sdf_blowup_max_thickness_fraction: float = (
-            DEFAULT_MAX_THICKNESS_FRACTION
-        ),
+        sdf_blowup_fraction: float = 0.0,
         thin_loss_weight: float = 1.0,
         thin_max_factor: float = 6.0,
         thin_sample_bias: float = 1.0,
@@ -2073,7 +2506,7 @@ class OptimizationWorker(QtCore.QThread):
         sq_eps1: float = 1.0,
         sq_eps2: float = 1.0,
         sq_eps_mode: str = "per_primitive",
-        sq_unlock_frac: float = 0.20,
+        sq_unlock_frac: float = 0.05,
         sq_bend_unlock_frac: float = 0.40,
         sq_eps_lr_mult: float = 0.25,
         sq_bend_lr_mult: float = 0.10,
@@ -2100,6 +2533,7 @@ class OptimizationWorker(QtCore.QThread):
         parameter_neighbor_rotation_regularization: float = 0.0,
         parameter_center_trust_radius_factor: float = 0.0,
         parameter_radii_trust_factor: float = 0.0,
+        emit_intermediate_progress: bool = True,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
@@ -2116,10 +2550,12 @@ class OptimizationWorker(QtCore.QThread):
         self._method = method
         self._num_steps = num_steps
         self._report_every = report_every
+        self._emit_intermediate_progress = bool(emit_intermediate_progress)
         self._sdf_mode = sdf_mode
         self._sdf_samples = sdf_samples
         self._uploaded_samples: UploadedSdfSamples | None = None
         self._stop_flag = False
+        self.error_message: str | None = None
         self._initial_centers = (
             None if initial_centers is None
             else np.asarray(initial_centers, dtype=np.float32).reshape(-1, 3)
@@ -2224,6 +2660,21 @@ class OptimizationWorker(QtCore.QThread):
         self._surface_sigma = max(self._surface_sigma_vox * float(dx), 1e-6)
         self._loss_huber_delta = max(
             float(loss_huber_delta_vox) * float(dx), 1.0e-8)
+        normal_values = {
+            "normal_loss_weight": float(normal_loss_weight),
+            "normal_band_vox": float(normal_band_vox),
+            "normal_warmup_frac": float(normal_warmup_frac),
+            "normal_ramp_frac": float(normal_ramp_frac),
+        }
+        if not all(np.isfinite(value) for value in normal_values.values()):
+            raise ValueError("normal-loss settings must be finite")
+        if float(normal_loss_weight) < 0.0 or float(normal_band_vox) <= 0.0:
+            raise ValueError(
+                "normal_loss_weight must be non-negative and normal_band_vox positive")
+        self._normal_loss_weight = float(normal_loss_weight)
+        self._normal_band_vox = float(normal_band_vox)
+        self._normal_warmup_frac = float(np.clip(normal_warmup_frac, 0.0, 1.0))
+        self._normal_ramp_frac = float(np.clip(normal_ramp_frac, 0.0, 1.0))
         self._validation_sample_size = max(1, int(validation_sample_size))
         self._validation_every = max(
             1,
@@ -2339,11 +2790,34 @@ class OptimizationWorker(QtCore.QThread):
                     self._bone_expected_weights_np = (
                         bw / float(np.sum(bw))).astype(np.float32)
         self._bone_aware = self._num_bones > 0
+        # A mesh-wide spatial budget is independent of rigging.  When present,
+        # it is the authoritative hard ceiling for population growth; the bone
+        # data above remains active for its shape/loss metrics.
+        self._spatial_budget_centers_np = None
+        self._spatial_budget_caps_np = None
+        if (spatial_budget_centers_np is not None
+                or spatial_budget_caps_np is not None):
+            if spatial_budget_centers_np is None or spatial_budget_caps_np is None:
+                raise ValueError(
+                    "spatial region budget requires both centers and caps")
+            budget_centers = np.asarray(
+                spatial_budget_centers_np, dtype=np.float32).reshape(-1, 3)
+            budget_caps = np.asarray(
+                spatial_budget_caps_np, dtype=np.int32).reshape(-1)
+            if len(budget_centers) == 0 or len(budget_centers) != len(budget_caps):
+                raise ValueError("spatial budget centers/caps must have equal non-zero length")
+            if not np.isfinite(budget_centers).all() or np.any(budget_caps < 1):
+                raise ValueError("spatial budget centers must be finite and caps positive")
+            self._spatial_budget_centers_np = np.ascontiguousarray(budget_centers)
+            self._spatial_budget_caps_np = np.ascontiguousarray(budget_caps)
         self._lr_init = lr_init
         self._lr_final = lr_final
         self._lr_decay_k = lr_decay_k
         self._lr_mult_radii = lr_mult_radii   # per-group LR (radii in log-space)
         self._lr_mult_rot = lr_mult_rot
+        self._optimize_centers = bool(optimize_centers)
+        self._optimize_rotations = bool(optimize_rotations)
+        self._optimize_radii = bool(optimize_radii)
         self._center_step_radius_frac = max(0.0, float(center_step_radius_frac))
         self._center_step_min_vox = max(0.0, float(center_step_min_vox))
         self._center_step_max_vox = max(
@@ -2355,23 +2829,26 @@ class OptimizationWorker(QtCore.QThread):
         self._soft_vox_start = float(soft_union_vox_start)
         self._soft_vox_end = float(soft_union_vox_end)
         self._thickness_np = thickness_np
-        self._sdf_blowup_offset = float(sdf_blowup_offset)
-        self._sdf_blowup_max_thickness_fraction = float(
-            sdf_blowup_max_thickness_fraction)
-        if not np.isfinite(self._sdf_blowup_offset):
-            raise ValueError("sdf_blowup_offset must be finite")
-        if (not np.isfinite(self._sdf_blowup_max_thickness_fraction)
-                or not 0.0 < self._sdf_blowup_max_thickness_fraction < 0.5):
+        self._sdf_blowup_fraction = float(sdf_blowup_fraction)
+        if (not np.isfinite(self._sdf_blowup_fraction)
+                or not -0.5 < self._sdf_blowup_fraction < 0.5):
             raise ValueError(
-                "sdf_blowup_max_thickness_fraction must be between 0 and 0.5")
+                "sdf_blowup_fraction magnitude must be smaller than 0.5")
         # Preserve the whole-mesh carrier and its geometry: local-fit methods
         # temporarily swap ``_thickness_np/_origin/_dx`` to each region grid.
         self._sdf_blowup_thickness_np = (
-            None if self._sdf_blowup_offset == 0.0 or thickness_np is None
+            None if self._sdf_blowup_fraction == 0.0 or thickness_np is None
             else np.asarray(thickness_np, dtype=np.float32)
         )
         self._sdf_blowup_origin = np.asarray(origin, dtype=np.float32).reshape(3)
         self._sdf_blowup_dx = float(dx)
+        self._sdf_blowup_max_offset_world = (
+            relative_blowup_extent_voxels(
+                self._sdf_blowup_fraction,
+                self._sdf_blowup_thickness_np,
+                self._sdf_blowup_dx,
+            ) * self._sdf_blowup_dx
+        )
         self._thin_loss_weight = thin_loss_weight
         self._thin_max_factor = thin_max_factor
         self._thin_sample_bias = thin_sample_bias
@@ -2380,8 +2857,8 @@ class OptimizationWorker(QtCore.QThread):
         self._thickness_margin_source_id = None
         self._flat_weight = flat_weight
         self._flat_min_ratio = flat_min_ratio
-        # Hard-delete thresholds for degenerate shapes during SuperFit (axis
-        # ratios vs the median axis): too-flat disks and too-pointy spikes.
+        # Axis-ratio thresholds for degenerate shapes during SuperFit. Flat
+        # collapses are hard-deleted; elongated SQs are routed to splitting.
         self._degenerate_flat_ratio = degenerate_flat_ratio
         self._degenerate_spike_ratio = degenerate_spike_ratio
         # High-res per-region local fitting (SuperFit). When a mesh-backed
@@ -2511,20 +2988,21 @@ class OptimizationWorker(QtCore.QThread):
             pass
 
     def run(self):
-        # Always emit ``finished`` (even on error) so the host's pipeline — e.g.
-        # sequential Bone-Separation — advances instead of hanging on a failed
-        # bone.  Clear any stale global tape before starting (see above).
+        # QThread itself emits ``finished`` exactly once when ``run`` returns.
+        # Keep exceptions visible to the owner so an API job cannot publish its
+        # unchanged input parameters as a successful fit.
+        self.error_message = None
         try:
             self._reset_stale_tape()
             if self._method == "adam":
                 self._run_adam()
             else:
                 self._run_naive()
-        except Exception:
+        except Exception as exc:
             import traceback
             traceback.print_exc()
-        finally:
-            self.finished.emit()
+            self.error_message = f"{type(exc).__name__}: {exc}"
+            self.failed.emit(self.error_message)
 
     def symmetry_metadata(self) -> dict | None:
         """Describe the exact hard-mirror layout produced by this worker.
@@ -2739,6 +3217,30 @@ class OptimizationWorker(QtCore.QThread):
         d2 = np.sum((pts[:, None, :] - bones[None, :, :]) ** 2, axis=2)
         return np.argmin(d2, axis=1).astype(np.int32)
 
+    def _growth_capacity_counts(self) -> np.ndarray | None:
+        """Return the active hard caps (mesh regions take precedence)."""
+        if self._spatial_budget_caps_np is not None:
+            return self._spatial_budget_caps_np.copy()
+        return self._bone_capacity_counts(self._max_ellipsoids)
+
+    def _nearest_growth_region_indices_np(
+        self, points: np.ndarray,
+    ) -> np.ndarray | None:
+        """Assign points to the region governing spawn/split capacity."""
+        if self._spatial_budget_centers_np is None:
+            return self._nearest_bone_indices_np(points)
+        pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+        regions = self._spatial_budget_centers_np
+        if len(pts) == 0:
+            return np.empty((0,), dtype=np.int32)
+        out = np.empty(len(pts), dtype=np.int32)
+        for start in range(0, len(pts), 8192):
+            block = pts[start:start + 8192]
+            d2 = np.sum(
+                (block[:, None, :] - regions[None, :, :]) ** 2, axis=2)
+            out[start:start + len(block)] = np.argmin(d2, axis=1)
+        return out
+
     @staticmethod
     def _bone_has_add_capacity(
         bone_index: int | None,
@@ -2756,11 +3258,17 @@ class OptimizationWorker(QtCore.QThread):
         self,
         centers: np.ndarray,
     ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-        caps = self._bone_capacity_counts(self._max_ellipsoids)
-        assign = self._bone_assignments_np(centers)
+        """Return assignment/count/cap state for the active growth budget.
+
+        The historical method name is kept because maintenance tests and older
+        integrations patch it directly.  It now supports both rig-bone budgets
+        and the general mesh-region budget.
+        """
+        caps = self._growth_capacity_counts()
+        assign = self._nearest_growth_region_indices_np(centers)
         if caps is None or assign is None:
             return assign, None, caps
-        counts = np.bincount(assign, minlength=self._num_bones).astype(np.int32)
+        counts = np.bincount(assign, minlength=len(caps)).astype(np.int32)
         return assign, counts, caps
 
     def _filter_spawn_candidates_by_bone_capacity(
@@ -2773,7 +3281,7 @@ class OptimizationWorker(QtCore.QThread):
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if counts is None or caps is None or len(centers) == 0:
             return centers, radii, rotations
-        assign = self._nearest_bone_indices_np(centers)
+        assign = self._nearest_growth_region_indices_np(centers)
         if assign is None:
             return centers, radii, rotations
         keep: list[int] = []
@@ -2827,7 +3335,7 @@ class OptimizationWorker(QtCore.QThread):
         b = None if bend is None else np.asarray(bend)[i]
         child_c, _child_r, _child_q, _child_e, _child_b = self._split_primitive(
             centers[i], radii[i], rotations[i], e, b)
-        child_assign = self._nearest_bone_indices_np(child_c)
+        child_assign = self._nearest_growth_region_indices_np(child_c)
         if child_assign is None:
             return True
 
@@ -2921,7 +3429,7 @@ class OptimizationWorker(QtCore.QThread):
         # Use depth as "importance" for FPS — prefer deep interior points
         if progress_cb is not None:
             progress_cb(0.45, "placing initial ellipsoids")
-        selected = self._farthest_point_sample(
+        selected = self._farthest_point_sample_with_spatial_capacity(
             interior_world, interior_depth, num_e,
             existing_centers=np.empty((0, 3), dtype=np.float32),
         )
@@ -3255,7 +3763,9 @@ class OptimizationWorker(QtCore.QThread):
         A shared ε pair is one global model parameter, so topology edits must
         inherit its current learned value.  Reintroducing the UI prior for every
         spawn would move that parameter merely because the population changed.
-        Per-primitive and fixed modes intentionally keep their configured prior.
+        Fixed mode likewise keeps the explicitly configured value.  Genuinely
+        new per-primitive rows start at the neutral ellipsoid shape (ε=1) so a
+        late spawn is not born with boxy corners it can no longer train away.
         """
         count = int(n)
         if self._sq_eps_mode == "shared" and reference is not None:
@@ -3264,6 +3774,8 @@ class OptimizationWorker(QtCore.QThread):
             if len(finite):
                 shared = np.mean(finite, axis=0, dtype=np.float64).astype(np.float32)
                 return np.repeat(shared[None, :], count, axis=0)
+        if self._sq_eps_mode == "per_primitive":
+            return np.ones((count, 2), dtype=np.float32)
         return self._init_eps(count)
 
     def _shape_state_np(
@@ -3607,10 +4119,10 @@ class OptimizationWorker(QtCore.QThread):
         aax = {0: 2, 1: 1, 2: 0}[self._sym_axis]
         g = self._sdf_target_np
         mirrored_grid = np.flip(g, axis=aax)
-        if self._sdf_blowup_offset < 0.0:
+        if self._sdf_blowup_fraction < 0.0:
             self._sdf_target_np = np.maximum(
                 g, mirrored_grid).astype(np.float32)
-        elif self._sdf_blowup_offset > 0.0:
+        elif self._sdf_blowup_fraction > 0.0:
             self._sdf_target_np = np.minimum(
                 g, mirrored_grid).astype(np.float32)
         else:
@@ -3623,7 +4135,7 @@ class OptimizationWorker(QtCore.QThread):
             # hole on the otherwise symmetric target.
             self._thickness_np = conservative_mirror_min(
                 self._thickness_np, axis=aax)
-            if self._sdf_blowup_offset != 0.0:
+            if self._sdf_blowup_fraction != 0.0:
                 self._sdf_blowup_thickness_np = self._thickness_np
         if self._sdf_samples is not None:
             self._sdf_samples = self._paired_symmetric_samples(
@@ -3682,6 +4194,13 @@ class OptimizationWorker(QtCore.QThread):
                 samples.coarse_mask[source_idx],
                 samples.coarse_mask[mirror_idx],
             ], axis=0)
+        paired_normals = None
+        if samples.normals is not None:
+            source_normals = samples.normals[source_idx]
+            mirror_normals = samples.normals[mirror_idx].copy()
+            mirror_normals[:, int(axis)] *= -1.0
+            paired_normals = np.concatenate(
+                [source_normals, mirror_normals], axis=0)
         return SdfSampleSet(
             points=paired_points,
             values=paired_values,
@@ -3689,6 +4208,87 @@ class OptimizationWorker(QtCore.QThread):
             dx=float(samples.dx),
             source=f"{samples.source}-symmetric",
             coarse_mask=paired_coarse,
+            normals=paired_normals,
+        )
+
+    def _normal_weight_at(
+        self,
+        step: int,
+        *,
+        dx: float,
+        total_steps: int | None = None,
+    ) -> float:
+        """Resolution-scaled normal weight after the configured warm-up/ramp."""
+        if self._normal_loss_weight <= 0.0:
+            return 0.0
+        steps = self._num_steps if total_steps is None else int(total_steps)
+        if int(step) < 0 or steps <= 1:
+            ramp = 1.0
+        else:
+            progress = float(step) / float(max(steps - 1, 1))
+            if progress <= self._normal_warmup_frac:
+                return 0.0
+            if self._normal_ramp_frac <= 0.0:
+                ramp = 1.0
+            else:
+                ramp = float(np.clip(
+                    (progress - self._normal_warmup_frac)
+                    / self._normal_ramp_frac,
+                    0.0,
+                    1.0,
+                ))
+        return float(self._normal_loss_weight) * float(dx) * ramp
+
+    def _normal_shape_kind(self) -> int:
+        if self._isotropic:
+            return 1
+        if self._superquadric:
+            return 2 if self._bent else 4
+        if self._capsule:
+            return 3
+        return 0
+
+    def _launch_predicted_normals(
+        self,
+        *,
+        centers,
+        radii,
+        rotations,
+        eps,
+        bend,
+        min_d_cache,
+        pred_normals,
+        num_e: int,
+        indices,
+        points=None,
+        origin=None,
+        dx: float | None = None,
+        nx: int | None = None,
+        ny: int | None = None,
+        nz: int | None = None,
+    ) -> None:
+        if points is not None:
+            wp.launch(
+                _primitive_normal_kernel_points,
+                dim=int(pred_normals.shape[0]),
+                inputs=[
+                    centers, radii, rotations, eps, bend,
+                    min_d_cache, int(num_e),
+                    self._normal_shape_kind(), points, indices, pred_normals,
+                ],
+                device=device,
+            )
+            return
+        wp.launch(
+            _primitive_normal_kernel_batch,
+            dim=int(pred_normals.shape[0]),
+            inputs=[
+                centers, radii, rotations, eps, bend,
+                min_d_cache, int(num_e),
+                self._normal_shape_kind(), origin, float(dx),
+                int(nx), int(ny), int(nz), indices, pred_normals,
+            ],
+            device=device,
         )
 
     def _alloc_buffers(
@@ -3791,6 +4391,11 @@ class OptimizationWorker(QtCore.QThread):
         sdf_pred = wp.empty(
             batch_size, dtype=wp.float32, device=device, requires_grad=True,
         )
+        pred_normals = None
+        if self._normal_loss_weight > 0.0:
+            pred_normals = wp.empty(
+                batch_size, dtype=wp.vec3, device=device, requires_grad=True,
+            )
         loss = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
         wp_indices = wp.empty(batch_size, dtype=wp.int32, device=device)
         if progress_cb is not None:
@@ -3807,6 +4412,7 @@ class OptimizationWorker(QtCore.QThread):
             pred_bend=pred_bend,
             min_d_cache=min_d_cache,
             sdf_pred=sdf_pred,
+            pred_normals=pred_normals,
             loss=loss,
             wp_indices=wp_indices,
         )
@@ -4320,15 +4926,24 @@ class OptimizationWorker(QtCore.QThread):
         count: int,
         rng: np.random.Generator,
     ) -> np.ndarray:
-        """Reserve candidate slots across represented nearest-bone regions."""
-        if (count <= 0 or not self._bone_aware or self._bone_centers_np is None
-                or self._num_bones <= 0 or len(pool) == 0):
+        """Reserve detector samples evenly across spatial/bone regions.
+
+        Spatial mesh regions take precedence.  Equal per-region detector quota
+        is deliberately stronger than area-proportional sampling: a small hand
+        or appendage cannot disappear statistically behind the torso.
+        """
+        region_centers = (
+            self._spatial_budget_centers_np
+            if self._spatial_budget_centers_np is not None
+            else (self._bone_centers_np if self._bone_aware else None)
+        )
+        if count <= 0 or region_centers is None or len(pool) == 0:
             return np.empty((0,), dtype=np.int64)
 
         probe_count = min(len(pool), max(int(count) * 4, int(count)))
         probe = self._sample_candidate_pool(pool, probe_count, rng)
         points = self._grid_points_from_flat(probe)
-        bones = np.asarray(self._bone_centers_np, dtype=np.float32).reshape(-1, 3)
+        bones = np.asarray(region_centers, dtype=np.float32).reshape(-1, 3)
         assignment = np.empty(len(points), dtype=np.int32)
         for start in range(0, len(points), 8192):
             stop = min(start + 8192, len(points))
@@ -4352,10 +4967,11 @@ class OptimizationWorker(QtCore.QThread):
                 if selected else np.empty((0,), dtype=np.int64))
 
     def _region_candidate_indices(self) -> np.ndarray:
-        """Cached exact-grid samples with guaranteed thin/bone representation."""
+        """Cached exact-grid samples with guaranteed thin/region representation."""
         key = (
             id(self._sdf_target_np), id(self._thickness_np), self._shape,
             float(self._dx), id(self._bone_centers_np), self._bone_aware,
+            id(self._spatial_budget_centers_np),
             int(self._region_candidate_budget),
             float(self._region_thin_candidate_fraction),
             float(self._region_bone_candidate_fraction),
@@ -4411,9 +5027,9 @@ class OptimizationWorker(QtCore.QThread):
                 selected_parts.append(
                     self._sample_candidate_pool(thin, n_thin, rng))
 
-        n_bone = int(round(budget * self._region_bone_candidate_fraction))
+        n_region = int(round(budget * self._region_bone_candidate_fraction))
         selected_parts.append(
-            self._bone_balanced_candidates(surface, n_bone, rng))
+            self._bone_balanced_candidates(surface, n_region, rng))
 
         selected = set()
         for part in selected_parts:
@@ -4461,7 +5077,55 @@ class OptimizationWorker(QtCore.QThread):
     def _pred_grid_from_params(
         self, centers, radii, rotations, eps=None, bend=None,
     ) -> np.ndarray:
-        if self._superquadric or self._capsule:
+        if self._superquadric:
+            total = int(self._nx * self._ny * self._nz)
+            if total == 0:
+                return np.empty(self._shape, dtype=np.float32)
+            centers = np.ascontiguousarray(centers, dtype=np.float32).reshape(-1, 3)
+            if len(centers) == 0:
+                return np.full(self._shape, 1.0e6, dtype=np.float32)
+            radii = np.ascontiguousarray(radii, dtype=np.float32).reshape(-1, 3)
+            rotations = np.ascontiguousarray(rotations, dtype=np.float32).reshape(-1, 4)
+            num_e = int(len(centers))
+            eps_np, bend_np = self._shape_state_np(num_e, eps, bend)
+            wp_centers = wp.array(centers, dtype=wp.vec3, device=device)
+            wp_radii = wp.array(radii, dtype=wp.vec3, device=device)
+            wp_rot = wp.array(rotations.reshape(-1), dtype=wp.float32, device=device)
+            wp_eps = wp.array(
+                np.ascontiguousarray(eps_np.reshape(-1)),
+                dtype=wp.float32, device=device)
+            wp_bend = (
+                wp.array(np.ascontiguousarray(bend_np.reshape(-1)),
+                         dtype=wp.float32, device=device)
+                if self._bent else None)
+
+            # Unlike the training kernels, this read-only prediction needs no
+            # per-voxel/primitive scan.  Generate voxel centres on the GPU and
+            # retain the uploaded parameters across chunks.  Bound the reusable
+            # output buffer to 16 MiB for high-resolution target grids.
+            chunk_size = min(total, _SQ_GRID_PRED_CHUNK_SIZE)
+            out = wp.empty(chunk_size, dtype=wp.float32, device=device)
+            result = np.empty(total, dtype=np.float32)
+            wp_origin = wp.vec3(*(float(v) for v in self._origin))
+            for start in range(0, total, chunk_size):
+                count = min(chunk_size, total - start)
+                if self._bent:
+                    wp.launch(
+                        _superquadric_sdf_grid_chunk, dim=count,
+                        inputs=[wp_centers, wp_radii, wp_rot, wp_eps, wp_bend,
+                                num_e, wp_origin, float(self._dx),
+                                self._nx, self._ny, start, out],
+                        device=device)
+                else:
+                    wp.launch(
+                        _plain_superquadric_sdf_grid_chunk, dim=count,
+                        inputs=[wp_centers, wp_radii, wp_rot, wp_eps,
+                                num_e, wp_origin, float(self._dx),
+                                self._nx, self._ny, start, out],
+                        device=device)
+                result[start:start + count] = out.numpy()[:count]
+            return result.reshape(self._shape)
+        if self._capsule:
             total = int(self._nx * self._ny * self._nz)
             result = np.empty(total, dtype=np.float32)
             chunk_size = 65_536
@@ -4487,32 +5151,35 @@ class OptimizationWorker(QtCore.QThread):
         rotations: np.ndarray,
         eps: np.ndarray | None = None,
         bend: np.ndarray | None = None,
-    ) -> np.ndarray:
+        return_normals: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """Evaluate the current primitive union at exact world-space points."""
         points = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
         centers = np.ascontiguousarray(centers, dtype=np.float32).reshape(-1, 3)
         radii = np.ascontiguousarray(radii, dtype=np.float32).reshape(-1, 3)
         rotations = np.ascontiguousarray(rotations, dtype=np.float32).reshape(-1, 4)
         if len(points) == 0:
-            return np.empty((0,), dtype=np.float32)
+            empty = np.empty((0,), dtype=np.float32)
+            if return_normals:
+                return empty, np.empty((0, 3), dtype=np.float32)
+            return empty
         if len(centers) == 0:
-            return np.full(len(points), 1.0e6, dtype=np.float32)
+            empty_union = np.full(len(points), 1.0e6, dtype=np.float32)
+            if return_normals:
+                return empty_union, np.zeros((len(points), 3), dtype=np.float32)
+            return empty_union
 
         num_e = int(len(centers))
         wp_centers = wp.array(centers, dtype=wp.vec3, device=device)
         wp_radii = wp.array(radii, dtype=wp.vec3, device=device)
         wp_rot = wp.array(rotations.reshape(-1), dtype=wp.float32, device=device)
-        if self._superquadric:
-            eps_np, bend_np = self._shape_state_np(num_e, eps, bend)
-            wp_eps = wp.array(
-                np.ascontiguousarray(eps_np.reshape(-1)),
-                dtype=wp.float32, device=device)
-            wp_bend = wp.array(
-                np.ascontiguousarray(bend_np.reshape(-1)),
-                dtype=wp.float32, device=device)
-        else:
-            wp_eps = None
-            wp_bend = None
+        eps_np, bend_np = self._shape_state_np(num_e, eps, bend)
+        wp_eps = wp.array(
+            np.ascontiguousarray(eps_np.reshape(-1)),
+            dtype=wp.float32, device=device)
+        wp_bend = wp.array(
+            np.ascontiguousarray(bend_np.reshape(-1)),
+            dtype=wp.float32, device=device)
 
         # The point kernels retain a per-sample scan over all primitives.  Chunk
         # launches to keep that temporary below roughly 32 MiB even for a large
@@ -4521,6 +5188,9 @@ class OptimizationWorker(QtCore.QThread):
         chunk_size = max(1, max_scan_values // max(num_e + 1, 1))
         chunk_size = min(int(chunk_size), len(points))
         result = np.empty(len(points), dtype=np.float32)
+        normal_result = (
+            np.empty((len(points), 3), dtype=np.float32)
+            if return_normals else None)
         for start in range(0, len(points), chunk_size):
             stop = min(start + chunk_size, len(points))
             chunk = points[start:stop]
@@ -4538,9 +5208,11 @@ class OptimizationWorker(QtCore.QThread):
                             wp_points, wp_indices, out], device=device)
             elif self._superquadric:
                 wp.launch(
-                    _superquadric_sdf_kernel_points, dim=count,
-                    inputs=[wp_centers, wp_radii, wp_rot, wp_eps, wp_bend,
-                            min_d, num_e, wp_points, wp_indices, out],
+                    (_superquadric_sdf_kernel_points if self._bent
+                     else _plain_superquadric_sdf_kernel_points), dim=count,
+                    inputs=[wp_centers, wp_radii, wp_rot, wp_eps]
+                           + ([wp_bend] if self._bent else [])
+                           + [min_d, num_e, wp_points, wp_indices, out],
                     device=device)
             elif self._capsule:
                 wp.launch(
@@ -4553,6 +5225,21 @@ class OptimizationWorker(QtCore.QThread):
                     inputs=[wp_centers, wp_radii, wp_rot, min_d, num_e,
                             wp_points, wp_indices, out], device=device)
             result[start:stop] = out.numpy()
+            if return_normals:
+                normal_out = wp.empty(count, dtype=wp.vec3, device=device)
+                wp.launch(
+                    _primitive_normal_kernel_points,
+                    dim=count,
+                    inputs=[
+                        wp_centers, wp_radii, wp_rot, wp_eps, wp_bend,
+                        min_d, num_e, self._normal_shape_kind(),
+                        wp_points, wp_indices, normal_out,
+                    ],
+                    device=device,
+                )
+                normal_result[start:stop] = normal_out.numpy()
+        if return_normals:
+            return result, normal_result
         return result
 
     def _detect_worst_regions(self, centers, radii, rotations, k,
@@ -4726,7 +5413,7 @@ class OptimizationWorker(QtCore.QThread):
             c = np.asarray(reg["seed_world"], dtype=np.float32)
             bone_idx = None
             if bone_counts is not None and bone_caps is not None:
-                assign = self._nearest_bone_indices_np(c.reshape(1, 3))
+                assign = self._nearest_growth_region_indices_np(c.reshape(1, 3))
                 if assign is not None:
                     bone_idx = int(assign[0])
                 if not self._bone_has_add_capacity(bone_idx, bone_counts, bone_caps):
@@ -4780,6 +5467,61 @@ class OptimizationWorker(QtCore.QThread):
             min_dists2[best] = 0.0
 
         return np.array(selected, dtype=int)
+
+    def _farthest_point_sample_with_spatial_capacity(
+        self,
+        candidates: np.ndarray,
+        errors: np.ndarray,
+        k: int,
+        existing_centers: np.ndarray,
+    ) -> np.ndarray:
+        """FPS that never seeds a mesh region beyond its final local cap."""
+        caps = self._spatial_budget_caps_np
+        assignment = self._nearest_growth_region_indices_np(candidates)
+        if caps is None or assignment is None:
+            return self._farthest_point_sample(
+                candidates, errors, k, existing_centers)
+
+        candidates = np.asarray(candidates, dtype=np.float32).reshape(-1, 3)
+        errors = np.asarray(errors, dtype=np.float32).reshape(-1)
+        k = min(max(0, int(k)), len(candidates), int(np.sum(caps)))
+        existing_assignment = self._nearest_growth_region_indices_np(
+            existing_centers)
+        counts = np.bincount(
+            existing_assignment if existing_assignment is not None
+            else np.empty((0,), dtype=np.int32),
+            minlength=len(caps),
+        ).astype(np.int32)
+
+        if len(existing_centers):
+            existing = np.asarray(existing_centers, dtype=np.float32).reshape(-1, 3)
+            min_dists2 = np.full(len(candidates), np.inf, dtype=np.float32)
+            for center in existing:
+                delta = candidates - center
+                min_dists2 = np.minimum(
+                    min_dists2, np.einsum("ij,ij->i", delta, delta))
+        else:
+            min_dists2 = np.full(len(candidates), 1.0e12, dtype=np.float32)
+
+        selected: list[int] = []
+        available = np.ones(len(candidates), dtype=bool)
+        for _ in range(k):
+            available &= counts[assignment] < caps[assignment]
+            if not np.any(available):
+                break
+            scores = min_dists2 * (errors + 1.0e-8)
+            scores[~available] = -np.inf
+            best = int(np.argmax(scores))
+            if not np.isfinite(scores[best]):
+                break
+            selected.append(best)
+            counts[int(assignment[best])] += 1
+            available[best] = False
+            delta = candidates - candidates[best]
+            min_dists2 = np.minimum(
+                min_dists2, np.einsum("ij,ij->i", delta, delta))
+            min_dists2[best] = 0.0
+        return np.asarray(selected, dtype=int)
 
     # ══════════════════════════════════════════════════════════════════
     # TRAINING LOOPS
@@ -4857,7 +5599,11 @@ class OptimizationWorker(QtCore.QThread):
         if (self._thickness_margin_np is None
                 or self._thickness_margin_np.shape != thick.shape
                 or self._thickness_margin_source_id != source_id):
-            self._thickness_margin_np = dilate_zeros(thick, iters=2).astype(np.float32)
+            self._thickness_margin_np = (
+                np.asarray(thick, dtype=np.float32)
+                if self._sdf_blowup_fraction != 0.0
+                else dilate_zeros(thick, iters=2).astype(np.float32)
+            )
             self._thickness_margin_source_id = source_id
         th = self._thickness_margin_np[ijk[:, 2], ijk[:, 1], ijk[:, 0]]
         return np.maximum(
@@ -5276,7 +6022,7 @@ class OptimizationWorker(QtCore.QThread):
                 elif spawn_enabled:
                     sbi = None
                     if bone_counts is not None and bone_caps is not None:
-                        assign = self._nearest_bone_indices_np(seed.reshape(1, 3))
+                        assign = self._nearest_growth_region_indices_np(seed.reshape(1, 3))
                         if assign is not None:
                             sbi = int(assign[0])
                     if self._bone_has_add_capacity(sbi, bone_counts, bone_caps):
@@ -5287,7 +6033,7 @@ class OptimizationWorker(QtCore.QThread):
             elif spawn_enabled:
                 bi = None
                 if bone_counts is not None and bone_caps is not None:
-                    assign = self._nearest_bone_indices_np(seed.reshape(1, 3))
+                    assign = self._nearest_growth_region_indices_np(seed.reshape(1, 3))
                     if assign is not None:
                         bi = int(assign[0])
                 if self._bone_has_add_capacity(bi, bone_counts, bone_caps):
@@ -6055,15 +6801,38 @@ class OptimizationWorker(QtCore.QThread):
         short equal axes + one long) are judged only by how far past the spike
         threshold they go, not flagged as flat.
         """
+        flat, spiky = self._degenerate_axis_flags(radii)
+        return np.where(flat | spiky)[0]
+
+    def _degenerate_axis_flags(
+        self, radii: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return per-row ``(flat, spiky)`` axis-ratio classifications."""
         r = np.abs(np.asarray(radii, dtype=np.float64))
         if len(r) == 0:
-            return np.array([], dtype=int)
+            empty = np.empty((0,), dtype=bool)
+            return empty, empty
         rmax = r.max(axis=1)
         rmin = r.min(axis=1)
         rmid = np.maximum(r.sum(axis=1) - rmax - rmin, 1e-9)
         flat = (rmin / rmid) < float(self._degenerate_flat_ratio)
         spiky = (rmax / rmid) > float(self._degenerate_spike_ratio)
-        return np.where(flat | spiky)[0]
+        return flat, spiky
+
+    def _detect_elongated_superquadrics(self, radii: np.ndarray) -> np.ndarray:
+        """Spiky SQ rows, longest-first, for split rather than hard deletion."""
+        if not self._superquadric:
+            return np.empty((0,), dtype=int)
+        r = np.abs(np.asarray(radii, dtype=np.float64))
+        _flat, spiky = self._degenerate_axis_flags(r)
+        idx = np.flatnonzero(spiky)
+        if idx.size == 0:
+            return np.empty((0,), dtype=int)
+        rmax = r.max(axis=1)
+        rmin = r.min(axis=1)
+        rmid = np.maximum(r.sum(axis=1) - rmax - rmin, 1e-9)
+        ratio = rmax / rmid
+        return idx[np.argsort(-ratio[idx], kind="stable")].astype(int)
 
     def _local_fit(self, centers, radii, rotations, offset, pool_flat, gstep=-1,
                    eps=None, bend=None):
@@ -6081,6 +6850,11 @@ class OptimizationWorker(QtCore.QThread):
         nx, ny, nz = self._nx, self._ny, self._nz
         total = nx * ny * nz
         self._ensure_thickness_wp(total)
+        wp_target_normals = None
+        if self._normal_loss_weight > 0.0:
+            wp_target_normals = wp.array(
+                sdf_grid_normals(self._sdf_target_np, float(dx)).reshape(-1, 3),
+                dtype=wp.vec3, device=device, requires_grad=False)
         num_e = len(centers)
         eps, bend = self._shape_state_np(num_e, eps, bend)
         n_active = num_e - offset
@@ -6100,6 +6874,7 @@ class OptimizationWorker(QtCore.QThread):
         pred_bend     = buf['pred_bend']
         min_d_cache   = buf['min_d_cache']
         sdf_pred      = buf['sdf_pred']
+        pred_normals  = buf['pred_normals']
         loss          = buf['loss']
         sdf_target    = buf['sdf_target']
         wp_indices    = buf['wp_indices']
@@ -6126,6 +6901,7 @@ class OptimizationWorker(QtCore.QThread):
         rot_offset = offset * 4
         shape_offset = offset * 2
         report_every = max(1, self._local_steps // 20)
+        normal_weight = self._normal_weight_at(gstep, dx=float(dx))
 
         for li in range(self._local_steps):
             if self._stop_flag:
@@ -6153,12 +6929,14 @@ class OptimizationWorker(QtCore.QThread):
                     )
                 elif self._superquadric:
                     wp.launch(
-                        _superquadric_sdf_kernel_batch,
+                        (_superquadric_sdf_kernel_batch if self._bent
+                         else _plain_superquadric_sdf_kernel_batch),
                         dim=bs,
                         inputs=[pred_centers, pred_radii, pred_rot_flat,
-                                pred_eps, pred_bend, min_d_cache,
-                                num_e, wp_origin, float(dx), nx, ny, nz,
-                                wp_indices, sdf_pred],
+                                pred_eps]
+                               + ([pred_bend] if self._bent else [])
+                               + [min_d_cache, num_e, wp_origin, float(dx),
+                                  nx, ny, nz, wp_indices, sdf_pred],
                         device=device,
                     )
                 elif self._capsule:
@@ -6179,6 +6957,20 @@ class OptimizationWorker(QtCore.QThread):
                                 wp_indices, sdf_pred],
                         device=device,
                     )
+                if normal_weight > 0.0:
+                    self._launch_predicted_normals(
+                        centers=pred_centers,
+                        radii=pred_radii,
+                        rotations=pred_rot_flat,
+                        eps=pred_eps,
+                        bend=pred_bend,
+                        min_d_cache=min_d_cache,
+                        pred_normals=pred_normals,
+                        num_e=num_e,
+                        indices=wp_indices,
+                        origin=wp_origin,
+                        dx=float(dx), nx=nx, ny=ny, nz=nz,
+                    )
                 loss.zero_()
                 wp.launch(
                     _rmse_loss_kernel_batch,
@@ -6192,6 +6984,17 @@ class OptimizationWorker(QtCore.QThread):
                             max(0.5 * float(dx), 1.0e-8)],
                     device=device,
                 )
+                if normal_weight > 0.0:
+                    wp.launch(
+                        _normal_loss_kernel_batch,
+                        dim=bs,
+                        inputs=[
+                            pred_normals, wp_target_normals, sdf_target,
+                            wp_indices, loss, bs, float(normal_weight),
+                            float(self._normal_band_vox) * float(dx),
+                        ],
+                        device=device,
+                    )
                 if self._flat_weight > 0.0:
                     wp.launch(
                         _flatness_penalty_kernel,
@@ -6316,15 +7119,27 @@ class OptimizationWorker(QtCore.QThread):
         """
         c0 = np.asarray(region_center, dtype=np.float32)
         half = float(half_extent)
-        # A dilated target may move outside the original local-fit box.  Keep
-        # the complete requested distance plus the existing two-voxel guard.
-        pad = 2.0 * float(self._dx) + abs(float(self._sdf_blowup_offset))
+        # A relative target may move farther on thick regions.  Pad by the
+        # largest actually possible local offset, not by the dimensionless
+        # fraction itself, plus the existing two-voxel guard.
+        cached_offset = getattr(
+            self, "_sdf_blowup_max_offset_world", None)
+        if cached_offset is None:
+            cached_offset = (
+                relative_blowup_extent_voxels(
+                    self._sdf_blowup_fraction,
+                    self._sdf_blowup_thickness_np,
+                    float(self._dx),
+                ) * float(self._dx)
+            )
+        max_offset = float(cached_offset)
+        pad = 2.0 * float(self._dx) + max_offset
         return (c0 - half - pad).astype(np.float32), (c0 + half + pad).astype(np.float32)
 
     def _apply_blowup_to_region_result(self, res) -> None:
         """Apply the whole-mesh thickness cap to one fresh local SDF box."""
-        requested = float(self._sdf_blowup_offset)
-        if requested == 0.0:
+        fraction = float(self._sdf_blowup_fraction)
+        if fraction == 0.0:
             return
 
         source = self._sdf_blowup_thickness_np
@@ -6367,15 +7182,16 @@ class OptimizationWorker(QtCore.QThread):
 
         res.blowup_thickness = np.ascontiguousarray(
             local_thickness, dtype=np.float32)
+        # This fresh region carrier is only guaranteed for the fraction that
+        # was sampled/applied here; never leave stale whole-grid cache metadata.
+        res.blowup_thickness_capacity_fraction = abs(fraction)
+        res.blowup_thickness_extent_vox = 0.0
         # Region maintenance/loss weighting must cover the moved exterior too.
         res.thickness = res.blowup_thickness
-        res.grid = apply_thickness_limited_blowup(
+        res.grid = apply_thickness_relative_blowup(
             res.grid,
-            requested,
+            fraction,
             res.blowup_thickness,
-            float(res.dx),
-            max_thickness_fraction=(
-                self._sdf_blowup_max_thickness_fraction),
         )
 
     def _region_divide_conquer(self, contrib_c, contrib_r, contrib_q,
@@ -6721,6 +7537,7 @@ class OptimizationWorker(QtCore.QThread):
         # ── 2) Combined sample pool: world points + target + thickness ──
         band = float(self._surface_band_vox)
         pts_list, tgt_list, th_list = [], [], []
+        normal_list = [] if self._normal_loss_weight > 0.0 else None
         any_thick = False
         # Ignore boxes that do not own a trainable primitive.  Their samples can
         # only pull a different box's primitive through the hard union minimum.
@@ -6740,8 +7557,16 @@ class OptimizationWorker(QtCore.QThread):
             pz = o[2] + (iz.astype(np.float32) + 0.5) * d
             pts_list.append(np.stack([px, py, pz], axis=1).astype(np.float32))
             tgt_list.append(flat_t[sel].astype(np.float32))
+            if normal_list is not None:
+                normal_list.append(
+                    sdf_grid_normals(m['res'].grid, d).reshape(-1, 3)[sel])
             if m['res'].thickness is not None:
-                th = dilate_zeros(m['res'].thickness, iters=2).ravel().astype(np.float32)
+                thickness_field = np.asarray(
+                    m['res'].thickness, dtype=np.float32)
+                if self._sdf_blowup_fraction == 0.0:
+                    thickness_field = dilate_zeros(
+                        thickness_field, iters=2)
+                th = thickness_field.ravel().astype(np.float32)
                 th_list.append(th[sel])
                 any_thick = True
             else:
@@ -6753,6 +7578,9 @@ class OptimizationWorker(QtCore.QThread):
         pool_points = np.concatenate(pts_list, axis=0).astype(np.float32)
         pool_targets = np.concatenate(tgt_list, axis=0).astype(np.float32)
         pool_thick = np.concatenate(th_list, axis=0).astype(np.float32)
+        pool_normals = (
+            None if normal_list is None
+            else np.concatenate(normal_list, axis=0).astype(np.float32))
         P = int(pool_points.shape[0])
         local_dx = float(min(boxes[b]['dx'] for b in active))
         local_surface_sigma = max(
@@ -6813,12 +7641,17 @@ class OptimizationWorker(QtCore.QThread):
             dx=local_dx,
             thickness=(pool_thick[validation_idx] if any_thick else None),
             thickness_reference=(thick_ref if any_thick else None),
+            normals=(None if pool_normals is None
+                     else pool_normals[validation_idx]),
         )
 
         # Pool is fixed for the whole fit → upload once.
         wp_points = wp.array(pool_points, dtype=wp.vec3, device=device)
         wp_targets = wp.array(pool_targets, dtype=wp.float32, device=device)
         wp_thick = wp.array(pool_thick, dtype=wp.float32, device=device)
+        wp_target_normals = (
+            None if pool_normals is None
+            else wp.array(pool_normals, dtype=wp.vec3, device=device))
 
         # Show every region box that actually holds a trainable — i.e. the small
         # high-res boxes currently being optimised, not one box over the whole
@@ -6931,6 +7764,7 @@ class OptimizationWorker(QtCore.QThread):
                 pred_bend_raw=buf['pred_bend_raw'], pred_bend=buf['pred_bend'],
                 prev_centers=wp.empty(num_e, dtype=wp.vec3, device=device),
                 min_d_cache=buf['min_d_cache'], sdf_pred=buf['sdf_pred'],
+                pred_normals=buf['pred_normals'],
                 loss=buf['loss'], wp_indices=buf['wp_indices'],
                 opt_c=_PopulationAdam(buf['pred_centers'], lr0),
                 opt_r=_PopulationAdam(
@@ -7115,6 +7949,7 @@ class OptimizationWorker(QtCore.QThread):
             return tc, tr, tq, te, tb
 
         state = None
+        normal_weight = self._normal_weight_at(gstep, dx=local_dx)
         completed_steps = 0
         for cycle in range(n_cycles):
             if self._stop_flag or int(train_c.shape[0]) == 0:
@@ -7137,6 +7972,7 @@ class OptimizationWorker(QtCore.QThread):
             prev_centers = state['prev_centers']
             min_d_cache = state['min_d_cache']
             sdf_pred = state['sdf_pred']
+            pred_normals = state['pred_normals']
             loss = state['loss']
             wp_indices = state['wp_indices']
             (cl_lo, cl_hi, cl_logmin, cl_logmax,
@@ -7177,11 +8013,14 @@ class OptimizationWorker(QtCore.QThread):
                             device=device)
                     elif self._superquadric:
                         wp.launch(
-                            _superquadric_sdf_kernel_points,
+                            (_superquadric_sdf_kernel_points if self._bent
+                             else _plain_superquadric_sdf_kernel_points),
                             dim=bs,
                             inputs=[pred_centers, pred_radii, pred_rot_flat,
-                                    pred_eps, pred_bend,
-                                    min_d_cache, num_e, wp_points, wp_indices, sdf_pred],
+                                    pred_eps]
+                                   + ([pred_bend] if self._bent else [])
+                                   + [min_d_cache, num_e, wp_points, wp_indices,
+                                      sdf_pred],
                             device=device)
                     elif self._capsule:
                         wp.launch(
@@ -7197,6 +8036,19 @@ class OptimizationWorker(QtCore.QThread):
                             inputs=[pred_centers, pred_radii, pred_rot_flat,
                                     min_d_cache, num_e, wp_points, wp_indices, sdf_pred],
                             device=device)
+                    if normal_weight > 0.0:
+                        self._launch_predicted_normals(
+                            centers=pred_centers,
+                            radii=pred_radii,
+                            rotations=pred_rot_flat,
+                            eps=pred_eps,
+                            bend=pred_bend,
+                            min_d_cache=min_d_cache,
+                            pred_normals=pred_normals,
+                            num_e=num_e,
+                            indices=wp_indices,
+                            points=wp_points,
+                        )
                     loss.zero_()
                     wp.launch(
                         _rmse_loss_kernel_batch,
@@ -7210,6 +8062,16 @@ class OptimizationWorker(QtCore.QThread):
                             float(thin_w), float(self._thin_max_factor),
                             max(0.5 * local_dx, 1.0e-8)],
                         device=device)
+                    if normal_weight > 0.0:
+                        wp.launch(
+                            _normal_loss_kernel_batch,
+                            dim=bs,
+                            inputs=[
+                                pred_normals, wp_target_normals, wp_targets,
+                                wp_indices, loss, bs, float(normal_weight),
+                                float(self._normal_band_vox) * local_dx,
+                            ],
+                            device=device)
                     if self._flat_weight > 0.0:
                         wp.launch(
                             _flatness_penalty_kernel,
@@ -7395,12 +8257,19 @@ class OptimizationWorker(QtCore.QThread):
         out_b = np.concatenate([fixed_b, train_b], axis=0).astype(np.float32)
 
         def _validation_loss(c_values, r_values, q_values, e_values, b_values):
-            prediction = self._pred_points_from_params(
+            prediction_result = self._pred_points_from_params(
                 validation_sample.points,
-                c_values, r_values, q_values, e_values, b_values)
+                c_values, r_values, q_values, e_values, b_values,
+                return_normals=(normal_weight > 0.0))
+            if normal_weight > 0.0:
+                prediction, prediction_normals = prediction_result
+            else:
+                prediction = prediction_result
+                prediction_normals = None
             return float(evaluate_validation_loss(
                 prediction,
                 validation_sample,
+                prediction_normals=prediction_normals,
                 huber_delta=max(0.5 * local_dx, 1.0e-8),
                 miss_weight=float(self._miss_penalty_weight),
                 surface_weight=float(self._surface_weight),
@@ -7410,6 +8279,8 @@ class OptimizationWorker(QtCore.QThread):
                 thin_max_factor=float(self._thin_max_factor),
                 thickness_reference=(thick_ref if any_thick else None),
                 coarse_far_weight=0.0,
+                normal_weight=(normal_weight / max(local_dx, 1.0e-12)),
+                normal_band=float(self._normal_band_vox) * local_dx,
             ).total)
 
         # Counterfactual acceptance is row-local: retain a refined primitive
@@ -7553,9 +8424,18 @@ class OptimizationWorker(QtCore.QThread):
             eps, bend = eps[keep], bend[keep]
             lineage = lineage[keep]
 
-        # ── 0a2) Delete degenerate shapes (too flat / too pointy) ──
-        deg_idx = (self._detect_degenerate_ellipsoids(radii)
-                   if densify_active else np.empty(0, dtype=int))
+        # ── 0a2) Delete collapsed shapes ─────────────────────────────
+        # A long, thin superquadric can still be the useful carrier of a limb or
+        # another narrow feature.  Keep those rows for the prioritised split pass
+        # below; only genuinely flat SQs remain hard-delete candidates.  For the
+        # other primitive families retain the historic flat-or-spiky deletion.
+        if densify_active and self._superquadric:
+            flat, spiky = self._degenerate_axis_flags(radii)
+            deg_idx = np.flatnonzero(flat & ~spiky)
+        elif densify_active:
+            deg_idx = self._detect_degenerate_ellipsoids(radii)
+        else:
+            deg_idx = np.empty(0, dtype=int)
         # Never wipe the whole population in one round (safety against a bad fit
         # transiently making everything degenerate).
         if 0 < len(deg_idx) < len(centers):
@@ -7661,15 +8541,17 @@ class OptimizationWorker(QtCore.QThread):
         # ── Densify: SPLIT over-represented ellipsoids + SPLIT/SPAWN in under-rep
         # Both mechanisms are independently switchable (split_enabled /
         # spawn_underrep); merge is gated in _detect_merges by merge_enabled.
-        # 1) Over-represented ellipsoids to split (net +1 each): a *bridging* one
-        #    spanning the gap between structures (prioritised), or one that
-        #    *protrudes* past the surface.  Combine both, bridging-first, dedup.
+        # 1) Over-represented ellipsoids to split (net +1 each): an elongated SQ,
+        #    a *bridging* one spanning the gap between structures, or one that
+        #    *protrudes* past the surface.  Elongated SQs go first so the spike
+        #    threshold repairs them instead of deleting useful thin coverage.
         targets, seen = [], set()
         if self._split_enabled:
+            elongated = self._detect_elongated_superquadrics(radii)
             bridge = viz_bridge           # reuse the analysis-snapshot detections
             protr = viz_protr
             cap_over = int(min(self._split_per_round, budget))
-            for v in list(bridge) + list(protr):
+            for v in list(elongated) + list(bridge) + list(protr):
                 v = int(v)
                 if v not in seen and len(targets) < cap_over:
                     if not self._reserve_split_bone_capacity(
@@ -7720,7 +8602,7 @@ class OptimizationWorker(QtCore.QThread):
                     mr = spawn_r.copy()
                     mq = _mirror_quats(spawn_q, a).astype(np.float32)
                     keep_mirror: list[int] = []
-                    mirror_assign = self._nearest_bone_indices_np(mc)
+                    mirror_assign = self._nearest_growth_region_indices_np(mc)
                     for mi in range(len(mc)):
                         bi = None
                         if mirror_assign is not None:
@@ -7968,7 +8850,11 @@ class OptimizationWorker(QtCore.QThread):
         if self._wp_thickness is not None:
             return
         if self._thickness_np is not None:
-            flat = dilate_zeros(self._thickness_np, iters=2).ravel().astype(np.float32)
+            thickness_field = np.asarray(
+                self._thickness_np, dtype=np.float32)
+            if self._sdf_blowup_fraction == 0.0:
+                thickness_field = dilate_zeros(thickness_field, iters=2)
+            flat = thickness_field.ravel().astype(np.float32)
             interior = flat[flat > 0.0]
             self._thick_ref = float(np.median(interior)) if interior.size else 1.0
             self._thin_weight_eff = float(self._thin_loss_weight)
@@ -7987,7 +8873,11 @@ class OptimizationWorker(QtCore.QThread):
         if self._sdf_samples is None:
             return None
         if self._uploaded_samples is None:
-            self._uploaded_samples = UploadedSdfSamples(self._sdf_samples, device)
+            self._uploaded_samples = UploadedSdfSamples(
+                self._sdf_samples,
+                device,
+                include_normals=(self._normal_loss_weight > 0.0),
+            )
             th = self._sdf_samples.thickness
             if th is not None:
                 valid = th[th > 0.0]
@@ -8020,6 +8910,7 @@ class OptimizationWorker(QtCore.QThread):
                     1.0 - coarse_fraction),
                 coarse_fraction=coarse_fraction,
                 seed=0,
+                include_normals=(self._normal_loss_weight > 0.0),
             )
 
         thickness = None
@@ -8035,6 +8926,7 @@ class OptimizationWorker(QtCore.QThread):
             surface_band=float(self._surface_band_vox) * float(self._dx),
             surface_fraction=float(self._surface_fraction),
             seed=0,
+            include_normals=(self._normal_loss_weight > 0.0),
         )
 
     # ── naive SGD ─────────────────────────────────────────────────────
@@ -8048,6 +8940,11 @@ class OptimizationWorker(QtCore.QThread):
         if self._symmetry_enabled and not self._sym_checked:
             self._setup_symmetry()
         self._ensure_thickness_wp(total)
+        wp_target_normals = None
+        if self._normal_loss_weight > 0.0:
+            wp_target_normals = wp.array(
+                sdf_grid_normals(self._sdf_target_np, float(dx)).reshape(-1, 3),
+                dtype=wp.vec3, device=device, requires_grad=False)
         num_e = self._num_ellipsoids
         bs = self._batch_size
 
@@ -8069,6 +8966,7 @@ class OptimizationWorker(QtCore.QThread):
         pred_bend     = buf['pred_bend']
         min_d_cache   = buf['min_d_cache']
         sdf_pred      = buf['sdf_pred']
+        pred_normals  = buf['pred_normals']
         loss          = buf['loss']
         sdf_target    = buf['sdf_target']
         wp_indices    = buf['wp_indices']
@@ -8119,10 +9017,12 @@ class OptimizationWorker(QtCore.QThread):
                 pred_bend     = buf['pred_bend']
                 min_d_cache   = buf['min_d_cache']
                 sdf_pred      = buf['sdf_pred']
+                pred_normals  = buf['pred_normals']
                 loss          = buf['loss']
                 wp_indices    = buf['wp_indices']
 
             wp_indices.assign(sampler.next_batch())
+            normal_weight = self._normal_weight_at(step, dx=float(dx))
 
             tape = wp.Tape()
             with tape:
@@ -8141,12 +9041,14 @@ class OptimizationWorker(QtCore.QThread):
                     )
                 elif self._superquadric:
                     wp.launch(
-                        _superquadric_sdf_kernel_batch,
+                        (_superquadric_sdf_kernel_batch if self._bent
+                         else _plain_superquadric_sdf_kernel_batch),
                         dim=bs,
                         inputs=[pred_centers, pred_radii, pred_rot_flat,
-                                pred_eps, pred_bend, min_d_cache,
-                                num_e, wp_origin, float(dx), nx, ny, nz,
-                                wp_indices, sdf_pred],
+                                pred_eps]
+                               + ([pred_bend] if self._bent else [])
+                               + [min_d_cache, num_e, wp_origin, float(dx),
+                                  nx, ny, nz, wp_indices, sdf_pred],
                         device=device,
                     )
                 elif self._capsule:
@@ -8167,6 +9069,20 @@ class OptimizationWorker(QtCore.QThread):
                                 wp_indices, sdf_pred],
                         device=device,
                     )
+                if normal_weight > 0.0:
+                    self._launch_predicted_normals(
+                        centers=pred_centers,
+                        radii=pred_radii,
+                        rotations=pred_rot_flat,
+                        eps=pred_eps,
+                        bend=pred_bend,
+                        min_d_cache=min_d_cache,
+                        pred_normals=pred_normals,
+                        num_e=num_e,
+                        indices=wp_indices,
+                        origin=wp_origin,
+                        dx=float(dx), nx=nx, ny=ny, nz=nz,
+                    )
                 loss.zero_()
                 wp.launch(
                     _rmse_loss_kernel_batch,
@@ -8180,6 +9096,17 @@ class OptimizationWorker(QtCore.QThread):
                             max(0.5 * float(dx), 1.0e-8)],
                     device=device,
                 )
+                if normal_weight > 0.0:
+                    wp.launch(
+                        _normal_loss_kernel_batch,
+                        dim=bs,
+                        inputs=[
+                            pred_normals, wp_target_normals, sdf_target,
+                            wp_indices, loss, bs, float(normal_weight),
+                            float(self._normal_band_vox) * float(dx),
+                        ],
+                        device=device,
+                    )
                 if self._flat_weight > 0.0:
                     wp.launch(
                         _flatness_penalty_kernel,
@@ -8191,15 +9118,18 @@ class OptimizationWorker(QtCore.QThread):
 
             tape.backward(loss)
 
-            wp.launch(_sgd_step_vec3, dim=num_e,
-                      inputs=[pred_centers, tape.gradients[pred_centers], lr],
-                      device=device)
-            wp.launch(_sgd_step_vec3, dim=num_e,
-                      inputs=[pred_radii, tape.gradients[pred_radii], lr],
-                      device=device)
-            wp.launch(_sgd_step_f32, dim=num_e * 4,
-                      inputs=[pred_rot_flat, tape.gradients[pred_rot_flat], lr],
-                      device=device)
+            if self._optimize_centers:
+                wp.launch(_sgd_step_vec3, dim=num_e,
+                          inputs=[pred_centers, tape.gradients[pred_centers], lr],
+                          device=device)
+            if self._optimize_radii:
+                wp.launch(_sgd_step_vec3, dim=num_e,
+                          inputs=[pred_radii, tape.gradients[pred_radii], lr],
+                          device=device)
+            if self._optimize_rotations:
+                wp.launch(_sgd_step_f32, dim=num_e * 4,
+                          inputs=[pred_rot_flat, tape.gradients[pred_rot_flat], lr],
+                          device=device)
             if self._eps_is_trainable(step):
                 wp.launch(
                     _sgd_step_f32,
@@ -8214,13 +9144,21 @@ class OptimizationWorker(QtCore.QThread):
                     inputs=[pred_bend_raw, tape.gradients[pred_bend_raw],
                             float(lr * self._sq_bend_lr_mult)],
                     device=device)
-            wp.launch(_normalize_flat_quats, dim=num_e,
-                      inputs=[pred_rot_flat], device=device)
+            if self._optimize_rotations:
+                wp.launch(_normalize_flat_quats, dim=num_e,
+                          inputs=[pred_rot_flat], device=device)
             # Sphere: naive path trains world radii directly — project them
             # (mean of the 3 components) + reset rotation each step.
-            self._project_isotropic(pred_radii, pred_rot_flat, num_e)
+            if self._isotropic and num_e > 0:
+                if self._optimize_radii:
+                    wp.launch(_broadcast_log_radii, dim=num_e,
+                              inputs=[pred_radii], device=device)
+                if self._optimize_rotations:
+                    wp.launch(_reset_rot_identity, dim=num_e,
+                              inputs=[pred_rot_flat], device=device)
             # Capsule: circular cross-section (r1 = r0).
-            self._project_capsule(pred_radii, num_e)
+            if self._optimize_radii:
+                self._project_capsule(pred_radii, num_e)
             if self._symmetry_enabled and self._sym_axis is not None:
                 self._project_symmetry_inplace(
                     pred_centers, pred_radii, pred_rot_flat,
@@ -8300,6 +9238,16 @@ class OptimizationWorker(QtCore.QThread):
             self._ensure_thickness_wp(total)
             target_values_np = self._sdf_target_np.ravel()
             target_thickness_np = self._thickness_flat
+        if self._normal_loss_weight <= 0.0:
+            wp_target_normals = None
+        elif use_sample_targets:
+            wp_target_normals = uploaded_samples.normals
+        else:
+            dense_target_normals = sdf_grid_normals(
+                self._sdf_target_np, float(dx)).reshape(-1, 3)
+            wp_target_normals = wp.array(
+                dense_target_normals,
+                dtype=wp.vec3, device=device, requires_grad=False)
         num_e = self._num_ellipsoids
         bs = self._batch_size
 
@@ -8328,6 +9276,7 @@ class OptimizationWorker(QtCore.QThread):
         pred_bend     = buf['pred_bend']
         min_d_cache   = buf['min_d_cache']
         sdf_pred      = buf['sdf_pred']
+        pred_normals  = buf['pred_normals']
         loss          = buf['loss']
         sdf_target    = buf['sdf_target']
         wp_indices    = buf['wp_indices']
@@ -8579,15 +9528,22 @@ class OptimizationWorker(QtCore.QThread):
             finite_geometry = all(
                 np.isfinite(state[name]).all() for name in geometry_keys)
             if finite_geometry:
-                prediction = self._pred_points_from_params(
+                prediction_result = self._pred_points_from_params(
                     validation_sample.points,
                     state["world_centers"], state["radii"],
                     state["world_rotations"],
                     state.get("eps"), state.get("bend"),
+                    return_normals=(self._normal_loss_weight > 0.0),
                 )
+                if self._normal_loss_weight > 0.0:
+                    prediction, prediction_normals = prediction_result
+                else:
+                    prediction = prediction_result
+                    prediction_normals = None
                 measured = evaluate_validation_loss(
                     prediction,
                     validation_sample,
+                    prediction_normals=prediction_normals,
                     huber_delta=float(self._loss_huber_delta),
                     miss_weight=float(self._miss_penalty_weight),
                     surface_weight=float(self._surface_weight),
@@ -8600,6 +9556,8 @@ class OptimizationWorker(QtCore.QThread):
                         float(SPARSE_FAR_FIELD_WEIGHT)
                         if use_sample_targets else 0.0),
                     coarse_huber_delta=max(4.0 * float(dx), 0.02),
+                    normal_weight=float(self._normal_loss_weight),
+                    normal_band=float(self._normal_band_vox) * float(dx),
                 )
                 value = float(measured.total)
             else:
@@ -8794,6 +9752,7 @@ class OptimizationWorker(QtCore.QThread):
                 pred_bend     = buf['pred_bend']
                 min_d_cache   = buf['min_d_cache']
                 sdf_pred      = buf['sdf_pred']
+                pred_normals  = buf['pred_normals']
                 loss          = buf['loss']
                 wp_indices    = buf['wp_indices']
 
@@ -8809,6 +9768,7 @@ class OptimizationWorker(QtCore.QThread):
                         num_e, dtype=wp.float32, device=device, requires_grad=True)
 
             wp_indices.assign(sampler.next_batch())
+            normal_weight = self._normal_weight_at(step, dx=float(dx))
 
             tape = wp.Tape()
             with tape:
@@ -8843,24 +9803,29 @@ class OptimizationWorker(QtCore.QThread):
                     elif self._superquadric:
                         if use_sample_targets:
                             wp.launch(
-                                _superquadric_softmin_kernel_points,
+                                (_superquadric_softmin_kernel_points if self._bent
+                                 else _plain_superquadric_softmin_kernel_points),
                                 dim=bs,
                                 inputs=[fit_centers, pred_radii, fit_rot_flat,
-                                        pred_eps, pred_bend,
-                                        min_d_cache, soft_s_cache, num_e,
-                                        uploaded_samples.points, wp_indices,
-                                        sdf_pred, float(self._soft_k(step))],
+                                        pred_eps]
+                                       + ([pred_bend] if self._bent else [])
+                                       + [min_d_cache, soft_s_cache, num_e,
+                                          uploaded_samples.points, wp_indices,
+                                          sdf_pred, float(self._soft_k(step))],
                                 device=device,
                             )
                         else:
                             wp.launch(
-                                _superquadric_softmin_kernel_batch,
+                                (_superquadric_softmin_kernel_batch if self._bent
+                                 else _plain_superquadric_softmin_kernel_batch),
                                 dim=bs,
                                 inputs=[fit_centers, pred_radii, fit_rot_flat,
-                                        pred_eps, pred_bend,
-                                        min_d_cache, soft_s_cache, num_e, wp_origin,
-                                        float(dx), nx, ny, nz, wp_indices, sdf_pred,
-                                        float(self._soft_k(step))],
+                                        pred_eps]
+                                       + ([pred_bend] if self._bent else [])
+                                       + [min_d_cache, soft_s_cache, num_e,
+                                          wp_origin, float(dx), nx, ny, nz,
+                                          wp_indices, sdf_pred,
+                                          float(self._soft_k(step))],
                                 device=device,
                             )
                     elif self._capsule:
@@ -8905,22 +9870,26 @@ class OptimizationWorker(QtCore.QThread):
                 elif self._superquadric:
                     if use_sample_targets:
                         wp.launch(
-                            _superquadric_sdf_kernel_points,
+                            (_superquadric_sdf_kernel_points if self._bent
+                             else _plain_superquadric_sdf_kernel_points),
                             dim=bs,
                             inputs=[fit_centers, pred_radii, fit_rot_flat,
-                                    pred_eps, pred_bend,
-                                    min_d_cache, num_e, uploaded_samples.points,
-                                    wp_indices, sdf_pred],
+                                    pred_eps]
+                                   + ([pred_bend] if self._bent else [])
+                                   + [min_d_cache, num_e, uploaded_samples.points,
+                                      wp_indices, sdf_pred],
                             device=device,
                         )
                     else:
                         wp.launch(
-                            _superquadric_sdf_kernel_batch,
+                            (_superquadric_sdf_kernel_batch if self._bent
+                             else _plain_superquadric_sdf_kernel_batch),
                             dim=bs,
                             inputs=[fit_centers, pred_radii, fit_rot_flat,
-                                    pred_eps, pred_bend,
-                                    min_d_cache, num_e, wp_origin, float(dx),
-                                    nx, ny, nz, wp_indices, sdf_pred],
+                                    pred_eps]
+                                   + ([pred_bend] if self._bent else [])
+                                   + [min_d_cache, num_e, wp_origin, float(dx),
+                                      nx, ny, nz, wp_indices, sdf_pred],
                             device=device,
                         )
                 elif self._capsule:
@@ -8961,6 +9930,22 @@ class OptimizationWorker(QtCore.QThread):
                                     nx, ny, nz, wp_indices, sdf_pred],
                             device=device,
                         )
+                if normal_weight > 0.0:
+                    self._launch_predicted_normals(
+                        centers=fit_centers,
+                        radii=pred_radii,
+                        rotations=fit_rot_flat,
+                        eps=pred_eps,
+                        bend=pred_bend,
+                        min_d_cache=min_d_cache,
+                        pred_normals=pred_normals,
+                        num_e=num_e,
+                        indices=wp_indices,
+                        points=(uploaded_samples.points
+                                if use_sample_targets else None),
+                        origin=wp_origin,
+                        dx=float(dx), nx=nx, ny=ny, nz=nz,
+                    )
                 loss.zero_()
                 wp.launch(
                     _rmse_loss_kernel_batch,
@@ -8976,6 +9961,17 @@ class OptimizationWorker(QtCore.QThread):
                             float(self._loss_huber_delta)],
                     device=device,
                 )
+                if normal_weight > 0.0:
+                    wp.launch(
+                        _normal_loss_kernel_batch,
+                        dim=bs,
+                        inputs=[
+                            pred_normals, wp_target_normals, sdf_target,
+                            wp_indices, loss, bs, float(normal_weight),
+                            float(self._normal_band_vox) * float(dx),
+                        ],
+                        device=device,
+                    )
                 if use_sample_targets and sample_targets.coarse_mask is not None:
                     wp.launch(
                         _coarse_far_field_loss_kernel,
@@ -9054,13 +10050,16 @@ class OptimizationWorker(QtCore.QThread):
             opt_c.lr = lr
             opt_r.lr = lr * self._lr_mult_radii
             opt_q.lr = lr * self._lr_mult_rot
-            if self._center_step_radius_frac > 0.0:
+            if self._optimize_centers and self._center_step_radius_frac > 0.0:
                 wp.launch(_copy_vec3_range, dim=num_e,
                           inputs=[pred_centers, prev_centers, 0],
                           device=device)
-            opt_c.step(grad_c)
-            opt_r.step(grad_r)
-            opt_q.step(grad_q)
+            if self._optimize_centers:
+                opt_c.step(grad_c)
+            if self._optimize_radii:
+                opt_r.step(grad_r)
+            if self._optimize_rotations:
+                opt_q.step(grad_q)
             if self._eps_is_trainable(step):
                 opt_eps.lr = lr * self._sq_eps_lr_mult
                 opt_eps.step(grad_eps)
@@ -9069,7 +10068,7 @@ class OptimizationWorker(QtCore.QThread):
                 opt_bend.step(grad_bend)
             tape.zero()
 
-            if self._center_step_radius_frac > 0.0:
+            if self._optimize_centers and self._center_step_radius_frac > 0.0:
                 wp.launch(
                     _limit_center_step_by_radius,
                     dim=num_e,
@@ -9082,9 +10081,12 @@ class OptimizationWorker(QtCore.QThread):
                     ],
                     device=device)
 
+            center_trust = (self._parameter_center_trust_radius_factor
+                            if self._optimize_centers else 0.0)
+            radius_trust = (self._parameter_log_radius_limit
+                            if self._optimize_radii else 0.0)
             if parameter_anchor_wp is not None and (
-                    self._parameter_center_trust_radius_factor > 0.0
-                    or self._parameter_log_radius_limit > 0.0):
+                    center_trust > 0.0 or radius_trust > 0.0):
                 wp.launch(
                     _project_parameter_trust_region_kernel,
                     dim=num_e,
@@ -9092,8 +10094,8 @@ class OptimizationWorker(QtCore.QThread):
                         pred_centers, pred_log_radii,
                         parameter_anchor_wp[0], parameter_anchor_wp[1],
                         parameter_anchor_wp[3],
-                        float(self._parameter_center_trust_radius_factor),
-                        float(self._parameter_log_radius_limit),
+                        float(center_trust),
+                        float(radius_trust),
                     ],
                     device=device,
                 )
@@ -9103,8 +10105,9 @@ class OptimizationWorker(QtCore.QThread):
             # but the STORED quats drift off unit otherwise — and anything that
             # reads them without normalising (the SDF-slice union grid, exports)
             # would then see ellipsoids vanish (|q|>1) or balloon (|q|<1).
-            wp.launch(_normalize_flat_quats, dim=num_e,
-                      inputs=[pred_rot_flat], device=device)
+            if self._optimize_rotations:
+                wp.launch(_normalize_flat_quats, dim=num_e,
+                          inputs=[pred_rot_flat], device=device)
 
             # Hard mirror: the trained source half moved this step → re-derive the
             # mirror half from it and re-pin the on-plane block, in place (Adam
@@ -9121,18 +10124,27 @@ class OptimizationWorker(QtCore.QThread):
                                                pred_bend_raw if self._bent else None)
 
             # Sphere: project to isotropic radii + identity rotation each step.
-            self._project_isotropic(pred_log_radii, pred_rot_flat, num_e)
+            if self._isotropic and num_e > 0:
+                if self._optimize_radii:
+                    wp.launch(_broadcast_log_radii, dim=num_e,
+                              inputs=[pred_log_radii], device=device)
+                if self._optimize_rotations:
+                    wp.launch(_reset_rot_identity, dim=num_e,
+                              inputs=[pred_rot_flat], device=device)
             # Capsule: keep the cross-section circular (r1 = r0) each step.
-            self._project_capsule(pred_log_radii, num_e)
+            if self._optimize_radii:
+                self._project_capsule(pred_log_radii, num_e)
             # Superquadric: keep per-primitive roundness in a safe range, and
             # bound centres + (log-)radii so the harsher SQ/bend gradients can't
             # drive a primitive to inf (a generous safety net).
             if self._superquadric:
-                wp.launch(_clamp_log_radii, dim=num_e,
-                          inputs=[pred_log_radii, _log_rmin, _log_rmax],
-                          device=device)
-                wp.launch(_clamp_centers_range, dim=num_e,
-                          inputs=[pred_centers, _c_lo, _c_hi, 0], device=device)
+                if self._optimize_radii:
+                    wp.launch(_clamp_log_radii, dim=num_e,
+                              inputs=[pred_log_radii, _log_rmin, _log_rmax],
+                              device=device)
+                if self._optimize_centers:
+                    wp.launch(_clamp_centers_range, dim=num_e,
+                              inputs=[pred_centers, _c_lo, _c_hi, 0], device=device)
 
             report_due = (step % self._report_every == 0)
             validation_due = (
@@ -9158,14 +10170,18 @@ class OptimizationWorker(QtCore.QThread):
                     and validation_patience.should_stop)
 
             if report_due:
-                self._emit_progress(step, loss, fit_centers, pred_radii,
-                                    fit_rot_flat, num_e, origin, dx, n,
-                                    pred_eps=(pred_eps
-                                              if self._superquadric else None),
-                                    pred_bend=pred_bend if self._bent else None)
+                if self._emit_intermediate_progress:
+                    self._emit_progress(
+                        step, loss, fit_centers, pred_radii,
+                        fit_rot_flat, num_e, origin, dx, n,
+                        pred_eps=(pred_eps
+                                  if self._superquadric else None),
+                        pred_bend=pred_bend if self._bent else None,
+                    )
 
                 wp.synchronize_device(device)
                 loss_val = float(loss.numpy()[0])
+                self.step_status.emit(int(step), loss_val)
                 if loss_val < 1e-10:
                     break
             if stop_for_patience:

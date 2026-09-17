@@ -5,7 +5,7 @@ Features:
   - Live-Plot der Loss-Kurve via pyqtgraph
   - Dropdown zur Auswahl vergangener und aktueller Runs
   - Run-Metadaten (Methode, #Ellipsoide, Schritte, …)
-  - Runs können benannt und als JSON gespeichert werden
+  - Runs können als JSON gespeichert werden
   - Gespeicherte Runs überleben die Session
 """
 
@@ -148,6 +148,7 @@ class RunTrackerPanel(QtWidgets.QWidget):
         self._run_combo.setCurrentIndex(self._run_combo.count() - 1)
         self._ensure_plot_curve(rec)
         self._update_info()
+        self._refresh_plot_visibility()
         return rec
 
     def record_step(self, step: int, loss: float) -> None:
@@ -166,6 +167,7 @@ class RunTrackerPanel(QtWidgets.QWidget):
             if idx >= 0:
                 self._run_combo.setItemText(idx, self._current_run.display_name)
             self._update_info()
+            self._refresh_plot_visibility()
 
     # ══════════════════════════════════════════════════════════════════
     # UI CONSTRUCTION
@@ -198,34 +200,27 @@ class RunTrackerPanel(QtWidgets.QWidget):
         self._plot.setLabel("left", "Loss")
         self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._plot.addLegend(offset=(10, 10))
-        layout.addWidget(self._plot, stretch=3)
+        # The curve is the primary content of this tab; let it consume all
+        # vertical space that is not needed by the compact controls below.
+        layout.addWidget(self._plot, stretch=1)
 
         # ── Show-all checkbox ─────────────────────────────────────────
         self._chk_show_all = QtWidgets.QCheckBox("Show all runs")
-        self._chk_show_all.setChecked(False)
+        self._chk_show_all.setChecked(True)
         self._chk_show_all.toggled.connect(self._refresh_plot_visibility)
         layout.addWidget(self._chk_show_all)
 
         # ── Info area ─────────────────────────────────────────────────
         self._info_text = QtWidgets.QTextEdit()
         self._info_text.setReadOnly(True)
-        self._info_text.setMaximumHeight(150)
-        layout.addWidget(self._info_text, stretch=1)
+        self._info_text.setMaximumHeight(118)
+        self._info_text.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum,
+        )
+        layout.addWidget(self._info_text)
 
         # Background / foreground colours follow light/dark mode.
         self.apply_theme()
-
-        # ── Name + rename ─────────────────────────────────────────────
-        row_name = QtWidgets.QHBoxLayout()
-        row_name.addWidget(QtWidgets.QLabel("Name:"))
-        self._edit_name = QtWidgets.QLineEdit()
-        self._edit_name.setPlaceholderText("Name run …")
-        self._edit_name.returnPressed.connect(self._on_rename)
-        row_name.addWidget(self._edit_name)
-        self._btn_rename = QtWidgets.QPushButton("Rename")
-        self._btn_rename.clicked.connect(self._on_rename)
-        row_name.addWidget(self._btn_rename)
-        layout.addLayout(row_name)
 
         # ── Action buttons ────────────────────────────────────────────
         row_actions = QtWidgets.QHBoxLayout()
@@ -329,13 +324,31 @@ class RunTrackerPanel(QtWidgets.QWidget):
     def _refresh_plot_visibility(self):
         show_all = self._chk_show_all.isChecked()
         selected = self._selected_run()
+        selected_id = selected.run_id if selected is not None else None
+        active_id = None
+        if self._current_run is not None and not self._current_run.finished:
+            active_id = self._current_run.run_id
+
         for run_id, curve in self._plot_items.items():
-            if show_all:
-                curve.setVisible(True)
-            elif selected and run_id == selected.run_id:
-                curve.setVisible(True)
+            # The live curve remains visible even while an older run is selected.
+            visible = show_all or run_id in (selected_id, active_id)
+            curve.setVisible(visible)
+
+            color = self._run_colors.get(run_id, theme.YELLOW)
+            if run_id == active_id:
+                # Current optimisation: saturated, thicker and drawn on top.
+                opacity, width, z_value = 1.0, 3.0, 20.0
+            elif active_id is not None and run_id == selected_id:
+                # An explicitly inspected historic run remains readable without
+                # competing visually with the live result.
+                opacity, width, z_value = 0.60, 2.0, 10.0
+            elif active_id is None and run_id == selected_id:
+                opacity, width, z_value = 1.0, 2.5, 20.0
             else:
-                curve.setVisible(False)
+                opacity, width, z_value = 0.26, 1.25, 0.0
+            curve.setOpacity(opacity)
+            curve.setPen(pg.mkPen(color=color, width=width))
+            curve.setZValue(z_value)
 
     # ══════════════════════════════════════════════════════════════════
     # INFO PANEL
@@ -345,15 +358,10 @@ class RunTrackerPanel(QtWidgets.QWidget):
         rec = self._selected_run()
         if rec is None:
             self._info_text.setPlainText("No run selected.")
-            self._edit_name.clear()
             return
-
-        self._edit_name.setText(rec.name)
 
         status = "Completed" if rec.finished else "Running …"
         lines = [
-            f"ID:             {rec.run_id}",
-            f"Name:           {rec.name or '(unnamed)'}",
             f"Status:         {status}",
             f"Mesh:           {rec.mesh_name or '—'}",
             f"Method:         {rec.method}",
@@ -372,28 +380,8 @@ class RunTrackerPanel(QtWidgets.QWidget):
         self._info_text.setPlainText("\n".join(lines))
 
     # ══════════════════════════════════════════════════════════════════
-    # ACTIONS: rename, save, delete, export
+    # ACTIONS: save, delete, export
     # ══════════════════════════════════════════════════════════════════
-
-    def _on_rename(self):
-        rec = self._selected_run()
-        if rec is None:
-            return
-        new_name = self._edit_name.text().strip()
-        if not new_name:
-            return
-        rec.name = new_name
-        idx = self._find_combo_index(rec.run_id)
-        if idx >= 0:
-            self._run_combo.setItemText(idx, rec.display_name)
-        if rec.run_id in self._plot_items:
-            self._plot_items[rec.run_id].opts["name"] = new_name
-            self._plot.plotItem.legend.clear()
-            for rid, curve in self._plot_items.items():
-                r = next((x for x in self._runs if x.run_id == rid), None)
-                lbl = r.name if (r and r.name) else rid
-                self._plot.plotItem.legend.addItem(curve, lbl)
-        self._update_info()
 
     def _on_save(self):
         rec = self._selected_run()
@@ -438,6 +426,7 @@ class RunTrackerPanel(QtWidgets.QWidget):
         if rec is self._current_run:
             self._current_run = None
         self._update_info()
+        self._refresh_plot_visibility()
 
     def _on_copy_csv(self):
         rec = self._selected_run()
@@ -466,3 +455,4 @@ class RunTrackerPanel(QtWidgets.QWidget):
                     curve.setVisible(False)
             except Exception as e:
                 print(f"[RunTracker] Could not load {fp.name}: {e}")
+        self._refresh_plot_visibility()

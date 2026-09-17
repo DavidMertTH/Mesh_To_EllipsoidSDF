@@ -56,6 +56,27 @@ class SuperquadricUiPlumbingTest(unittest.TestCase):
                     ):
                         self.assertIn(name, worker_parameters)
 
+    def test_superquadric_defaults_start_neutral_and_unlock_early(self) -> None:
+        worker_parameters = inspect.signature(
+            OptimizationWorker.__init__).parameters
+        self.assertEqual(worker_parameters["sq_eps1"].default, 1.0)
+        self.assertEqual(worker_parameters["sq_eps2"].default, 1.0)
+        self.assertEqual(worker_parameters["sq_unlock_frac"].default, 0.05)
+
+        for shape_type in (SuperquadricShape, BentSuperquadricShape):
+            with self.subTest(shape=shape_type.__name__):
+                shape = shape_type()
+                shape.options_widget()
+                kwargs = shape.fit_kwargs()
+                self.assertEqual(kwargs["sq_eps1"], 1.0)
+                self.assertEqual(kwargs["sq_eps2"], 1.0)
+                self.assertEqual(kwargs["sq_eps_mode"], "per_primitive")
+                self.assertEqual(kwargs["sq_unlock_frac"], 0.05)
+                state = shape.panel_state()
+                self.assertEqual(state["eps1"], 1.0)
+                self.assertEqual(state["eps2"], 1.0)
+                self.assertEqual(state["eps_warmup"], 5)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
