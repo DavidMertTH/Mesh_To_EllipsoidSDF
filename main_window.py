@@ -787,6 +787,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._startup_blowup_fraction: float | None = None
         try:
             _startup_shared = self._startup_panel_state.get("shared", {})
+            if (isinstance(_startup_shared, dict)
+                    and "sdf_grid_n" in _startup_shared):
+                set_widget_value(
+                    self._mesh_sdf_panel.spin_n, "int",
+                    _startup_shared["sdf_grid_n"])
             if "blowup_fraction" in _startup_shared:
                 self._startup_blowup_fraction = float(
                     _startup_shared["blowup_fraction"])
@@ -1573,6 +1578,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         return [
             ("margin",          self._slider_margin,       "int"),
+            ("sdf_grid_n",      self._mesh_sdf_panel.spin_n, "int"),
             ("num_ellipsoids",  self._spin_num_ellipsoids, "int"),
             ("max_ellipsoids",  self._spin_max_ellipsoids, "int"),
             ("max_steps",       self._spin_max_steps,      "int"),
@@ -4152,6 +4158,9 @@ class MainWindow(QtWidgets.QMainWindow):
         rng = self._viewer.show_thickness(
             mesh_result.thickness, mesh_result.origin,
             mesh_result.dx, mesh_result.n,
+            sample_stride_vox=getattr(
+                mesh_result, "thickness_stride_vox", 1.0),
+            sdf_grid=mesh_result.grid,
         )
         if rng is not None:
             self._status.showMessage(

@@ -307,6 +307,111 @@ def _vertex_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return (vn / np.maximum(norm, 1e-12)).astype(np.float32)
 
 
+def _sample_sdf_trilinear(
+    grid: np.ndarray,
+    points: np.ndarray,
+    origin: np.ndarray,
+    dx: float,
+) -> np.ndarray:
+    """Sample a voxel-centred SDF; positions beyond the grid are exterior."""
+    nz, ny, nx = grid.shape
+    hi = np.array([nx - 1, ny - 1, nz - 1], dtype=np.int64)
+    q = (points - origin) / float(dx) - 0.5
+    inside = np.all((q >= -0.5) & (q <= hi + 0.5), axis=1)
+    q = np.clip(q, 0.0, hi)
+    lo = np.floor(q).astype(np.int64)
+    upper = np.minimum(lo + 1, hi)
+    frac = q - lo
+    x0, y0, z0 = lo[:, 0], lo[:, 1], lo[:, 2]
+    x1, y1, z1 = upper[:, 0], upper[:, 1], upper[:, 2]
+    fx, fy, fz = frac[:, 0], frac[:, 1], frac[:, 2]
+    c00 = grid[z0, y0, x0] * (1.0 - fx) + grid[z0, y0, x1] * fx
+    c10 = grid[z0, y1, x0] * (1.0 - fx) + grid[z0, y1, x1] * fx
+    c01 = grid[z1, y0, x0] * (1.0 - fx) + grid[z1, y0, x1] * fx
+    c11 = grid[z1, y1, x0] * (1.0 - fx) + grid[z1, y1, x1] * fx
+    sampled = ((c00 * (1.0 - fy) + c10 * fy) * (1.0 - fz)
+               + (c01 * (1.0 - fy) + c11 * fy) * fz)
+    return np.where(inside, sampled, 1.0e6).astype(np.float32)
+
+
+def _surface_ball_thickness(
+    verts: np.ndarray,
+    faces: np.ndarray,
+    sdf_grid: np.ndarray,
+    origin: np.ndarray,
+    dx: float,
+) -> np.ndarray:
+    """Estimate the largest interior ball touching each mesh vertex.
+
+    At a smooth surface point, the centre of any interior ball touching it
+    lies on its inward normal.  Along that ray, a ball still contains the
+    surface point while its SDF depth is at least the travelled distance.
+    Stop at the first medial boundary, before another body part can be read.
+    """
+    normals = _vertex_normals(verts, faces)
+    valid_normals = np.linalg.norm(normals, axis=1) > 0.5
+    step = 0.5 * float(dx)
+    origin = np.asarray(origin, dtype=np.float32)
+    verts = np.asarray(verts, dtype=np.float32)
+    grid = np.asarray(sdf_grid, dtype=np.float32)
+
+    # Prefer the oriented inward normal.  Flip only if that side stays outside
+    # while the other side enters; nearby disconnected parts may make both
+    # probes negative, so picking the deeper one would cross into that part.
+    minus = _sample_sdf_trilinear(grid, verts - normals * dx, origin, dx)
+    plus = _sample_sdf_trilinear(grid, verts + normals * dx, origin, dx)
+    flipped = (minus >= 0.0) & (plus < 0.0)
+    inward = np.where(flipped[:, None], normals, -normals)
+    surface_sdf = _sample_sdf_trilinear(grid, verts, origin, dx)
+    near_surface = np.isfinite(surface_sdf) & (np.abs(surface_sdf) <= 2.0 * dx)
+    surface = verts + inward * np.clip(surface_sdf, -dx, dx)[:, None]
+
+    best_radius = np.zeros(len(verts), dtype=np.float32)
+    entered = np.zeros(len(verts), dtype=bool)
+    misses = np.zeros(len(verts), dtype=np.uint8)
+    active = valid_normals & near_surface
+    tolerance = float(dx)
+    max_steps = max(int(max(grid.shape)), 1)
+    for j in range(1, max_steps + 1):
+        active_ids = np.flatnonzero(active)
+        if active_ids.size == 0:
+            break
+        travel = j * step
+        points = surface[active_ids] + inward[active_ids] * travel
+        depth = -_sample_sdf_trilinear(grid, points, origin, dx)
+        inside = depth > 0.0
+        contained = inside & (depth >= travel - tolerance)
+        accepted_ids = active_ids[contained]
+        if accepted_ids.size:
+            best_radius[accepted_ids] = np.maximum(
+                best_radius[accepted_ids], depth[contained])
+        entered[active_ids] |= inside
+        failed = entered[active_ids] & ~contained
+        misses[active_ids] = np.where(
+            failed, np.minimum(misses[active_ids] + 1, 2), 0)
+        active[active_ids] = (
+            (misses[active_ids] < 2)
+            & (entered[active_ids] | (travel < 3.0 * dx)))
+    return 2.0 * best_radius
+
+
+def _thickness_colors_from_values(
+    thickness: np.ndarray,
+    vmin: float | None,
+    vmax: float | None,
+) -> tuple[np.ndarray, float, float]:
+    pos = thickness[thickness > 0.0]
+    if vmin is None:
+        vmin = float(np.percentile(pos, 5)) if pos.size else 0.0
+    if vmax is None:
+        vmax = float(np.percentile(pos, 95)) if pos.size else 1.0
+    t = (thickness - vmin) / max(vmax - vmin, 1e-6)
+    rgb = _colormap_jet(t)
+    alpha = np.ones((len(thickness), 1), dtype=np.float32)
+    colors = np.concatenate([rgb, alpha], axis=1).astype(np.float32)
+    return colors, float(vmin), float(vmax)
+
+
 def thickness_vertex_colors(
     verts: np.ndarray,
     faces: np.ndarray,
@@ -316,11 +421,17 @@ def thickness_vertex_colors(
     n: int,
     vmin: float | None = None,
     vmax: float | None = None,
+    sample_stride_vox: float = 1.0,
+    sdf_grid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, float]:
-    """Per-vertex RGBA colours from the local-thickness field.
+    """Per-vertex RGBA colours from the mesh's local surface thickness.
 
     Returns (colors (V,4) float32, vmin, vmax) where vmin/vmax are the colour
     range actually used (5th/95th percentile of the sampled thickness).
+
+    When an SDF is available, measure the largest interior ball touching each
+    surface vertex directly from the SDF.  This avoids gaps caused by the
+    volume-thickness sphere rasterizer's aggressive centre-only skip.
 
     ``local_thickness`` fills the *interior* of each feature with the full
     inscribed-sphere diameter, but surface vertices sit on the zero level set
@@ -329,8 +440,15 @@ def thickness_vertex_colors(
     inward vertex normal* and take the max thickness encountered, which pulls
     each feature's true diameter onto its surface (torso → warm, fingers → cool).
     """
-    tg = _dilate_zeros(thickness_grid, iters=2)
     verts = verts.astype(np.float32)
+    if sdf_grid is not None:
+        if np.asarray(sdf_grid).shape != np.asarray(thickness_grid).shape:
+            raise ValueError("SDF and thickness grids must have the same shape")
+        th = _surface_ball_thickness(
+            verts, faces, sdf_grid, origin, dx)
+        return _thickness_colors_from_values(th, vmin, vmax)
+
+    tg = _dilate_zeros(thickness_grid, iters=2)
     normals = _vertex_normals(verts, faces)
 
     # Per-axis bounds from the (possibly anisotropic) grid — ``n`` is kept only
@@ -339,29 +457,45 @@ def thickness_vertex_colors(
     hi = np.array([g_nx - 1, g_ny - 1, g_nz - 1])
 
     def _sample(points: np.ndarray) -> np.ndarray:
-        q = (points - origin.astype(np.float32)) / float(dx)
-        idx = np.clip(np.floor(q).astype(np.int64), 0, hi)
-        return tg[idx[:, 2], idx[:, 1], idx[:, 0]]   # grid is (nz, ny, nx)
+        # Trilinear sampling avoids voxel-boundary jumps becoming visible as
+        # speckled colours on dense meshes.  Clamp each corner independently
+        # so vertices at the grid boundary remain valid.
+        # The SDF samples live at voxel centres, half a cell past ``origin``.
+        q = (points - origin.astype(np.float32)) / float(dx) - 0.5
+        q = np.clip(q, 0.0, hi.astype(np.float32))
+        lo = np.floor(q).astype(np.int64)
+        upper = np.minimum(lo + 1, hi)
+        frac = q - lo.astype(np.float32)
+        x0, y0, z0 = lo[:, 0], lo[:, 1], lo[:, 2]
+        x1, y1, z1 = upper[:, 0], upper[:, 1], upper[:, 2]
+        fx, fy, fz = frac[:, 0], frac[:, 1], frac[:, 2]
+        c000 = tg[z0, y0, x0]
+        c100 = tg[z0, y0, x1]
+        c010 = tg[z0, y1, x0]
+        c110 = tg[z0, y1, x1]
+        c001 = tg[z1, y0, x0]
+        c101 = tg[z1, y0, x1]
+        c011 = tg[z1, y1, x0]
+        c111 = tg[z1, y1, x1]
+        c00 = c000 * (1.0 - fx) + c100 * fx
+        c10 = c010 * (1.0 - fx) + c110 * fx
+        c01 = c001 * (1.0 - fx) + c101 * fx
+        c11 = c011 * (1.0 - fx) + c111 * fx
+        c0 = c00 * (1.0 - fy) + c10 * fy
+        c1 = c01 * (1.0 - fy) + c11 * fy
+        return c0 * (1.0 - fz) + c1 * fz
 
     # March inward (and a little outward) along the normal, keep the max.
     th = _sample(verts)
     steps = 8
+    step_world = float(dx) * max(float(sample_stride_vox), 1.0)
     for j in range(1, steps + 1):
-        off = normals * (float(j) * float(dx))
+        off = normals * (float(j) * step_world)
         th = np.maximum(th, _sample(verts - off))    # inward (true interior side)
         if j <= 2:
             th = np.maximum(th, _sample(verts + off))  # cover flipped-normal faces
 
-    pos = th[th > 0.0]
-    if vmin is None:
-        vmin = float(np.percentile(pos, 5)) if pos.size else 0.0
-    if vmax is None:
-        vmax = float(np.percentile(pos, 95)) if pos.size else 1.0
-    t = (th - vmin) / max(vmax - vmin, 1e-6)
-    rgb = _colormap_jet(t)
-    alpha = np.ones((len(verts), 1), dtype=np.float32)
-    colors = np.concatenate([rgb, alpha], axis=1).astype(np.float32)
-    return colors, float(vmin), float(vmax)
+    return _thickness_colors_from_values(th, vmin, vmax)
 
 
 # ── Base viewer ───────────────────────────────────────────────────────────────
@@ -1586,6 +1720,8 @@ class SceneViewer3D(_BaseViewer):
         origin: np.ndarray,
         dx: float,
         n: int,
+        sample_stride_vox: float = 1.0,
+        sdf_grid: np.ndarray | None = None,
     ) -> tuple[float, float] | None:
         """Compute the per-vertex thickness heatmap and cache it.
 
@@ -1598,6 +1734,8 @@ class SceneViewer3D(_BaseViewer):
             return None
         colors, vmin, vmax = thickness_vertex_colors(
             self._mesh_verts, self._mesh_faces, thickness_grid, origin, dx, n,
+            sample_stride_vox=sample_stride_vox,
+            sdf_grid=sdf_grid,
         )
         self._thickness_colors = colors
         if self._mesh_render_mode == RENDER_THICKNESS:

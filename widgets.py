@@ -256,9 +256,8 @@ class SdfSlicePanel(QtWidgets.QWidget):
         self._error_source_provider: Optional[
             Callable[[], tuple[np.ndarray, np.ndarray, np.ndarray] | None]
         ] = None
-        # Default grid resolution.  The host lowers this (→ 64) when no CUDA GPU
-        # is present, since the n³ SDF runs on the CPU there and 512³ is far too
-        # heavy.  Not persisted, so it is re-applied per session.
+        # Default grid resolution.  The host lowers this on CPU-only systems;
+        # MainWindow then restores the user's saved choice before loading a mesh.
         self._default_n = int(default_n)
         self._build_ui()
 
