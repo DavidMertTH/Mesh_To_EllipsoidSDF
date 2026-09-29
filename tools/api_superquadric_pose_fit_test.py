@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import app_settings  # noqa: E402
 from main_window import MainWindow  # noqa: E402
 
 
@@ -68,6 +69,13 @@ def _entry(index: int, *, primitive_type=None, eps=None, alias=False):
 
 
 class ApiSuperquadricPoseFitTest(unittest.TestCase):
+    def test_center_lr_multiplier_is_forwarded_to_the_optimizer(self) -> None:
+        self.assertEqual(app_settings.defaults()["lr_mult_centers"], 1.0)
+        self.assertEqual(
+            MainWindow._optimizer_settings({"lr_mult_centers": 2.5}),
+            {"lr_mult_centers": 2.5},
+        )
+
     def test_pose_refit_settings_and_request_overrides(self) -> None:
         defaults = MainWindow._api_pose_fit_transform_flags({}, {})
         self.assertEqual(defaults, {

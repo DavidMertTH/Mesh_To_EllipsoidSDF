@@ -251,7 +251,7 @@ class SparseSuperquadricSoftminRegressionTest(unittest.TestCase):
                 msg=f"{name} did not update")
         self.assertGreater(float(np.min(radii.numpy())), 0.0)
 
-    def test_sparse_thickness_upload_and_thin_sampling_quota(self) -> None:
+    def test_sparse_thickness_upload_and_continuous_sampling(self) -> None:
         samples = self.samples
         worker = OptimizationWorker(
             sdf_target_np=np.zeros((8, 8, 8), dtype=np.float32),
@@ -280,17 +280,21 @@ class SparseSuperquadricSoftminRegressionTest(unittest.TestCase):
             surface_fraction=0.70,
             rng=np.random.default_rng(17),
             flat_thickness=samples.thickness,
-            thin_bias=1.0,
+            thickness_sampling_power=1.0,
             coarse_mask=samples.coarse_mask,
         )
-        self.assertIsNotNone(sampler._band_thin)
-        expected_thin = int(round(sampler.n_surf * sampler._thin_quota))
-        self.assertGreater(expected_thin, 0)
+        self.assertIsNotNone(sampler._band_cdf)
+        probabilities = np.diff(np.concatenate([
+            np.asarray([0.0]), sampler._band_cdf]))
+        self.assertTrue(np.all(probabilities > 0.0))
         batch = sampler.next_batch()
-        thin_pool = set(int(index) for index in sampler._band_thin)
-        self.assertTrue(all(int(index) in thin_pool
-                            for index in batch[:expected_thin]))
-        self.assertTrue(np.all(samples.thickness[batch[:expected_thin]] == 0.01))
+        surface_batch = batch[:sampler.n_surf]
+        # Equal-size populations at thickness 0.01 and 0.10 receive an
+        # expected 10:1 probability ratio, continuously rather than as quotas.
+        thin_count = np.count_nonzero(
+            samples.thickness[surface_batch] == 0.01)
+        self.assertGreater(thin_count, 0.80 * sampler.n_surf)
+        self.assertLess(thin_count, sampler.n_surf)
         self.assertGreaterEqual(
             np.count_nonzero(samples.coarse_mask[batch]), sampler.n_far)
 

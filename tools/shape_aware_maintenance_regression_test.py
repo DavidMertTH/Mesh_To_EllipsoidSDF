@@ -60,6 +60,124 @@ def _worker(
 
 
 class ShapeAwareMaintenanceRegressionTest(unittest.TestCase):
+    def test_underrepresented_region_prefers_spawn_at_analysis_seed(self) -> None:
+        worker = _worker(
+            primitive_shape="ellipsoid",
+            num_ellipsoids=1,
+            max_ellipsoids=3,
+        )
+        seed = np.array([0.04, -0.03, 0.02], dtype=np.float32)
+        region = {
+            "seed_world": seed,
+            "seed_depth": 0.5,
+            "severity": 4.0,
+        }
+        centers = np.array([[0.05, -0.03, 0.02]], dtype=np.float32)
+        radii = np.full((1, 3), 0.3, dtype=np.float32)
+        rotations = _identity_quats(1)
+
+        split_targets, spawn_regions = worker._densify_regions(
+            centers,
+            radii,
+            rotations,
+            [region],
+            budget=1,
+            split_enabled=True,
+            spawn_enabled=True,
+        )
+
+        self.assertEqual(split_targets, [])
+        self.assertEqual(len(spawn_regions), 1)
+        np.testing.assert_array_equal(spawn_regions[0]["seed_world"], seed)
+
+        fallback_splits, fallback_spawns = worker._densify_regions(
+            centers,
+            radii,
+            rotations,
+            [region],
+            budget=1,
+            split_enabled=True,
+            spawn_enabled=False,
+        )
+        self.assertEqual(fallback_splits, [0])
+        self.assertEqual(fallback_spawns, [])
+
+    def test_spawn_diameter_is_sixty_percent_of_local_thickness(self) -> None:
+        dx = 0.1
+        worker = _worker(
+            primitive_shape="ellipsoid",
+            dx=dx,
+            num_ellipsoids=1,
+            max_ellipsoids=3,
+        )
+        seed = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+        deep_region = {
+            "seed_world": seed,
+            "seed_depth": 0.9,
+            "seed_thickness": 0.8,
+            "severity": 5.0,
+        }
+
+        centers, radii, rotations, sites = worker._spawn_in_regions(
+            [deep_region], budget=1)
+
+        np.testing.assert_array_equal(centers[0], seed)
+        expected_circumradius = 0.5 * 0.60 * deep_region["seed_thickness"]
+        np.testing.assert_allclose(
+            radii[0], expected_circumradius, atol=1.0e-7)
+        np.testing.assert_array_equal(
+            rotations[0], np.array([0.0, 0.0, 0.0, 1.0], np.float32))
+        self.assertEqual(len(sites), 1)
+
+        sq_worker = _worker(
+            primitive_shape="superquadric",
+            dx=dx,
+            num_ellipsoids=1,
+            max_ellipsoids=3,
+        )
+        _sq_c, sq_r, _sq_q, _sq_sites = sq_worker._spawn_in_regions(
+            [deep_region], budget=1)
+        family_factor = sq_worker._spawn_shape_radius_factor()
+        self.assertAlmostEqual(
+            float(sq_r[0, 0]) * family_factor,
+            expected_circumradius,
+            places=6,
+        )
+
+        capsule_worker = _worker(
+            primitive_shape="capsule",
+            dx=dx,
+            num_ellipsoids=1,
+            max_ellipsoids=3,
+        )
+        _cap_c, cap_r, _cap_q, _cap_sites = capsule_worker._spawn_in_regions(
+            [deep_region], budget=1)
+        self.assertAlmostEqual(
+            float(cap_r[0, 0] + cap_r[0, 2]),
+            expected_circumradius,
+            places=6,
+        )
+
+    def test_shallow_underrepresented_region_still_gets_minimum_seed(self) -> None:
+        dx = 0.1
+        worker = _worker(
+            primitive_shape="ellipsoid",
+            dx=dx,
+            num_ellipsoids=1,
+            max_ellipsoids=3,
+        )
+        region = {
+            "seed_world": np.zeros(3, dtype=np.float32),
+            "seed_depth": 0.02,
+            "severity": 3.0,
+        }
+
+        centers, radii, _rotations, _sites = worker._spawn_in_regions(
+            [region], budget=1)
+
+        self.assertEqual(len(centers), 1)
+        np.testing.assert_allclose(radii[0], 0.25 * dx, atol=1.0e-7)
+
     def test_boxy_sq_coverage_includes_corner_missed_by_ellipsoid_proxy(self) -> None:
         dx = 0.2
         origin = np.full(3, -1.1, dtype=np.float32)

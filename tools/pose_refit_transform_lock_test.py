@@ -100,6 +100,24 @@ class PoseRefitTransformLockTest(unittest.TestCase):
                 np.testing.assert_allclose(observed, initial,
                                            rtol=1.0e-6, atol=1.0e-6)
 
+    def test_zero_center_lr_multiplier_freezes_only_position(self) -> None:
+        centers, radii, rotations = _run_fit(lr_mult_centers=0.0)
+        np.testing.assert_allclose(centers, INITIAL_CENTER,
+                                   rtol=1.0e-6, atol=1.0e-6)
+        self.assertGreater(
+            np.max(np.abs(radii - INITIAL_RADII)), 1.0e-4)
+        self.assertGreater(
+            np.max(np.abs(rotations - INITIAL_ROTATION)), 1.0e-4)
+
+    def test_center_lr_multiplier_scales_position_updates(self) -> None:
+        unit_centers, _, _ = _run_fit(
+            lr_mult_centers=1.0, center_step_radius_frac=0.0)
+        fast_centers, _, _ = _run_fit(
+            lr_mult_centers=2.0, center_step_radius_frac=0.0)
+        unit_delta = float(np.linalg.norm(unit_centers - INITIAL_CENTER))
+        fast_delta = float(np.linalg.norm(fast_centers - INITIAL_CENTER))
+        self.assertGreater(fast_delta, 1.5 * unit_delta)
+
     def test_all_disabled_channels_preserve_full_transform(self) -> None:
         centers, radii, rotations = _run_fit(
             optimize_centers=False,
@@ -160,6 +178,16 @@ class PoseRefitTransformLockTest(unittest.TestCase):
                                    rtol=1.0e-6, atol=1.0e-6)
         np.testing.assert_allclose(rotations, INITIAL_ROTATION,
                                    rtol=1.0e-6, atol=1.0e-6)
+
+    def test_sgd_fallback_honors_zero_center_lr_multiplier(self) -> None:
+        centers, radii, rotations = _run_fit(
+            method="sgd", lr_mult_centers=0.0)
+        np.testing.assert_allclose(centers, INITIAL_CENTER,
+                                   rtol=1.0e-6, atol=1.0e-6)
+        self.assertGreater(
+            np.max(np.abs(radii - INITIAL_RADII)), 1.0e-4)
+        self.assertGreater(
+            np.max(np.abs(rotations - INITIAL_ROTATION)), 1.0e-4)
 
 
 if __name__ == "__main__":

@@ -137,6 +137,7 @@ class SdfSampleSet:
     source: str = "samples"
     coarse_mask: np.ndarray | None = None
     normals: np.ndarray | None = None
+    thickness_sampling_power: float = 0.0
 
     def __post_init__(self) -> None:
         self.points = np.ascontiguousarray(self.points, dtype=np.float32).reshape(-1, 3)
@@ -158,6 +159,12 @@ class SdfSampleSet:
                 self.normals, dtype=np.float32).reshape(-1, 3)
             if self.normals.shape[0] != self.values.shape[0]:
                 raise ValueError("SdfSampleSet normal/value count mismatch")
+        self.thickness_sampling_power = float(
+            self.thickness_sampling_power)
+        if (not np.isfinite(self.thickness_sampling_power)
+                or self.thickness_sampling_power < 0.0):
+            raise ValueError(
+                "thickness_sampling_power must be finite and non-negative")
 
     @property
     def size(self) -> int:
@@ -174,6 +181,7 @@ class SdfSampleSet:
             source=self.source,
             coarse_mask=self.coarse_mask,
             normals=self.normals,
+            thickness_sampling_power=self.thickness_sampling_power,
         )
 
     def with_thickness_limited_offset(
@@ -221,6 +229,7 @@ class SdfSampleSet:
             source=self.source,
             coarse_mask=self.coarse_mask,
             normals=adjusted_normals,
+            thickness_sampling_power=self.thickness_sampling_power,
         )
 
     def with_thickness_relative_offset(
@@ -258,6 +267,7 @@ class SdfSampleSet:
             source=self.source,
             coarse_mask=self.coarse_mask,
             normals=adjusted_normals,
+            thickness_sampling_power=self.thickness_sampling_power,
         )
 
     @classmethod

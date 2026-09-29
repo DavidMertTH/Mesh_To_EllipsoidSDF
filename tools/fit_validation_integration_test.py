@@ -89,6 +89,39 @@ def _run_direct(worker: OptimizationWorker) -> None:
     worker._run_adam()
 
 
+def _force_population_growth_at_step_one(
+    self,
+    step,
+    pred_centers,
+    pred_radii,
+    pred_rot_flat,
+    pred_eps=None,
+    pred_bend=None,
+):
+    if int(step) != 1:
+        return None
+    wp.synchronize_device()
+    centers = pred_centers.numpy().reshape(-1, 3).copy()
+    radii = pred_radii.numpy().reshape(-1, 3).copy()
+    rotations = pred_rot_flat.numpy().reshape(-1, 4).copy()
+    eps = pred_eps.numpy().reshape(-1, 2).copy()
+    bend = pred_bend.numpy().reshape(-1, 2).copy()
+    self._last_population_lineage = np.array([0, -1], dtype=np.int64)
+    return (
+        np.concatenate([
+            centers,
+            np.array([[0.40, 0.25, 0.25]], dtype=np.float32),
+        ]),
+        np.concatenate([
+            radii,
+            np.array([[0.05, 0.04, 0.03]], dtype=np.float32),
+        ]),
+        np.concatenate([rotations, _identity_quats(1)]),
+        np.concatenate([eps, self._init_eps(1)]),
+        np.concatenate([bend, self._init_bend(1)]),
+    )
+
+
 class ValidationIntegrationTest(unittest.TestCase):
     def test_patience_is_not_delayed_by_disabled_densification(self) -> None:
         worker = _worker(
@@ -155,40 +188,9 @@ class ValidationIntegrationTest(unittest.TestCase):
             num_steps=3,
         )
         frames = _capture_frames(worker)
-
-        def force_population_growth(
-            self,
-            step,
-            pred_centers,
-            pred_radii,
-            pred_rot_flat,
-            pred_eps=None,
-            pred_bend=None,
-        ):
-            if int(step) != 1:
-                return None
-            wp.synchronize_device()
-            centers = pred_centers.numpy().reshape(-1, 3).copy()
-            radii = pred_radii.numpy().reshape(-1, 3).copy()
-            rotations = pred_rot_flat.numpy().reshape(-1, 4).copy()
-            eps = pred_eps.numpy().reshape(-1, 2).copy()
-            bend = pred_bend.numpy().reshape(-1, 2).copy()
-            self._last_population_lineage = np.array([0, -1], dtype=np.int64)
-            return (
-                np.concatenate([
-                    centers,
-                    np.array([[0.40, 0.25, 0.25]], dtype=np.float32),
-                ]),
-                np.concatenate([
-                    radii,
-                    np.array([[0.05, 0.04, 0.03]], dtype=np.float32),
-                ]),
-                np.concatenate([rotations, _identity_quats(1)]),
-                np.concatenate([eps, self._init_eps(1)]),
-                np.concatenate([bend, self._init_bend(1)]),
-            )
-
-        worker._maybe_superfit = MethodType(force_population_growth, worker)
+        self.assertTrue(worker._use_best_validation_result)
+        worker._maybe_superfit = MethodType(
+            _force_population_growth_at_step_one, worker)
         validation_values = iter((123.0, 124.0, 125.0))
 
         with patch(
@@ -217,6 +219,41 @@ class ValidationIntegrationTest(unittest.TestCase):
         # selected its geometry, rather than a stale pre-update mini-batch loss.
         self.assertEqual(final_frame["step"], 0)
         self.assertAlmostEqual(final_frame["loss"], 123.0, places=5)
+
+    def test_final_signal_keeps_current_state_when_best_result_is_disabled(self) -> None:
+        worker = _worker(
+            superfit=True,
+            max_ellipsoids=2,
+            num_steps=3,
+            use_best_validation_result=False,
+        )
+        frames = _capture_frames(worker)
+        worker._maybe_superfit = MethodType(
+            _force_population_growth_at_step_one, worker)
+        validation_values = iter((123.0, 124.0, 125.0))
+
+        with patch(
+            "optimization.evaluate_validation_loss",
+            side_effect=lambda *_args, **_kwargs: SimpleNamespace(
+                total=next(validation_values)),
+        ):
+            _run_direct(worker)
+
+        self.assertFalse(worker._use_best_validation_result)
+        self.assertGreaterEqual(len(frames), 4)
+        last_training_frame = frames[-2]
+        final_frame = frames[-1]
+        self.assertEqual(len(final_frame["centers"]), 2)
+        np.testing.assert_allclose(
+            final_frame["centers"], last_training_frame["centers"])
+        np.testing.assert_allclose(
+            final_frame["radii"], last_training_frame["radii"])
+        np.testing.assert_allclose(
+            final_frame["rotations"], last_training_frame["rotations"])
+        np.testing.assert_array_equal(worker._primitive_ids, np.array([0, 1]))
+        self.assertEqual(worker.best_validation_step, 0)
+        self.assertEqual(worker.best_validation_loss, 123.0)
+        self.assertEqual(final_frame["step"], 2)
 
     def test_nonfinite_late_geometry_is_not_checkpointed_and_best_is_restored(self) -> None:
         worker = _worker(num_steps=2)

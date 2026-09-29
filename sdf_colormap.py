@@ -39,12 +39,13 @@ def make_sdf_lut(npts: int = 256) -> np.ndarray:
     return cmap.getLookupTable(0.0, 1.0, npts, alpha=True)
 
 
-# Interior colour easing.  The interior magnitude (0 at the surface, 1 at the
-# deepest point) is raised to this power before colouring.  >1 keeps the colour
-# close to the surface tone for most of the interior and only ramps to the full
-# colour near the genuinely deepest point — a longer, more gradual blend instead
-# of an early saturation.  1.0 == plain linear.
-SLICE_INTERIOR_GAMMA = 2.0
+# Slice presentation constants shared by the 2-D panel and the 3-D viewport.
+# A sub-linear interior curve makes thickness differences readable even when the
+# global SDF depth is set by a much thicker body part elsewhere in the mesh.
+SLICE_INTERIOR_GAMMA = 0.70
+SLICE_INTERIOR_MIN_ALPHA = 225.0
+SLICE_EXTERIOR_ALPHA_GAMMA = 1.35
+SLICE_EXTERIOR_BAND_VOXELS = 8.0
 
 
 def colorize_sdf_slice(slice2d: np.ndarray, lut: np.ndarray | None = None,
@@ -53,14 +54,12 @@ def colorize_sdf_slice(slice2d: np.ndarray, lut: np.ndarray | None = None,
     """Map a 2-D SDF slice to an ``(W, H, 4)`` uint8 RGBA image.
 
     Interior and exterior are scaled INDEPENDENTLY:
-      * exterior (SDF > 0): LUT mapping surface -> far, normalised by a SMALL
-        ``out_band`` (a few voxels) so the colour fades to background within a
-        few voxels of the surface — a crisp boundary, not a wide halo;
+      * exterior (SDF > 0): LUT mapping surface -> far, with alpha fading to
+        zero across ``out_band``.  This provides distance context near the
+        cross-section without drawing an opaque rectangular slice plane;
       * interior (SDF < 0): the LUT's SURFACE colour is blended toward the
-        DEEPEST colour across the WHOLE interior, eased by ``gamma`` (>1), so
-        the full colour is reached only at the genuinely deepest point with a
-        long, even gradient (the shared LUT itself plateaus just past the
-        surface, which is why we lerp the two endpoints instead of indexing it).
+        DEEPEST colour across the WHOLE interior.  Its alpha stays high so the
+        cross-section reads as a filled area instead of only a surface rim.
     """
     if lut is None:
         lut = make_sdf_lut()
@@ -71,10 +70,19 @@ def colorize_sdf_slice(slice2d: np.ndarray, lut: np.ndarray | None = None,
     t = 0.5 + 0.5 * pos                              # exterior LUT position
     idx = np.clip((t * (n - 1)).astype(np.int32), 0, n - 1)
     rgba = lut[idx].astype(np.float32)
+    exterior_alpha = 255.0 * np.power(
+        np.clip(1.0 - pos, 0.0, 1.0),
+        SLICE_EXTERIOR_ALPHA_GAMMA,
+    )
+    rgba[..., 3] = exterior_alpha
 
     surf = lut[(n - 1) // 2].astype(np.float32)      # surface colour (t=0.5)
     deep = lut[0].astype(np.float32)                 # deepest interior colour
     mag = np.clip(-sdf / max(float(depth), 1e-9), 0.0, 1.0) ** float(gamma)
     interior = surf * (1.0 - mag[..., None]) + deep * mag[..., None]
+    interior[..., 3] = (
+        SLICE_INTERIOR_MIN_ALPHA
+        + (255.0 - SLICE_INTERIOR_MIN_ALPHA) * (1.0 - mag)
+    )
     rgba = np.where((sdf < 0.0)[..., None], interior, rgba)
     return np.ascontiguousarray(rgba.astype(np.ubyte))

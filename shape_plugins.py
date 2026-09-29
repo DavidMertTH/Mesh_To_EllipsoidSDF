@@ -329,11 +329,12 @@ class _OptimizedPrimitiveShape(ShapePlugin):
         self._chk_spawn = QtWidgets.QCheckBox("Spawn")
         self._chk_spawn.setChecked(True)
         self._chk_spawn.setToolTip(
-            "Spawn a new, fully-inside primitive in isolated under-represented gaps.")
+            "Create a primitive covering about 60% of the local mesh thickness\n"
+            "at each selected under-represented region, then optimise it.")
         self._chk_split = QtWidgets.QCheckBox("Split")
         self._chk_split.setChecked(True)
         self._chk_split.setToolTip(
-            "Split oversized / bridging primitives and the nearest one to a gap.")
+            "Split oversized, protruding, or bridging primitives.")
         self._chk_prune = QtWidgets.QCheckBox("Prune")
         self._chk_prune.setChecked(True)
         self._chk_prune.setToolTip(

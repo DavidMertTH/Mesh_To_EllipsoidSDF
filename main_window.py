@@ -47,7 +47,12 @@ from shape_plugins import (
 )
 from api_rig_space import correct_unity_rig_space
 from mesh_io import load_and_prepare, load_and_prepare_arrays
-from sdf_compute import SdfComputer, SdfResult
+from sdf_compute import (
+    SdfComputer,
+    SdfResult,
+    sample_thickness_at_face_corners,
+    sample_thickness_at_vertices,
+)
 from sdf_blowup import (
     BLOWUP_CARRIER_MARGIN_VOXELS,
     MAX_UI_THICKNESS_FRACTION,
@@ -152,7 +157,14 @@ class SdfWorker(QtCore.QThread):
                  sdf_blowup_fraction: float = 0.0,
                  sdf_blowup_capacity_fraction: float | None = None,
                  sdf_blowup_carrier_fraction: float | None = None,
-                 sdf_guard_voxels_per_side: int | None = None):
+                 sdf_guard_voxels_per_side: int | None = None,
+                 transported_vertex_thickness: np.ndarray | None = None,
+                 transported_face_corner_thickness: np.ndarray | None = None,
+                 cache_vertex_points: np.ndarray | None = None,
+                 cache_face_corner_vertices: np.ndarray | None = None,
+                 cache_face_corner_faces: np.ndarray | None = None,
+                 thin_surface_fraction: float | None = 0.30,
+                 thickness_sampling_power: float | None = None):
         super().__init__(parent)
         self._computer = computer
         self._n = n
@@ -160,18 +172,102 @@ class SdfWorker(QtCore.QThread):
         self._symmetry = symmetry
         self._thickness_max_resolution = thickness_max_resolution
         self._compute_thickness = bool(compute_thickness)
+        if thickness_sampling_power is None:
+            thickness_sampling_power = (
+                0.30 if thin_surface_fraction is None
+                else float(np.clip(
+                    float(thin_surface_fraction), 0.0, 1.0)))
+        thickness_sampling_power = float(thickness_sampling_power)
+        if (not np.isfinite(thickness_sampling_power)
+                or thickness_sampling_power < 0.0):
+            raise ValueError(
+                "thickness_sampling_power must be finite and non-negative")
+        self._thickness_sampling_power = thickness_sampling_power
+        if (transported_vertex_thickness is not None
+                and transported_face_corner_thickness is not None):
+            raise ValueError(
+                "transported vertex and face-corner thickness are mutually "
+                "exclusive")
+        self._transported_vertex_thickness = None
+        if transported_vertex_thickness is not None:
+            transported = np.asarray(
+                transported_vertex_thickness, dtype=np.float32).reshape(-1)
+            if not np.isfinite(transported).all():
+                raise ValueError(
+                    "transported_vertex_thickness must be finite")
+            if np.any(transported < 0.0):
+                raise ValueError(
+                    "transported_vertex_thickness must be nonnegative")
+            self._transported_vertex_thickness = np.ascontiguousarray(
+                transported, dtype=np.float32)
+        self._transported_face_corner_thickness = None
+        if transported_face_corner_thickness is not None:
+            transported = np.asarray(
+                transported_face_corner_thickness,
+                dtype=np.float32,
+            ).reshape(-1)
+            if transported.size % 3 != 0:
+                raise ValueError(
+                    "transported_face_corner_thickness must contain three "
+                    "values per face")
+            if not np.isfinite(transported).all():
+                raise ValueError(
+                    "transported_face_corner_thickness must be finite")
+            if np.any(transported < 0.0):
+                raise ValueError(
+                    "transported_face_corner_thickness must be nonnegative")
+            self._transported_face_corner_thickness = np.ascontiguousarray(
+                transported.reshape(-1, 3), dtype=np.float32)
+        self._has_transported_thickness = bool(
+            self._transported_vertex_thickness is not None
+            or self._transported_face_corner_thickness is not None)
         self._compute_blowup_thickness = bool(
-            compute_blowup_thickness and compute_thickness)
+            compute_blowup_thickness
+            and (compute_thickness
+                 or self._has_transported_thickness))
         self._compute_sparse_samples = bool(compute_sparse_samples)
+        self._cache_vertex_points = None
+        if cache_vertex_points is not None:
+            cache_points = np.asarray(
+                cache_vertex_points, dtype=np.float32).reshape(-1, 3)
+            if not np.isfinite(cache_points).all():
+                raise ValueError("cache_vertex_points must be finite")
+            self._cache_vertex_points = np.ascontiguousarray(
+                cache_points, dtype=np.float32)
+        if ((cache_face_corner_vertices is None)
+                != (cache_face_corner_faces is None)):
+            raise ValueError(
+                "cache_face_corner_vertices and cache_face_corner_faces must "
+                "be provided together")
+        self._cache_face_corner_vertices = None
+        self._cache_face_corner_faces = None
+        if cache_face_corner_vertices is not None:
+            cache_vertices = np.asarray(
+                cache_face_corner_vertices, dtype=np.float32).reshape(-1, 3)
+            cache_faces = np.asarray(
+                cache_face_corner_faces, dtype=np.int32).reshape(-1, 3)
+            if not np.isfinite(cache_vertices).all():
+                raise ValueError("cache_face_corner_vertices must be finite")
+            if (cache_faces.size
+                    and (int(cache_faces.min()) < 0
+                         or int(cache_faces.max()) >= len(cache_vertices))):
+                raise ValueError(
+                    "cache_face_corner_faces contain an out-of-range index")
+            self._cache_face_corner_vertices = np.ascontiguousarray(
+                cache_vertices, dtype=np.float32)
+            self._cache_face_corner_faces = np.ascontiguousarray(
+                cache_faces, dtype=np.int32)
         self._max_dist = max_dist
         self._sdf_blowup_fraction = float(sdf_blowup_fraction)
         if (not np.isfinite(self._sdf_blowup_fraction)
                 or not -0.5 < self._sdf_blowup_fraction < 0.5):
             raise ValueError(
                 "sdf_blowup_fraction magnitude must be smaller than 0.5")
-        if self._sdf_blowup_fraction != 0.0 and not self._compute_thickness:
+        if (self._sdf_blowup_fraction != 0.0
+                and not self._compute_thickness
+                and not self._has_transported_thickness):
             raise ValueError(
-                "non-zero sdf_blowup_fraction requires compute_thickness")
+                "non-zero sdf_blowup_fraction requires feature thickness")
         if self._sdf_blowup_fraction != 0.0:
             self._compute_blowup_thickness = True
         self._sdf_blowup_capacity_fraction = float(
@@ -250,6 +346,16 @@ class SdfWorker(QtCore.QThread):
                 blowup_thickness_fraction=(
                     self._sdf_blowup_carrier_fraction),
                 guard_voxels_per_side=self._sdf_guard_voxels_per_side,
+                vertex_thickness=(
+                    self._transported_vertex_thickness
+                    if (not self._compute_sparse_samples
+                        or self._sdf_blowup_fraction != 0.0)
+                    else None),
+                face_corner_thickness=(
+                    self._transported_face_corner_thickness
+                    if (not self._compute_sparse_samples
+                        or self._sdf_blowup_fraction != 0.0)
+                    else None),
             )
             self._raise_if_stopped()
             if self._compute_sparse_samples:
@@ -270,11 +376,20 @@ class SdfWorker(QtCore.QThread):
                 )
                 sparse_plan = _bone_region_sparse_plan(
                     dense_count, offsets=offsets)
+                # A transported surface field needs the sparse path even for a
+                # very small or extremely anisotropic grid.  Keeping a minimum
+                # surface cloud is still much cheaper than rebuilding feature
+                # thickness, and preserves the loss weighting exactly.
+                if (sparse_plan is None
+                        and self._has_transported_thickness):
+                    sparse_plan = (128, tuple(offsets), 8)
                 estimated_sparse = (
                     _estimate_sparse_sample_count(*sparse_plan)
                     if sparse_plan is not None else dense_count + 1
                 )
-                if sparse_plan is not None and estimated_sparse < dense_count:
+                if (sparse_plan is not None
+                        and (estimated_sparse < dense_count
+                             or self._has_transported_thickness)):
                     surface_samples, offsets_vox, coarse_n = sparse_plan
 
                     def _sparse_progress(f, m):
@@ -291,6 +406,12 @@ class SdfWorker(QtCore.QThread):
                         coarse_n=coarse_n,
                         progress_cb=_sparse_progress,
                         thickness_result=result,
+                        vertex_thickness=(
+                            self._transported_vertex_thickness),
+                        face_corner_thickness=(
+                            self._transported_face_corner_thickness),
+                        thickness_sampling_power=(
+                            self._thickness_sampling_power),
                     )
                     if self._sdf_blowup_fraction != 0.0:
                         adjusted_grid = apply_thickness_relative_blowup(
@@ -308,7 +429,8 @@ class SdfWorker(QtCore.QThread):
                             self._sdf_blowup_fraction,
                             normals=adjusted_normals,
                         )
-                    if samples.size >= dense_count:
+                    if (samples.size >= dense_count
+                            and not self._has_transported_thickness):
                         samples = None
                 else:
                     self._emit_progress(
@@ -318,6 +440,16 @@ class SdfWorker(QtCore.QThread):
                 self._raise_if_stopped()
                 setattr(result, "_sparse_samples", samples)
                 setattr(result, "_sparse_samples_computed", True)
+                setattr(
+                    result,
+                    "_sparse_thickness_sampling_power",
+                    self._thickness_sampling_power,
+                )
+                setattr(
+                    result,
+                    "_sparse_blowup_fraction",
+                    self._sdf_blowup_fraction,
+                )
             if self._sdf_blowup_fraction != 0.0:
                 blowup_thickness = getattr(
                     result, "blowup_thickness", None)
@@ -348,6 +480,43 @@ class SdfWorker(QtCore.QThread):
                      >= int(BLOWUP_CARRIER_MARGIN_VOXELS) else 0.0),
                 ),
             )
+            if (self._cache_vertex_points is not None
+                    and result.thickness is not None):
+                def _cache_progress(_frac, msg):
+                    self._emit_progress(
+                        1.0,
+                        f"Caching surface feature thickness · {msg}",
+                    )
+
+                _cache_progress(0.0, "Preparing vertices")
+                setattr(
+                    result,
+                    "_pose_vertex_thickness",
+                    sample_thickness_at_vertices(
+                        result,
+                        self._cache_vertex_points,
+                        progress_cb=_cache_progress,
+                    ),
+                )
+            if (self._cache_face_corner_vertices is not None
+                    and result.thickness is not None):
+                def _face_cache_progress(_frac, msg):
+                    self._emit_progress(
+                        1.0,
+                        f"Caching surface feature thickness · {msg}",
+                    )
+
+                _face_cache_progress(0.0, "Preparing face-corner probes")
+                setattr(
+                    result,
+                    "_pose_face_corner_thickness",
+                    sample_thickness_at_face_corners(
+                        result,
+                        self._cache_face_corner_vertices,
+                        self._cache_face_corner_faces,
+                        progress_cb=_face_cache_progress,
+                    ),
+                )
             self._raise_if_stopped()
             self.done.emit(result)
         except _SdfCanceled:
@@ -456,6 +625,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._api_cached_raw_faces: np.ndarray | None = None
         self._api_cached_oriented_faces: np.ndarray | None = None
         self._api_cached_vertex_count: int = -1
+        # Feature thickness belongs to stable surface regions, not to one
+        # skinned pose.  A batch stores it once in Unity/original length units
+        # and re-normalizes it for every following pose.
+        self._api_pose_thickness_cache: dict | None = None
+        self._api_batch_id: str | None = None
+        self._api_pose_index: int | None = None
         self._api_verts = None                    # original (un-normalized) verts
         self._api_rig: dict | None = None         # Unity skinning payload
         self._api_base_pose: Pose | None = None
@@ -706,6 +881,10 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMainWindow.AnimatedDocks
             | QtWidgets.QMainWindow.AllowNestedDocks
             | QtWidgets.QMainWindow.AllowTabbedDocks
+            # Qt otherwise only reorders a visible dock tab inside its current
+            # tab bar.  This also lets an individual tab leave that group and
+            # be dropped onto another group, e.g. Mesh beside Runs.
+            | QtWidgets.QMainWindow.GroupedDragging
         )
         self.setTabPosition(
             QtCore.Qt.AllDockWidgetAreas, QtWidgets.QTabWidget.North)
@@ -738,10 +917,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._default_workspace_resize_pending = (
             not self._restore_workspace_layout())
         self._schedule_workspace_dock_tab_style()
-        self._build_view_menu()
         # 'Settings' is a clickable menu-bar entry (not a submenu) that opens a
         # small dialog with the detailed fitting knobs + theme colours.
-        self.menuBar().addAction("Settings", self._open_settings_dialog)
+        self._settings_action = self.menuBar().addAction(
+            "Settings", self._open_settings_dialog)
+        # Keep workspace visibility controls directly beside Settings so a
+        # completely closed panel is always easy to recover.
+        self._build_view_menu()
         self._scan_mesh_dir()
         self._load_default_mesh()
 
@@ -767,12 +949,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 d, floating))
         dock.dockLocationChanged.connect(
             lambda _area: self._schedule_workspace_dock_tab_style())
+        dock.visibilityChanged.connect(
+            lambda _visible: self._schedule_workspace_dock_tab_style())
         return dock
 
     def _sync_workspace_dock_title_bar(
             self, dock: QtWidgets.QDockWidget, floating: bool) -> None:
-        """Use native chrome while floating and a caption-free grip in-layout."""
-        if floating:
+        """Keep close controls visible without duplicating tab captions.
+
+        A lone or floating dock uses Qt's native title bar (including its close
+        button).  In a tab group the tab itself carries the close button, so a
+        slim drag strip avoids repeating the active panel title above it.
+        """
+        if floating or not self.tabifiedDockWidgets(dock):
             dock.setTitleBarWidget(None)
         else:
             dock.setTitleBarWidget(dock._workspace_drag_strip)
@@ -823,6 +1012,12 @@ class MainWindow(QtWidgets.QMainWindow):
             tab_bar.setDrawBase(False)
             tab_bar.setExpanding(False)
             tab_bar.setElideMode(QtCore.Qt.ElideRight)
+            tab_bar.setTabsClosable(True)
+            if not tab_bar.property("workspaceCloseConnected"):
+                tab_bar.tabCloseRequested.connect(
+                    lambda index, bar=tab_bar:
+                    self._close_workspace_dock_tab(bar, index))
+                tab_bar.setProperty("workspaceCloseConnected", True)
             tab_bar.setStyleSheet(css)
 
         strip_css = (
@@ -832,6 +1027,29 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         for dock in self._dock_widgets.values():
             dock._workspace_drag_strip.setStyleSheet(strip_css)
+            # Tab groups are created and destroyed dynamically while dragging.
+            # Re-evaluate the title bar after every such layout change so a
+            # newly standalone dock immediately regains native close controls.
+            if dock.isFloating() or not self.tabifiedDockWidgets(dock):
+                dock.setTitleBarWidget(None)
+            else:
+                dock.setTitleBarWidget(dock._workspace_drag_strip)
+
+    def _close_workspace_dock_tab(
+            self, tab_bar: QtWidgets.QTabBar, index: int) -> None:
+        """Close the dock represented by one of Qt's generated dock tabs."""
+        if index < 0 or index >= tab_bar.count():
+            return
+        title = tab_bar.tabText(index)
+        dock = next(
+            (candidate for candidate in self._dock_widgets.values()
+             if candidate.windowTitle() == title),
+            None,
+        )
+        if dock is None:
+            return
+        dock.close()
+        self._schedule_workspace_dock_tab_style()
 
     def _arrange_default_workspace(self) -> None:
         """Restore the initial three-column workspace with two tab groups."""
@@ -1197,7 +1415,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_view_menu(self):
         """Expose every dock plus a one-click default-layout reset."""
-        self._view_menu = self.menuBar().addMenu("View")
+        self._view_menu = self.menuBar().addMenu("Views")
         self._view_actions = {}
         for key in ("scene", "sdf", "mesh", "dashboard", "runs", "options"):
             dock = self._dock_widgets[key]
@@ -1298,8 +1516,27 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._settings_dialog.load_values(self._settings)
         if self._settings_dialog.exec() == QtWidgets.QDialog.Accepted:
+            old_sampling_power = float(self._settings.get(
+                "thickness_sampling_power", 1.0))
             self._settings.update(self._settings_dialog.values())
             app_settings.save(self._settings)
+            new_sampling_power = float(self._settings.get(
+                "thickness_sampling_power", 1.0))
+            if not np.isclose(
+                    old_sampling_power, new_sampling_power, atol=1.0e-12):
+                # Sparse surface points are thickness-weighted while they are
+                # created; changing the power must rebuild that candidate cloud.
+                result = self._last_mesh_result
+                if result is not None:
+                    setattr(result, "_sparse_samples", None)
+                    setattr(result, "_sparse_samples_computed", False)
+                    setattr(result, "_sparse_thin_surface_fraction", None)
+                    setattr(
+                        result, "_sparse_thickness_sampling_power", None)
+                    setattr(result, "_sparse_blowup_fraction", None)
+                    if not self._api_batch_pipeline:
+                        self._mesh_sdf_panel.set_sparse_samples(None)
+                        self._viewer.set_sparse_samples(None)
             enabled = bool(self._settings.get(
                 "size_region_budget_enabled", True))
             self._chk_region_budget.blockSignals(True)
@@ -2841,15 +3078,55 @@ class MainWindow(QtWidgets.QMainWindow):
             and self._api_fit_existing
             and self._settings.get("use_sparse_sdf", True)
         )
+        reuse_pose_thickness = bool(
+            api_job_id is not None
+            and self._api_batch_pipeline
+            and self._api_fit_existing
+        )
+        transported_face_corner_thickness = (
+            self._api_reusable_pose_face_corner_thickness(
+                n=int(n), blowup_fraction=float(blowup_fraction))
+            if reuse_pose_thickness else None
+        )
+        if transported_face_corner_thickness is not None:
+            source_pose = None
+            if self._api_pose_thickness_cache is not None:
+                source_pose = self._api_pose_thickness_cache.get(
+                    "source_pose_index")
+            source_text = (
+                f" from pose {int(source_pose) + 1}"
+                if source_pose is not None else "")
+            MainWindow._api_publish_progress(
+                self,
+                "sdf",
+                f"Reusing feature thickness{source_text}",
+                0.0,
+            )
         try:
             worker = SdfWorker(
                 self._sdf, n, margin, parent=self,
                 symmetry=self._effective_symmetry_enabled(),
                 thickness_max_resolution=int(
                     self._settings.get("thickness_max_resolution", 128)),
+                compute_thickness=(
+                    transported_face_corner_thickness is None),
                 compute_blowup_thickness=(
                     blowup_fraction != 0.0),
                 compute_sparse_samples=prepare_sparse_samples,
+                thickness_sampling_power=float(self._settings.get(
+                    "thickness_sampling_power", 1.0)),
+                transported_face_corner_thickness=(
+                    transported_face_corner_thickness),
+                cache_face_corner_vertices=(
+                    self._base_verts
+                    if (reuse_pose_thickness
+                        and transported_face_corner_thickness is None)
+                    else None),
+                cache_face_corner_faces=(
+                    self._base_faces
+                    if (reuse_pose_thickness
+                        and transported_face_corner_thickness is None)
+                    else None),
                 # Keep the whole-mesh grid raw; only reserve/build enough support
                 # for the live transform that preview and fitting apply later.
                 sdf_blowup_fraction=(
@@ -2944,6 +3221,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 mesh_result,
                 thickness_fraction=current_blowup,
                 update_views=False)
+
+        # The first successful pose of an explicit Unity batch bakes three
+        # feature values per topology-stable face.  Later poses transport them
+        # without mixing hard-edge neighbours or repeating the voxel pass.
+        self._api_seed_pose_thickness_cache(mesh_result)
 
         # Queued synthetic-pose jobs do not consume any of the expensive viewer
         # products below.  Keep the numerical result identical and hand it to
@@ -3480,6 +3762,8 @@ class MainWindow(QtWidgets.QMainWindow):
             compute_sparse_samples=bool(
                 self._settings.get("use_sparse_sdf", True)
                 and not symmetry),
+            thickness_sampling_power=float(self._settings.get(
+                "thickness_sampling_power", 1.0)),
             max_dist=float("inf"),
             sdf_blowup_fraction=blowup_fraction,
         )
@@ -3957,6 +4241,7 @@ class MainWindow(QtWidgets.QMainWindow):
         local_fit_start_frac: float = 0.25,
         local_fit_end_frac: float = 1.0,
         local_fit_every: int = 150,
+        use_best_validation_result: bool = True,
         symmetry: bool = False,
         merge_enabled: bool = True,
         spawn_enabled: bool = True,
@@ -4054,6 +4339,24 @@ class MainWindow(QtWidgets.QMainWindow):
             blowup_fraction, blowup_thickness, float(r.dx))
         sparse_prepared = bool(getattr(
             r, "_sparse_samples_computed", False))
+        cached_sampling_power = getattr(
+            r, "_sparse_thickness_sampling_power", None)
+        cached_blowup_fraction = getattr(
+            r, "_sparse_blowup_fraction", None)
+        requested_sampling_power = float(self._settings.get(
+            "thickness_sampling_power", 1.0))
+        cache_parameters_match = bool(
+            cached_sampling_power is not None
+            and cached_blowup_fraction is not None
+            and np.isclose(
+                float(cached_sampling_power), requested_sampling_power,
+                atol=1.0e-12)
+            and np.isclose(
+                float(cached_blowup_fraction), blowup_fraction,
+                atol=1.0e-12)
+        )
+        if sparse_prepared and not cache_parameters_match:
+            sparse_prepared = False
         sparse_samples = (
             getattr(r, "_sparse_samples", None)
             if use_sparse_sdf and sparse_prepared else None)
@@ -4066,6 +4369,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     margin=self._slider_margin.value() / 100.0,
                     thickness_result=r,
                     offsets_vox=sparse_band_offsets(max_blowup_vox),
+                    thickness_sampling_power=requested_sampling_power,
                 )
                 if blowup_fraction != 0.0:
                     adjusted_normals = sample_sdf_grid_normals(
@@ -4080,6 +4384,14 @@ class MainWindow(QtWidgets.QMainWindow):
                             normals=adjusted_normals,
                         )
                     )
+                setattr(r, "_sparse_samples", sparse_samples)
+                setattr(r, "_sparse_samples_computed", True)
+                setattr(
+                    r,
+                    "_sparse_thickness_sampling_power",
+                    requested_sampling_power,
+                )
+                setattr(r, "_sparse_blowup_fraction", blowup_fraction)
                 print(
                     f"[SparseSDF] training samples: {sparse_samples.size:,} "
                     f"(dense voxels: {int(np.prod(r.grid.shape)):,})"
@@ -4088,6 +4400,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._mesh_sdf_panel.set_sparse_samples(sparse_samples)
                     self._viewer.set_sparse_samples(sparse_samples)
             except Exception as e:
+                setattr(r, "_sparse_samples", None)
+                setattr(r, "_sparse_samples_computed", False)
+                setattr(r, "_sparse_thin_surface_fraction", None)
+                setattr(r, "_sparse_thickness_sampling_power", None)
+                setattr(r, "_sparse_blowup_fraction", None)
                 print(f"[SparseSDF] Falling back to dense-grid training: {e}")
                 if not self._api_batch_pipeline:
                     self._mesh_sdf_panel.set_sparse_samples(None)
@@ -4135,6 +4452,7 @@ class MainWindow(QtWidgets.QMainWindow):
             local_fit_start_frac=local_fit_start_frac,
             local_fit_end_frac=local_fit_end_frac,
             local_fit_every=local_fit_every,
+            use_best_validation_result=bool(use_best_validation_result),
             symmetry_enabled=symmetry,
             merge_enabled=merge_enabled,
             spawn_underrep=spawn_enabled,
@@ -4650,6 +4968,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._api_pose_corrective_source = None
         self._api_pending_base_result = None
         self._api_batch_pipeline = False
+        self._api_batch_id = None
+        self._api_pose_index = None
         self._api_preview_last_step = -1
         self._api_preview_last_time = 0.0
         self._api_progress_last_time = 0.0
@@ -5338,6 +5658,143 @@ class MainWindow(QtWidgets.QMainWindow):
         self._api_cached_vertex_count = len(verts)
         return mesh, transform
 
+    def _api_reusable_pose_face_corner_thickness(
+        self,
+        n: int,
+        blowup_fraction: float,
+    ) -> np.ndarray | None:
+        """Return this batch's surface thickness in the current pose scale.
+
+        The cache deliberately requires an explicit Unity batch id and stable
+        topology.  Values are stored in original/Unity length units because
+        each pose is normalized independently before fitting.
+        """
+        settings = getattr(self, "_settings", {}) or {}
+        batch_id = getattr(self, "_api_batch_id", None)
+        cache = getattr(self, "_api_pose_thickness_cache", None)
+        verts = getattr(self, "_base_verts", None)
+        faces = getattr(self, "_base_faces", None)
+        norm = getattr(self, "_api_norm", None)
+        if (not getattr(self, "_api_batch_pipeline", False)
+                or not getattr(self, "_api_fit_existing", False)
+                or not batch_id
+                or cache is None
+                or verts is None
+                or faces is None
+                or norm is None):
+            return None
+
+        try:
+            scale = float(norm.scale)
+            thickness_resolution = int(
+                settings.get("thickness_max_resolution", 128))
+            cached_values = np.asarray(
+                cache["original_face_corner_thickness"],
+                dtype=np.float32,
+            ).reshape(-1, 3)
+            cached_faces = np.asarray(cache["faces"], dtype=np.int32)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        if (not np.isfinite(scale) or scale <= 0.0
+                or str(cache.get("batch_id", "")) != str(batch_id)
+                or int(cache.get("grid_n", -1)) != int(n)
+                or int(cache.get("thickness_max_resolution", -1))
+                != thickness_resolution
+                or int(cache.get("vertex_count", -1)) != int(len(verts))
+                or int(cache.get("face_count", -1)) != int(len(faces))
+                or cached_values.size != 3 * int(len(faces))
+                or cached_faces.shape != np.asarray(faces).shape
+                or not np.array_equal(cached_faces, np.asarray(faces))
+                or not np.isfinite(cached_values).all()
+                or np.any(cached_values <= 0.0)):
+            return None
+        return np.ascontiguousarray(
+            cached_values * np.float32(scale), dtype=np.float32)
+
+    def _api_seed_pose_thickness_cache(self, mesh_result: SdfResult) -> None:
+        """Store one successful pose's feature thickness per face corner."""
+        settings = getattr(self, "_settings", {}) or {}
+        batch_id = getattr(self, "_api_batch_id", None)
+        verts = getattr(self, "_base_verts", None)
+        faces = getattr(self, "_base_faces", None)
+        norm = getattr(self, "_api_norm", None)
+        mesh_settings = getattr(self, "_mesh_settings", None)
+        blowup_fraction = (
+            float(mesh_settings.blowup_fraction())
+            if mesh_settings is not None else 0.0
+        )
+        if (not getattr(self, "_api_batch_pipeline", False)
+                or not getattr(self, "_api_fit_existing", False)
+                or not batch_id
+                or verts is None
+                or faces is None
+                or norm is None
+                or getattr(mesh_result, "thickness", None) is None):
+            return
+
+        # A transported dense field is only a current-pose rasterization of the
+        # original surface data.  Never feed it back into the cache, otherwise
+        # repeated interpolation could slowly blur/drift the reference values.
+        if MainWindow._api_reusable_pose_face_corner_thickness(
+                self,
+                n=int(mesh_result.n),
+                blowup_fraction=blowup_fraction) is not None:
+            return
+
+        try:
+            scale = float(norm.scale)
+            if not np.isfinite(scale) or scale <= 0.0:
+                return
+            sampled = getattr(
+                mesh_result, "_pose_face_corner_thickness", None)
+            if sampled is None:
+                # Compatibility for direct callers/tests.  Production batch
+                # workers prepare this value off the GUI thread.
+                sampled = sample_thickness_at_face_corners(
+                    mesh_result, verts, faces)
+            sampled = np.asarray(sampled, dtype=np.float32).reshape(-1, 3)
+        except (TypeError, ValueError, AttributeError):
+            return
+        if (sampled.size != 3 * int(len(faces))
+                or not np.isfinite(sampled).all()
+                or np.any(sampled < 0.0)):
+            return
+        positive = sampled > 0.0
+        face_has_value = np.any(positive, axis=1)
+        if not np.all(face_has_value):
+            # A global resolved percentage can hide one completely missing
+            # triangle.  Such a hole would disable thin-loss weighting and
+            # relative blowup for that whole region, so keep the exact per-pose
+            # path instead of accepting an incomplete cache.
+            return
+        if not np.all(positive):
+            # Isolated zero corners are a voxel-sampling artifact.  Repair them
+            # only from resolved siblings on the same face; never leak a value
+            # across a hard edge or disconnected surface.
+            positive_count = np.sum(positive, axis=1)
+            face_replacement = (
+                np.sum(np.where(positive, sampled, 0.0), axis=1)
+                / positive_count
+            ).astype(np.float32, copy=False)
+            sampled = np.where(
+                positive, sampled, face_replacement[:, None]).astype(
+                    np.float32, copy=False)
+        if not np.all(sampled > 0.0):
+            return
+
+        self._api_pose_thickness_cache = {
+            "batch_id": str(batch_id),
+            "source_pose_index": getattr(self, "_api_pose_index", None),
+            "grid_n": int(mesh_result.n),
+            "thickness_max_resolution": int(
+                settings.get("thickness_max_resolution", 128)),
+            "vertex_count": int(len(verts)),
+            "face_count": int(len(faces)),
+            "faces": np.ascontiguousarray(faces, dtype=np.int32).copy(),
+            "original_face_corner_thickness": np.ascontiguousarray(
+                sampled / np.float32(scale), dtype=np.float32),
+        }
+
     def _api_on_fit_requested_impl(self, job_id: str) -> None:
         if self._api_server is None:
             return
@@ -5414,6 +5871,26 @@ class MainWindow(QtWidgets.QMainWindow):
             or payload.get("batch_pipeline", False)
             or payload.get("batchPipeline", False)
         )
+        raw_batch_id = (
+            self._api_options.get("batch_id")
+            or self._api_options.get("batchId")
+            or payload.get("batch_id")
+            or payload.get("batchId")
+        )
+        self._api_batch_id = (
+            str(raw_batch_id).strip() if raw_batch_id is not None else None)
+        if not self._api_batch_id:
+            self._api_batch_id = None
+        raw_pose_index = self._api_options.get(
+            "pose_index", self._api_options.get("poseIndex"))
+        if raw_pose_index is None:
+            raw_pose_index = payload.get(
+                "pose_index", payload.get("poseIndex"))
+        try:
+            self._api_pose_index = (
+                int(raw_pose_index) if raw_pose_index is not None else None)
+        except (TypeError, ValueError):
+            self._api_pose_index = None
         if self._api_batch_pipeline:
             self._progress_begin("Preparing Unity pose fit …")
         self._api_fit_existing = api_mode == "fit_pose"

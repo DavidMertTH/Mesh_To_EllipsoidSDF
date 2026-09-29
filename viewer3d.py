@@ -518,6 +518,26 @@ def _gl_opts(mode: str, cull: bool = False):
     return opts
 
 
+def _slice_gl_opts():
+    """Blend a diagnostic slice above opaque geometry.
+
+    Depth testing previously hid the filled part of a slice behind the mesh,
+    leaving only a thin intersection rim visible.  The texture itself fades to
+    transparent away from the surface, so drawing it as an overlay does not
+    expose its rectangular bounds.
+    """
+    from OpenGL import GL as _GL
+    return {
+        _GL.GL_DEPTH_TEST: False,
+        _GL.GL_BLEND: True,
+        _GL.GL_CULL_FACE: False,
+        'glBlendFuncSeparate': (
+            _GL.GL_SRC_ALPHA, _GL.GL_ONE_MINUS_SRC_ALPHA,
+            _GL.GL_ONE, _GL.GL_ONE_MINUS_SRC_ALPHA,
+        ),
+    }
+
+
 def _build_mesh_item(
     verts: np.ndarray,
     faces: np.ndarray,
@@ -607,6 +627,83 @@ def _build_mesh_item(
 
     item.setGLOptions(_gl_opts(mode, cull=cull))
     return item
+
+
+class SliceErrorLegend(QtWidgets.QFrame):
+    """Compact signed-error key shown in the 3-D viewport."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SliceErrorLegend")
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.setFixedWidth(310)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+
+        self._title = QtWidgets.QLabel("SDF Error")
+        self._title.setObjectName("SliceErrorLegendTitle")
+        layout.addWidget(self._title)
+
+        self._ramp = QtWidgets.QFrame()
+        self._ramp.setObjectName("SliceErrorLegendRamp")
+        self._ramp.setFixedHeight(12)
+        self._ramp.setToolTip(
+            "Over-coverage ← close match → under-coverage")
+        layout.addWidget(self._ramp)
+
+        label_row = QtWidgets.QHBoxLayout()
+        label_row.setContentsMargins(0, 0, 0, 0)
+        label_row.setSpacing(4)
+        self._over_label = QtWidgets.QLabel("Over-coverage")
+        self._over_label.setObjectName("SliceErrorOverLabel")
+        self._match_label = QtWidgets.QLabel("Close match")
+        self._match_label.setObjectName("SliceErrorMatchLabel")
+        self._under_label = QtWidgets.QLabel("Under-coverage")
+        self._under_label.setObjectName("SliceErrorUnderLabel")
+        label_row.addWidget(self._over_label)
+        label_row.addStretch(1)
+        label_row.addWidget(self._match_label)
+        label_row.addStretch(1)
+        label_row.addWidget(self._under_label)
+        layout.addLayout(label_row)
+
+        self._magnitude_label = QtWidgets.QLabel(
+            "Stronger colour = larger error\n"
+            f"Scale: ±{slice_module.ERROR_SLICE_SCALE_VOXELS:g} voxels")
+        self._magnitude_label.setObjectName("SliceErrorMagnitudeLabel")
+        self._magnitude_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self._magnitude_label)
+        self.apply_theme()
+
+    def apply_theme(self) -> None:
+        if theme.is_dark_mode():
+            panel = "rgba(20, 22, 30, 220)"
+            border = "rgba(120, 130, 160, 150)"
+            text = "#e4e8f0"
+            muted = "#aeb7c8"
+        else:
+            panel = "rgba(245, 247, 250, 235)"
+            border = "rgba(120, 130, 160, 170)"
+            text = "#1a1e28"
+            muted = "#596273"
+        self.setStyleSheet(
+            "QFrame#SliceErrorLegend {"
+            f" background-color: {panel}; border: 1px solid {border};"
+            " border-radius: 6px;"
+            "}"
+            "QFrame#SliceErrorLegendRamp {"
+            " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            f" stop:0 {theme.YELLOW_HEX}, stop:0.5 #80808a,"
+            f" stop:1 {theme.BLUE_HEX});"
+            f" border: 1px solid {border}; border-radius: 3px;"
+            "}"
+            f"QLabel {{ color: {text}; border: none; background: transparent;"
+            " font-size: 10px; }}"
+            "QLabel#SliceErrorLegendTitle { font-size: 11px; font-weight: bold; }"
+            f"QLabel#SliceErrorMagnitudeLabel {{ color: {muted}; }}"
+        )
 
 
 class ViewportOverlay(QtWidgets.QFrame):
@@ -788,8 +885,8 @@ class ViewportOverlay(QtWidgets.QFrame):
         self._combo_slice_mode.addItem(
             "Error (Color Coded)", "error")
         self._combo_slice_mode.setToolTip(
-            "SDF shows the selected distance field. Error compares the\n"
-            "ellipsoid fit with the mesh using a color-coded difference map.")
+            "SDF shows the selected distance field. Error shows the signed SDF\n"
+            "residual of the ellipsoid fit across the full cross-section.")
         grid.addWidget(mode_label, row + 1, 0)
         grid.addWidget(self._combo_slice_mode, row + 1, 1)
 
@@ -1026,6 +1123,13 @@ class SceneViewer3D(_BaseViewer):
         self._overlay.raymarchBlendChanged.connect(self._on_raymarch_blend_changed)
         self._view.add_corner_widget(self._overlay, corner="tl", margin=10)
 
+        # Signed-error key.  Top-right is intentionally separate from the
+        # controls so it remains readable as a visual legend over the slice.
+        self._slice_error_legend = SliceErrorLegend()
+        self._view.add_corner_widget(
+            self._slice_error_legend, corner="tr", margin=10)
+        self._slice_error_legend.setVisible(False)
+
         # ── slice position slider (integrated along the viewport bottom) ──
         self._build_slice_slider()
 
@@ -1160,6 +1264,7 @@ class SceneViewer3D(_BaseViewer):
         """
         self._view.setBackgroundColor(theme.bg((0, 0, 0)))
         self._overlay.apply_theme()
+        self._slice_error_legend.apply_theme()
         self._style_slice_slider()
         self._rebuild_mesh()
         self._rebuild_ellipsoids()
@@ -2128,6 +2233,7 @@ class SceneViewer3D(_BaseViewer):
 
     def _on_slice_toggled(self, on: bool) -> None:
         self._slice_slider_frame.setVisible(on)
+        self._sync_slice_error_legend()
         if on:
             self._update_slice()
         else:
@@ -2143,7 +2249,14 @@ class SceneViewer3D(_BaseViewer):
         self._update_slice()
 
     def _on_slice_source_changed(self, _source: str) -> None:
+        self._sync_slice_error_legend()
         self._update_slice()
+
+    def _sync_slice_error_legend(self) -> None:
+        self._slice_error_legend.setVisible(
+            self._overlay.slice_enabled()
+            and self._overlay.slice_mode() == "error"
+        )
 
     def _on_slice_position_changed(self, _idx: int) -> None:
         self._update_slice()
@@ -2176,7 +2289,8 @@ class SceneViewer3D(_BaseViewer):
         W, H, px = slice_module.slice_resolution(
             self._sdf_grid.shape, self._sdf_dx, normal)
         nz, ny, nx = self._sdf_grid.shape
-        out_band = 3.0 * float(self._sdf_dx)
+        out_band = (
+            slice_module.SLICE_EXTERIOR_BAND_VOXELS * float(self._sdf_dx))
 
         max_blow = (
             self._sdf_blowup_fraction * self._blowup_thickness_max)
@@ -2218,7 +2332,10 @@ class SceneViewer3D(_BaseViewer):
         if self._slice_item is None:
             # smooth=True → bilinear texture filtering between the 2K pixels.
             self._slice_item = gl.GLImageItem(
-                rgba, smooth=True, glOptions="translucent")
+                rgba, smooth=True, glOptions=_slice_gl_opts())
+            # Render after meshes/ellipsoids so the diagnostic cross-section is
+            # never reduced to the small portion that happens to be in front.
+            self._slice_item.setDepthValue(1000)
             self._view.addItem(self._slice_item)
         else:
             self._slice_item.setData(rgba)
@@ -2263,7 +2380,8 @@ class SceneViewer3D(_BaseViewer):
                 size=4.0,
                 pxMode=True,
             )
-            self._slice_sparse_item.setGLOptions("translucent")
+            self._slice_sparse_item.setGLOptions(_slice_gl_opts())
+            self._slice_sparse_item.setDepthValue(1010)
             self._view.addItem(self._slice_sparse_item)
         else:
             self._slice_sparse_item.setData(

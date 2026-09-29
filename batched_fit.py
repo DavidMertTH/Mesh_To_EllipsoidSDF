@@ -540,6 +540,7 @@ class BatchedFitWorker(QtCore.QThread):
         lr_init: float = 0.01,
         lr_final: float = 0.0002,
         lr_decay_k: float = 7.0,
+        lr_mult_centers: float = 1.0,
         lr_mult_radii: float = 2.0,
         lr_mult_rot: float = 1.0,
         miss_penalty_weight: float = 3.0,
@@ -563,6 +564,7 @@ class BatchedFitWorker(QtCore.QThread):
         self._lr_init = float(lr_init)
         self._lr_final = float(lr_final)
         self._lr_decay_k = float(lr_decay_k)
+        self._lr_mult_centers = float(lr_mult_centers)
         self._lr_mult_radii = float(lr_mult_radii)
         self._lr_mult_rot = float(lr_mult_rot)
         self._miss = float(miss_penalty_weight)
@@ -710,7 +712,8 @@ class BatchedFitWorker(QtCore.QThread):
 
         # ── optimisers (separate LR per param group) ──
         self.prep_progress.emit(0.7, "optimizer")
-        opt_c = wp.optim.Adam([pred_centers], lr=self._lr_init)
+        opt_c = wp.optim.Adam(
+            [pred_centers], lr=self._lr_init * self._lr_mult_centers)
         opt_r = wp.optim.Adam([pred_log_radii], lr=self._lr_init)
         opt_q = wp.optim.Adam([pred_rot_flat], lr=self._lr_init)
         grad_c = [pred_centers.grad.flatten()]
@@ -765,7 +768,7 @@ class BatchedFitWorker(QtCore.QThread):
                               device=device)
 
             tape.backward(loss)
-            opt_c.lr = lr
+            opt_c.lr = lr * self._lr_mult_centers
             opt_r.lr = lr * self._lr_mult_radii
             opt_q.lr = lr * self._lr_mult_rot
             opt_c.step(grad_c)

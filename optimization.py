@@ -33,6 +33,7 @@ from sdf_blowup import (
 )
 from sdf_compute import _sample_voxel_field_trilinear
 from sdf_samples import SdfSampleSet, UploadedSdfSamples, sdf_grid_normals
+from thin_sampling import thickness_sampling_probabilities
 from fit_validation import (
     BestCheckpoint,
     Patience,
@@ -2158,9 +2159,12 @@ class BandSampler:
 
     def __init__(self, flat_target: np.ndarray, batch_size: int, band: float,
                  surface_fraction: float, rng: np.random.Generator | None = None,
-                 flat_thickness: np.ndarray | None = None, thin_bias: float = 0.0,
+                 flat_thickness: np.ndarray | None = None,
+                 thin_bias: float | None = 0.0,
                  coarse_mask: np.ndarray | None = None,
-                 far_field_fraction: float = SPARSE_FAR_FIELD_FRACTION):
+                 far_field_fraction: float = SPARSE_FAR_FIELD_FRACTION,
+                 thin_fraction: float | None = None,
+                 thickness_sampling_power: float | None = None):
         self.batch_size = int(batch_size)
         self._rng = rng or np.random.default_rng()
         self._all = np.arange(flat_target.size, dtype=np.int32)
@@ -2190,47 +2194,56 @@ class BandSampler:
             int(self.batch_size * sf), self.batch_size - self.n_far)
         self.n_rest = self.batch_size - self.n_surf - self.n_far
 
-        # Thin-feature sampling (adaptive — driven by the thickness field).
-        #
-        # Delicate parts are a *tiny* fraction of all surface voxels, so a soft
-        # ∝1/thickness reweighting can't reliably surface them: features rarer
-        # than the reweighting's effective tail simply never land in a batch
-        # without an exponent so steep it starves the thick bulk.  Instead we
-        # reserve a guaranteed *quota* of the surface-band draws for a dedicated
-        # thin pool.
-        #
-        # What makes it adaptive (not a magic absolute threshold):
-        #   * "thin" = band voxels whose local thickness is below half the band
-        #     *median* — scale-free, so it follows each mesh's own distribution;
-        #   * the quota is *gated* to 0 when no such voxels exist, so a roughly
-        #     uniform-thickness mesh is sampled exactly as before (no distortion).
-        # ``thin_bias`` scales the quota (1.0 = default 30 %, 0 = off), capped so
-        # the thick surface always keeps the majority of the band.
-        self._band_thin = None
-        self._thin_quota = 0.0
-        if flat_thickness is not None and thin_bias > 0.0 and self._band.size > 1:
-            th = flat_thickness[self._band].astype(np.float64)
-            valid = th > 0.0
-            if valid.sum() > 1:
-                med = float(np.median(th[valid]))
-                thin_mask = valid & (th < 0.5 * med)
-                if thin_mask.mean() > 1e-3:          # thin features actually present
-                    self._band_thin = self._band[thin_mask]
-                    self._thin_quota = float(np.clip(0.3 * thin_bias, 0.0, 0.6))
+        # Continuous thickness importance.  There are deliberately no binary
+        # thin/regular pools: every resolved surface sample retains non-zero
+        # probability, with density proportional to 1 / thickness**power.
+        # The CDF is built once so weighted draws do not scan the full band on
+        # every optimisation step.
+        if thickness_sampling_power is None:
+            if thin_fraction is not None:
+                # Compatibility with the short-lived direct fraction setting.
+                thickness_sampling_power = float(np.clip(
+                    float(thin_fraction), 0.0, 1.0))
+            else:
+                # Original BandSampler users passed bias 1.0 for a 30 % boost.
+                thickness_sampling_power = (
+                    0.0 if thin_bias is None
+                    else float(np.clip(
+                        0.3 * float(thin_bias), 0.0, 0.6)))
+        requested_power = float(thickness_sampling_power)
+        if not np.isfinite(requested_power) or requested_power < 0.0:
+            raise ValueError(
+                "thickness_sampling_power must be finite and non-negative")
+        self._thickness_sampling_power = requested_power
+        self._band_cdf = None
+        if (flat_thickness is not None and requested_power > 0.0
+                and self._band.size > 1):
+            thickness = np.asarray(flat_thickness, dtype=np.float32).reshape(-1)
+            if thickness.size != flat_target.size:
+                raise ValueError("flat_thickness/target size mismatch")
+            probabilities = thickness_sampling_probabilities(
+                thickness[self._band], requested_power)
+            uniform_probability = 1.0 / float(self._band.size)
+            if not np.allclose(
+                    probabilities, uniform_probability,
+                    rtol=1.0e-7, atol=1.0e-12):
+                self._band_cdf = np.cumsum(probabilities, dtype=np.float64)
+                self._band_cdf[-1] = 1.0
 
     def next_batch(self) -> np.ndarray:
         parts = []
         if self.n_surf > 0:
-            n_thin = 0
-            if self._band_thin is not None and self._thin_quota > 0.0:
-                n_thin = int(round(self.n_surf * self._thin_quota))
-            n_band = self.n_surf - n_thin
-            if n_thin > 0:
+            if self._band_cdf is None:
                 parts.append(self._rng.choice(
-                    self._band_thin, size=n_thin, replace=True))
-            if n_band > 0:
-                parts.append(self._rng.choice(
-                    self._band, size=n_band, replace=True))
+                    self._band, size=self.n_surf, replace=True))
+            else:
+                positions = np.searchsorted(
+                    self._band_cdf,
+                    self._rng.random(self.n_surf),
+                    side="right",
+                )
+                positions = np.minimum(positions, self._band.size - 1)
+                parts.append(self._band[positions])
         if self.n_rest > 0:
             parts.append(self._rng.choice(self._all, size=self.n_rest, replace=True))
         if self.n_far > 0:
@@ -2471,6 +2484,7 @@ class OptimizationWorker(QtCore.QThread):
         lr_init: float = 0.01,
         lr_final: float = 0.0002,
         lr_decay_k: float = 7.0,
+        lr_mult_centers: float = 1.0,
         lr_mult_radii: float = 2.0,
         lr_mult_rot: float = 1.0,
         optimize_centers: bool = True,
@@ -2487,7 +2501,7 @@ class OptimizationWorker(QtCore.QThread):
         sdf_blowup_fraction: float = 0.0,
         thin_loss_weight: float = 1.0,
         thin_max_factor: float = 6.0,
-        thin_sample_bias: float = 1.0,
+        thin_sample_bias: float | None = 1.0,
         flat_weight: float = 0.5,
         flat_min_ratio: float = 0.35,
         degenerate_flat_ratio: float = 0.12,
@@ -2535,6 +2549,9 @@ class OptimizationWorker(QtCore.QThread):
         parameter_radii_trust_factor: float = 0.0,
         emit_intermediate_progress: bool = True,
         parent: QtCore.QObject | None = None,
+        thin_surface_fraction: float | None = None,
+        thickness_sampling_power: float | None = None,
+        use_best_validation_result: bool = True,
     ):
         super().__init__(parent)
         self._sdf_target_np = sdf_target_np
@@ -2689,6 +2706,7 @@ class OptimizationWorker(QtCore.QThread):
         if not np.isfinite(validation_min_delta) or float(validation_min_delta) < 0.0:
             raise ValueError("validation_min_delta must be finite and non-negative")
         self._validation_min_delta = float(validation_min_delta)
+        self._use_best_validation_result = bool(use_best_validation_result)
         self.best_validation_loss = float("inf")
         self.best_validation_step: int | None = None
         self.validation_history: list[tuple[int, float]] = []
@@ -2744,11 +2762,13 @@ class OptimizationWorker(QtCore.QThread):
         # regions fall back unless their miss is overwhelmingly worse.
         self._local_fit_thin_preference = 2.0
         # Region detection evaluates a bounded, cached set of exact points from
-        # the original target grid.  Thin and (when available) per-bone quotas
-        # keep small structures represented without constructing a predicted n³
-        # grid or decimating the target until fingers disappear.
+        # the original target grid.  Thin, exterior, and (when available)
+        # per-bone quotas keep small structures and the near-surface exterior
+        # represented without constructing a predicted n³ grid or decimating
+        # the target until fingers disappear.
         self._region_candidate_budget = 65_536
-        self._region_thin_candidate_fraction = 0.35
+        self._region_thin_candidate_fraction = 0.45
+        self._region_outside_candidate_fraction = 0.10
         self._region_bone_candidate_fraction = 0.25
         self._region_candidate_cache: dict[tuple, np.ndarray] = {}
         self._spawn_per_round = spawn_per_round
@@ -2813,6 +2833,7 @@ class OptimizationWorker(QtCore.QThread):
         self._lr_init = lr_init
         self._lr_final = lr_final
         self._lr_decay_k = lr_decay_k
+        self._lr_mult_centers = float(lr_mult_centers)
         self._lr_mult_radii = lr_mult_radii   # per-group LR (radii in log-space)
         self._lr_mult_rot = lr_mult_rot
         self._optimize_centers = bool(optimize_centers)
@@ -2851,7 +2872,34 @@ class OptimizationWorker(QtCore.QThread):
         )
         self._thin_loss_weight = thin_loss_weight
         self._thin_max_factor = thin_max_factor
-        self._thin_sample_bias = thin_sample_bias
+        if thickness_sampling_power is None:
+            if thin_surface_fraction is not None:
+                thickness_sampling_power = float(np.clip(
+                    float(thin_surface_fraction), 0.0, 1.0))
+            else:
+                # Old bias 1.0 represented the previous default emphasis.
+                thickness_sampling_power = (
+                    0.30 if thin_sample_bias is None
+                    else float(np.clip(
+                        0.3 * float(thin_sample_bias), 0.0, 0.6)))
+        thickness_sampling_power = float(thickness_sampling_power)
+        if (not np.isfinite(thickness_sampling_power)
+                or thickness_sampling_power < 0.0):
+            raise ValueError(
+                "thickness_sampling_power must be finite and non-negative")
+        self._thickness_sampling_power = thickness_sampling_power
+        proposal_power = (
+            0.0 if self._sdf_samples is None
+            else float(self._sdf_samples.thickness_sampling_power))
+        if (proposal_power > 0.0
+                and not np.isclose(
+                    proposal_power, self._thickness_sampling_power,
+                    atol=1.0e-12)):
+            raise ValueError(
+                "preweighted sparse samples use thickness_sampling_power "
+                f"{proposal_power:g}, but the optimizer requested "
+                f"{self._thickness_sampling_power:g}; rebuild the sparse "
+                "sample cloud with the requested power")
         self._thickness_flat = None     # dilated flat thickness (built lazily)
         self._thickness_margin_np = None
         self._thickness_margin_source_id = None
@@ -3365,9 +3413,11 @@ class OptimizationWorker(QtCore.QThread):
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Generate initial ellipsoid parameters placed inside the mesh.
 
-        Uses farthest-point sampling on interior voxels (sdf_target < 0)
-        to get diverse starting positions.  Initial radii are proportional
-        to local depth so ellipsoids start at a reasonable size.
+        Uses importance-weighted farthest-point sampling on interior voxels
+        (sdf_target < 0) to get diverse starting positions.  When a local
+        thickness field is available, thin features receive more of the fixed
+        initial primitive budget.  Initial radii remain proportional to local
+        depth so ellipsoids start at a reasonable size.
         """
         origin = self._origin
         dx = self._dx
@@ -3405,9 +3455,11 @@ class OptimizationWorker(QtCore.QThread):
         # Cap the FPS candidate cloud before converting to world coordinates.
         # Farthest-point sampling is O(candidates * ellipsoids), so running it
         # over every interior voxel dominates startup on fine SDF grids.  Keep
-        # deep interior voxels, but spread the shortlist across depth bands so
-        # thin parts still receive initial seeds.
+        # high-priority interior voxels, but spread the shortlist across
+        # priority bands so no part of the mesh disappears before FPS.
         interior_depth = np.abs(flat_target[interior_idx])
+        initial_importance = self._initial_interior_importance(
+            interior_idx, interior_depth)
         max_candidates = self._initial_fps_candidate_limit(num_e, len(interior_idx))
         if len(interior_idx) > max_candidates:
             if progress_cb is not None:
@@ -3417,8 +3469,11 @@ class OptimizationWorker(QtCore.QThread):
                 )
             interior_idx = self._shortlist_initial_interior_candidates(
                 interior_idx, interior_depth, max_candidates,
+                candidate_importance=initial_importance,
             )
             interior_depth = np.abs(flat_target[interior_idx])
+            initial_importance = self._initial_interior_importance(
+                interior_idx, interior_depth)
 
         # Convert shortlisted interior voxels to world positions
         if progress_cb is not None:
@@ -3426,11 +3481,12 @@ class OptimizationWorker(QtCore.QThread):
         iz, iy, ix = np.unravel_index(interior_idx, self._shape)
         interior_world = origin + (np.stack([ix, iy, iz], axis=1).astype(np.float32) + 0.5) * dx
 
-        # Use depth as "importance" for FPS — prefer deep interior points
+        # Spatial distance keeps the population spread out; importance decides
+        # how densely that coverage is allocated between thick and thin parts.
         if progress_cb is not None:
             progress_cb(0.45, "placing initial ellipsoids")
         selected = self._farthest_point_sample_with_spatial_capacity(
-            interior_world, interior_depth, num_e,
+            interior_world, initial_importance, num_e,
             existing_centers=np.empty((0, 3), dtype=np.float32),
         )
 
@@ -3684,46 +3740,122 @@ class OptimizationWorker(QtCore.QThread):
         limit = max(int(num_e), min(240_000, limit))
         return min(int(n_available), limit)
 
+    def _initial_interior_importance(
+        self,
+        interior_idx: np.ndarray,
+        interior_depth: np.ndarray,
+    ) -> np.ndarray:
+        """Return FPS importance with density biased toward thin features.
+
+        The legacy fallback is local SDF depth.  With a valid thickness field,
+        the configured inverse-thickness power becomes the density signal.  A
+        scale-free medialness factor suppresses near-surface voxels without
+        reintroducing an absolute preference for physically thick regions.
+        """
+        indices = np.asarray(interior_idx, dtype=np.int64).reshape(-1)
+        depth = np.asarray(interior_depth, dtype=np.float32).reshape(-1)
+        if len(indices) != len(depth):
+            raise ValueError("interior index/depth size mismatch")
+
+        legacy = np.where(
+            np.isfinite(depth) & (depth > 0.0), depth, 0.0)
+        thickness_grid = self._thickness_np
+        power = float(self._thickness_sampling_power)
+        if thickness_grid is None or power <= 0.0:
+            return np.ascontiguousarray(legacy, dtype=np.float32)
+
+        # Gather only the interior values before converting.  Casting an entire
+        # high-resolution thickness volume to float64 here can add gigabytes to
+        # startup memory even though the candidate scores only need float32.
+        thickness_flat = np.asarray(thickness_grid).reshape(-1)
+        if thickness_flat.size != self._sdf_target_np.size:
+            return np.ascontiguousarray(legacy, dtype=np.float32)
+        thickness = np.asarray(thickness_flat[indices], dtype=np.float32)
+        resolved = np.isfinite(thickness) & (thickness > 0.0)
+        if not np.any(resolved):
+            return np.ascontiguousarray(legacy, dtype=np.float32)
+
+        # dx is only a common reference factor, so it makes the inverse-
+        # thickness score scale-free without needing a full-array median.
+        reference = max(float(self._dx), float(np.finfo(np.float32).tiny))
+        importance = thickness.copy()
+        importance[~resolved] = reference
+        np.maximum(importance, reference * 1.0e-6, out=importance)
+        np.divide(reference, importance, out=importance)
+        np.power(importance, power, out=importance)
+
+        medialness = legacy.copy()
+        medialness *= 2.0
+        np.divide(
+            medialness, thickness, out=medialness,
+            where=resolved,
+        )
+        medialness[~resolved] = 1.0
+        np.clip(medialness, 0.05, 1.0, out=medialness)
+        importance *= medialness
+
+        # Clipping keeps the score multiplication numerically well behaved for
+        # malformed or extremely multi-scale thickness fields.
+        positive = np.isfinite(importance) & (importance > 0.0)
+        if not np.any(positive):
+            return np.ascontiguousarray(legacy, dtype=np.float32)
+        importance = np.nan_to_num(
+            importance,
+            copy=False,
+            nan=0.0,
+            posinf=1.0e6,
+            neginf=0.0,
+        )
+        importance = np.clip(importance, 0.0, 1.0e6)
+        return np.ascontiguousarray(importance, dtype=np.float32)
+
     def _shortlist_initial_interior_candidates(
         self,
         interior_idx: np.ndarray,
         interior_depth: np.ndarray,
         max_candidates: int,
+        candidate_importance: np.ndarray | None = None,
     ) -> np.ndarray:
         interior_idx = np.asarray(interior_idx, dtype=np.int64)
         depth = np.asarray(interior_depth, dtype=np.float32)
+        priority = (
+            depth if candidate_importance is None
+            else np.asarray(candidate_importance, dtype=np.float32).reshape(-1)
+        )
+        if len(priority) != len(interior_idx):
+            raise ValueError("candidate importance/index size mismatch")
         max_candidates = int(max_candidates)
         if max_candidates <= 0 or len(interior_idx) <= max_candidates:
             return interior_idx
 
-        finite = np.isfinite(depth)
+        finite = np.isfinite(depth) & np.isfinite(priority) & (priority > 0.0)
         if not np.any(finite):
             step = max(1, int(np.ceil(len(interior_idx) / max_candidates)))
             return interior_idx[::step][:max_candidates]
 
         valid_idx = interior_idx[finite]
-        valid_depth = depth[finite]
+        valid_priority = priority[finite]
         if len(valid_idx) <= max_candidates:
             return valid_idx
 
-        depth_order = np.argsort(valid_depth)
+        priority_order = np.argsort(valid_priority, kind="stable")
         n_bins = min(8, max(2, int(np.sqrt(max_candidates / 256.0))))
-        bins = np.array_split(depth_order, n_bins)
+        bins = np.array_split(priority_order, n_bins)
         picks: list[np.ndarray] = []
         remaining = max_candidates
 
         for bi, bin_order in enumerate(bins):
             if remaining <= 0 or len(bin_order) == 0:
                 continue
-            # Later bins contain deeper voxels; give them more quota while still
-            # preserving some near-surface/thin-structure candidates.
+            # Later bins contain higher-priority voxels; give them more quota
+            # while retaining candidates from every priority range.
             weight = float(bi + 1)
             weights_left = sum(float(j + 1) for j in range(bi, len(bins)))
             quota = int(round(remaining * weight / max(weights_left, 1.0)))
             quota = max(1, min(quota, len(bin_order), remaining))
-            local_depth = valid_depth[bin_order]
+            local_priority = valid_priority[bin_order]
             if len(bin_order) > quota:
-                top_local = np.argpartition(local_depth, -quota)[-quota:]
+                top_local = np.argpartition(local_priority, -quota)[-quota:]
                 bin_order = bin_order[top_local]
             picks.append(valid_idx[bin_order])
             remaining -= len(bin_order)
@@ -3740,12 +3872,16 @@ class OptimizationWorker(QtCore.QThread):
             )
             need = max_candidates - len(out)
             if len(fill) > need:
-                fill_depth = np.abs(self._sdf_target_np.ravel()[fill])
-                fill = fill[np.argpartition(fill_depth, -need)[-need:]]
+                fill_priority = self._initial_interior_importance(
+                    fill, np.abs(self._sdf_target_np.ravel()[fill]))
+                fill = fill[np.argpartition(fill_priority, -need)[-need:]]
             out = np.concatenate([out, fill])
         elif len(out) > max_candidates:
-            out_depth = np.abs(self._sdf_target_np.ravel()[out])
-            out = out[np.argpartition(out_depth, -max_candidates)[-max_candidates:]]
+            out_priority = self._initial_interior_importance(
+                out, np.abs(self._sdf_target_np.ravel()[out]))
+            out = out[
+                np.argpartition(out_priority, -max_candidates)[-max_candidates:]
+            ]
         return np.ascontiguousarray(out.astype(np.int64, copy=False))
 
     def _init_eps(self, n: int) -> np.ndarray:
@@ -4209,6 +4345,7 @@ class OptimizationWorker(QtCore.QThread):
             source=f"{samples.source}-symmetric",
             coarse_mask=paired_coarse,
             normals=paired_normals,
+            thickness_sampling_power=samples.thickness_sampling_power,
         )
 
     def _normal_weight_at(
@@ -4920,6 +5057,62 @@ class OptimizationWorker(QtCore.QThread):
             return pool.copy()
         return np.asarray(rng.choice(pool, size=count, replace=False), dtype=np.int64)
 
+    @staticmethod
+    def _sample_log_falloff_outside(
+        target: np.ndarray,
+        count: int,
+        dx: float,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Sample exterior voxels with inverse-log distance probability.
+
+        ``target`` is the flat target SDF, hence non-negative entries lie on or
+        outside the mesh and already contain their surface distance.  A point
+        ``d`` voxels away receives weight ``1 / (1 + log(1 + d))``: the surface
+        has weight one and selection probability falls logarithmically outward.
+
+        Weighted reservoir keys keep memory bounded while scanning a large SDF;
+        unlike materialising every exterior index and probability, this needs
+        only one grid chunk plus the requested reservoir.
+        """
+        values = np.asarray(target, dtype=np.float32).reshape(-1)
+        count = max(0, int(count))
+        if count == 0 or values.size == 0:
+            return np.empty((0,), dtype=np.int64)
+
+        best_indices = np.empty((0,), dtype=np.int64)
+        best_keys = np.empty((0,), dtype=np.float32)
+        safe_dx = max(float(dx), 1.0e-12)
+        chunk_size = 1_000_000
+        tiny = np.finfo(np.float32).tiny
+        for start in range(0, values.size, chunk_size):
+            stop = min(start + chunk_size, values.size)
+            chunk = values[start:stop]
+            local = np.flatnonzero(np.isfinite(chunk) & (chunk >= 0.0))
+            if local.size == 0:
+                continue
+            distance_vox = np.maximum(chunk[local], 0.0) / safe_dx
+            weights = 1.0 / (1.0 + np.log1p(distance_vox))
+            uniform = np.maximum(
+                rng.random(local.size, dtype=np.float32), tiny)
+            keys = np.log(uniform) / weights
+            indices = local.astype(np.int64, copy=False) + int(start)
+
+            if indices.size > count:
+                keep = np.argpartition(keys, keys.size - count)[-count:]
+                indices = indices[keep]
+                keys = keys[keep]
+            if best_indices.size:
+                indices = np.concatenate([best_indices, indices])
+                keys = np.concatenate([best_keys, keys])
+            if indices.size > count:
+                keep = np.argpartition(keys, keys.size - count)[-count:]
+                indices = indices[keep]
+                keys = keys[keep]
+            best_indices = indices.astype(np.int64, copy=False)
+            best_keys = keys.astype(np.float32, copy=False)
+        return best_indices
+
     def _bone_balanced_candidates(
         self,
         pool: np.ndarray,
@@ -4967,13 +5160,14 @@ class OptimizationWorker(QtCore.QThread):
                 if selected else np.empty((0,), dtype=np.int64))
 
     def _region_candidate_indices(self) -> np.ndarray:
-        """Cached exact-grid samples with guaranteed thin/region representation."""
+        """Cached exact-grid samples with thin, exterior, and region quotas."""
         key = (
             id(self._sdf_target_np), id(self._thickness_np), self._shape,
             float(self._dx), id(self._bone_centers_np), self._bone_aware,
             id(self._spatial_budget_centers_np),
             int(self._region_candidate_budget),
             float(self._region_thin_candidate_fraction),
+            float(self._region_outside_candidate_fraction),
             float(self._region_bone_candidate_fraction),
         )
         cached = self._region_candidate_cache.get(key)
@@ -4988,7 +5182,28 @@ class OptimizationWorker(QtCore.QThread):
             self._region_candidate_cache[key] = out
             return out
 
-        budget = min(int(self._region_candidate_budget), int(interior.size))
+        requested_budget = min(
+            int(self._region_candidate_budget), int(target.size))
+        outside_available = int(target.size - interior.size)
+        outside_fraction = float(np.clip(
+            self._region_outside_candidate_fraction, 0.0, 1.0))
+        budget = requested_budget
+        if 0.0 < outside_fraction < 1.0 and outside_available > 0:
+            # Find the largest budget for which both sides can honour the
+            # requested ratio.  Normal padded grids retain the full budget;
+            # pathological nearly-empty/full grids degrade without changing
+            # the exterior share into a majority.
+            budget = min(
+                budget,
+                int(np.floor(interior.size / (1.0 - outside_fraction))),
+                int(np.floor(outside_available / outside_fraction)),
+            )
+            budget = max(1, budget)
+        n_outside = min(
+            outside_available,
+            int(round(budget * outside_fraction)),
+        )
+        budget = min(budget, int(interior.size) + n_outside)
         band_world = max(float(self._surface_band_vox) * float(self._dx),
                          float(self._dx))
         surface = np.flatnonzero(
@@ -5008,7 +5223,8 @@ class OptimizationWorker(QtCore.QThread):
         ) & 0xFFFFFFFF
         rng = np.random.default_rng(seed)
 
-        selected_parts = []
+        selected_parts = [self._sample_log_falloff_outside(
+            target, n_outside, self._dx, rng)]
         if self._thickness_np is not None:
             thickness = self._thickness_np.ravel()
             valid = thickness[interior]
@@ -5059,9 +5275,14 @@ class OptimizationWorker(QtCore.QThread):
                         return
                     selected.add(int(value))
 
-        # Most samples remain close to the zero set; the tail preserves deeper
-        # misses needed for safe spawn depth and volumetric coverage.
-        _fill(surface, int(round(0.85 * budget)))
+        # Of the remaining 90% interior samples, most stay close to the zero
+        # set; the tail preserves deeper misses needed for safe spawn depth and
+        # volumetric coverage.  Exterior samples are disjoint and retain their
+        # exact reserved share.
+        actual_outside = len(selected_parts[0])
+        interior_budget = max(0, budget - actual_outside)
+        surface_goal = actual_outside + int(round(0.85 * interior_budget))
+        _fill(surface, surface_goal)
         _fill(interior, budget)
 
         out = np.fromiter(selected, dtype=np.int64, count=len(selected))
@@ -5073,6 +5294,29 @@ class OptimizationWorker(QtCore.QThread):
             self._region_candidate_cache.clear()
         self._region_candidate_cache[key] = out
         return out
+
+    def _target_normals_at_flat(self, flat_indices: np.ndarray) -> np.ndarray:
+        """Central-difference target-SDF normals at selected flat voxels."""
+        flat = np.asarray(flat_indices, dtype=np.int64).reshape(-1)
+        if flat.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+        iz, iy, ix = np.unravel_index(flat, self._shape)
+        grid = self._sdf_target_np
+        xm, xp = np.maximum(ix - 1, 0), np.minimum(ix + 1, self._nx - 1)
+        ym, yp = np.maximum(iy - 1, 0), np.minimum(iy + 1, self._ny - 1)
+        zm, zp = np.maximum(iz - 1, 0), np.minimum(iz + 1, self._nz - 1)
+        dx = max(float(self._dx), 1.0e-12)
+        gx = (grid[iz, iy, xp] - grid[iz, iy, xm]) / np.maximum(
+            (xp - xm).astype(np.float32) * dx, dx)
+        gy = (grid[iz, yp, ix] - grid[iz, ym, ix]) / np.maximum(
+            (yp - ym).astype(np.float32) * dx, dx)
+        gz = (grid[zp, iy, ix] - grid[zm, iy, ix]) / np.maximum(
+            (zp - zm).astype(np.float32) * dx, dx)
+        normals = np.stack([gx, gy, gz], axis=1).astype(np.float32)
+        lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+        return np.divide(
+            normals, lengths,
+            out=np.zeros_like(normals), where=lengths > 1.0e-8)
 
     def _pred_grid_from_params(
         self, centers, radii, rotations, eps=None, bend=None,
@@ -5251,15 +5495,17 @@ class OptimizationWorker(QtCore.QThread):
 
         A bounded candidate set is sampled once from exact voxel centres of the
         current target grid.  It reserves explicit quotas for thin surface
-        regions and, when rig information is available, nearest-bone regions.
-        The primitive union is evaluated only at those points, avoiding both an
-        O(n³) predicted grid and the old coarse-grid aliasing of fingers.
+        regions, logarithmically distance-weighted exterior points, and, when
+        rig information is available, nearest-bone regions.  The primitive
+        union is evaluated only at those points, avoiding both an O(n³)
+        predicted grid and the old coarse-grid aliasing of fingers.
 
         Greedy peak picking takes the worst sampled point and suppresses nearby
         samples in world space.  Returns region dicts (worst-first) with:
-          - ``seed_world``  : (3,) world position of the peak-severity voxel
+          - ``seed_world``  : (3,) interior spawn/fit position of the peak
+          - ``sample_world``: (3,) exact voxel centre where error was measured
           - ``pool_flat``   : flat voxel indices of the local interior pool
-          - ``seed_depth``  : local feature thickness at the seed (|target|)
+          - ``seed_depth``  : interior SDF depth at the seed (|target|)
           - ``severity``    : peak severity value
           - ``rank_score``  : score used for greedy picking
           - ``seed_thickness``: local feature thickness at the seed, if known
@@ -5281,6 +5527,25 @@ class OptimizationWorker(QtCore.QThread):
         points = self._grid_points_from_flat(candidate_flat)
         flat_target = self._sdf_target_np.ravel()
         target = flat_target[candidate_flat].astype(np.float32, copy=False)
+        # Exterior samples measure the miss where they actually lie, but a
+        # resulting fit/spawn region must remain attached to the mesh.  Project
+        # them through the zero set and one voxel inward using the target-SDF
+        # normal.  Interior candidates already are valid region centres.
+        region_points = points.copy()
+        exterior = target >= 0.0
+        valid_exterior = np.zeros(len(points), dtype=bool)
+        if np.any(exterior):
+            exterior_pos = np.flatnonzero(exterior)
+            normals = self._target_normals_at_flat(candidate_flat[exterior_pos])
+            normal_valid = np.linalg.norm(normals, axis=1) > 0.5
+            if np.any(normal_valid):
+                valid_pos = exterior_pos[normal_valid]
+                region_points[valid_pos] = (
+                    points[valid_pos]
+                    - normals[normal_valid]
+                    * (target[valid_pos, None] + dx)
+                )
+                valid_exterior[valid_pos] = True
         if eps is None and bend is None:
             # Keep geometry-only detector stubs/callers compatible; SQ paths
             # provide the learned arrays explicitly.
@@ -5291,8 +5556,11 @@ class OptimizationWorker(QtCore.QThread):
                 points, centers, radii, rotations, eps=eps, bend=bend)
         flat_thick = (self._thickness_np.ravel()
                       if self._thickness_np is not None else None)
-        thickness = (flat_thick[candidate_flat].astype(np.float32, copy=False)
+        thickness = (flat_thick[candidate_flat].astype(np.float32, copy=True)
                      if flat_thick is not None else None)
+        if thickness is not None and np.any(valid_exterior):
+            thickness[valid_exterior] = self._grid_values(
+                self._thickness_np, region_points[valid_exterior])
 
         severity = relative_underrep_samples(
             target, pred, dx,
@@ -5301,7 +5569,11 @@ class OptimizationWorker(QtCore.QThread):
             min_gap_vox=self._underrep_min_gap_vox,
             thickness_values=thickness,
             min_thickness_vox=self._underrep_min_thickness_vox,
+            outside_margin_vox=float("inf"),
         )
+        # A flat/clamped SDF has no reliable projection direction.  Such remote
+        # exterior samples must never create a detached region outside the mesh.
+        severity[exterior & ~valid_exterior] = 0.0
         rank = severity.copy()
         if thickness is not None and float(thin_preference) > 0.0:
             valid = thickness > 0.0
@@ -5325,7 +5597,8 @@ class OptimizationWorker(QtCore.QThread):
             if rank_peak <= 0.0 or peak <= floor:
                 break
             seed_flat = int(candidate_flat[seed_pos])
-            seed_world = points[seed_pos].astype(np.float32).copy()
+            sample_world = points[seed_pos].astype(np.float32).copy()
+            seed_world = region_points[seed_pos].astype(np.float32).copy()
             pool_flat = self._interior_ball_pool(
                 seed_world, self._region_radius_vox)
             if pool_flat.size == 0:
@@ -5333,15 +5606,17 @@ class OptimizationWorker(QtCore.QThread):
 
             regions.append(dict(
                 seed_world=seed_world,
+                sample_world=sample_world,
                 pool_flat=pool_flat.astype(np.int32),
-                seed_depth=float(abs(target[seed_pos])),
+                seed_depth=float(max(
+                    -self._grid_value(self._sdf_target_np, seed_world), 0.0)),
                 severity=peak,
                 rank_score=rank_peak,
                 seed_thickness=(None if thickness is None
                                 else float(thickness[seed_pos])),
             ))
 
-            delta = points - seed_world[None, :]
+            delta = region_points - seed_world[None, :]
             suppress = np.einsum("ij,ij->i", delta, delta) <= suppression_radius ** 2
             severity[suppress] = 0.0
             rank[suppress] = 0.0
@@ -5352,6 +5627,9 @@ class OptimizationWorker(QtCore.QThread):
         self, reference_eps: np.ndarray | None = None,
     ) -> float:
         """Circumradius of a unit spawn shape (new bends always start at zero)."""
+        if self._capsule:
+            # Isotropic capsule seed: half-length r[2] plus cap radius r[0].
+            return 2.0
         if not self._superquadric:
             return 1.0
         corners = np.array(
@@ -5378,9 +5656,13 @@ class OptimizationWorker(QtCore.QThread):
         """Spawn new primitives at under-represented region seeds.
 
         Each new primitive starts isotropic and straight at the region's
-        peak-severity interior voxel.  Its family-specific circumradius is
-        bounded by the local interior depth, so boxy SQ corners stay inside too.
-        Regions too shallow to host a meaningful primitive are skipped.
+        peak-severity interior voxel.  Its full family-specific diameter starts
+        at 60 percent of the local feature thickness.  This is large enough to
+        take part in the union fit immediately while still leaving room for the
+        subsequent local/global optimiser to grow it toward the missing
+        surface.  If no thickness value is available, the interior depth gives
+        a conservative fallback.  Even very thin regions get the global
+        minimum trainable radius so an analysed gap always produces a seed.
 
         Returns ``(centers, radii, rotations, region_sites)`` where each
         ``region_site`` is ``(centre_world, half_extent)`` for the optional local
@@ -5392,8 +5674,8 @@ class OptimizationWorker(QtCore.QThread):
         if budget <= 0 or not regions:
             return empty
 
-        min_depth = 1.0 * dx                 # need room for a real ellipsoid
-        inside_frac = 0.8                    # radius as a fraction of the depth
+        diameter_fraction = 0.60             # cover 60% of local mesh thickness
+        min_axis_radius = 0.25 * dx           # matches the global radius bound
         r_region_world = float(self._region_radius_vox) * dx
         shape_radius_factor = self._spawn_shape_radius_factor(reference_eps)
 
@@ -5402,14 +5684,25 @@ class OptimizationWorker(QtCore.QThread):
             if len(cs) >= int(budget):
                 break
             depth = float(reg["seed_depth"])
-            if depth < min_depth:
+            if not np.isfinite(depth):
                 continue
-            # Family circumradius < depth keeps the complete primitive inside.
-            rad = float(min(
-                inside_frac * depth / shape_radius_factor,
-                (depth - 0.5 * dx) / shape_radius_factor))
-            if rad <= 0.0:
-                continue
+            thickness = reg.get("seed_thickness")
+            thickness = (float(thickness) if thickness is not None else np.nan)
+            if not np.isfinite(thickness) or thickness <= 0.0:
+                # At a medial point the full local thickness is 2*depth.  This
+                # remains a safe deterministic fallback for callers without a
+                # precomputed local-thickness field.
+                thickness = 2.0 * max(depth, 0.0)
+            # The thickness field stores a full diameter, whereas primitive
+            # radii describe a half extent.  A 0.30*thickness circumradius thus
+            # gives the requested 0.60*thickness primitive diameter.  Apply the
+            # family factor so boxy SQ corners and capsule end caps obey the
+            # same physical size rather than only matching their axis values.
+            desired_circumradius = 0.5 * diameter_fraction * thickness
+            rad = max(
+                min_axis_radius,
+                float(desired_circumradius / shape_radius_factor),
+            )
             c = np.asarray(reg["seed_world"], dtype=np.float32)
             bone_idx = None
             if bone_counts is not None and bone_caps is not None:
@@ -5975,14 +6268,13 @@ class OptimizationWorker(QtCore.QThread):
                          bone_caps: np.ndarray | None = None,
                          eps: np.ndarray | None = None,
                          bend: np.ndarray | None = None):
-        """Per under-represented region: **split** the nearest existing ellipsoid
-        if one is close, otherwise **spawn** a new (fully-inside) ellipsoid.
+        """Route under-represented regions to small spawns at their error seeds.
 
-        "Close" means the nearest eligible ellipsoid's surface lies within one
-        region radius of the region seed — then extending it (split) is better
-        than seeding a fresh primitive; an isolated gap with no ellipsoid nearby
-        gets a spawn instead.  ``split_enabled`` / ``spawn_enabled`` gate the two
-        mechanisms; when only one is on it handles every region.  Returns
+        When spawning is enabled it is the primary action: every accepted
+        analysis region receives a new small primitive exactly at ``seed_world``
+        and the optimiser grows it from there.  Splitting is only the fallback
+        when Spawn is disabled, leaving normal Split capacity focused on
+        over-represented / bridging primitives.  Returns
         ``(split_targets, spawn_regions)``.
         """
         split_targets: list[int] = []
@@ -5993,44 +6285,15 @@ class OptimizationWorker(QtCore.QThread):
         used = set(int(i) for i in (exclude or set()))
         cen = np.asarray(centers, dtype=np.float32)
         eps, bend = self._shape_state_np(len(cen), eps, bend)
-        near_world = float(self._region_radius_vox) * float(self._dx)
 
         for region in regions:
             if len(split_targets) + len(spawn_regions) >= int(budget):
                 break
             seed = np.asarray(region['seed_world'], dtype=np.float32)
-            j = None
-            surface_distance = None
-            if len(cen) > 0:
-                seed_sdf = self._primitive_sdf_np_batch(
-                    centers, radii, rotations, seed[None, :], eps, bend)[:, 0]
-                for k in np.argsort(np.abs(seed_sdf), kind="stable"):
-                    k = int(k)
-                    if k not in used:
-                        j, surface_distance = k, abs(float(seed_sdf[k]))
-                        break
-            near = j is not None and surface_distance < near_world
-
-            # Prefer split for a nearby ellipsoid, spawn for an isolated gap;
-            # fall back to whichever mechanism is enabled.
-            if near and split_enabled:
-                if self._reserve_split_bone_capacity(
-                        j, centers, radii, rotations,
-                        bone_assign, bone_counts, bone_caps, eps, bend):
-                    used.add(j)
-                    split_targets.append(j)
-                elif spawn_enabled:
-                    sbi = None
-                    if bone_counts is not None and bone_caps is not None:
-                        assign = self._nearest_growth_region_indices_np(seed.reshape(1, 3))
-                        if assign is not None:
-                            sbi = int(assign[0])
-                    if self._bone_has_add_capacity(sbi, bone_counts, bone_caps):
-                        spawn_regions.append(region)
-                        if (bone_counts is not None and sbi is not None
-                                and 0 <= sbi < len(bone_counts)):
-                            bone_counts[sbi] += 1
-            elif spawn_enabled:
+            # Under-representation is a request for new local capacity.  Spawn
+            # at the detected error point even when an existing primitive is
+            # nearby; that seed can then expand specifically into the miss.
+            if spawn_enabled:
                 bi = None
                 if bone_counts is not None and bone_caps is not None:
                     assign = self._nearest_growth_region_indices_np(seed.reshape(1, 3))
@@ -6041,7 +6304,20 @@ class OptimizationWorker(QtCore.QThread):
                     if (bone_counts is not None and bi is not None
                             and 0 <= bi < len(bone_counts)):
                         bone_counts[bi] += 1
-            elif split_enabled and j is not None:
+                continue
+
+            # Spawn disabled: retain Split as an explicit fallback by selecting
+            # the nearest still-eligible primitive to the region seed.
+            j = None
+            if split_enabled and len(cen) > 0:
+                seed_sdf = self._primitive_sdf_np_batch(
+                    centers, radii, rotations, seed[None, :], eps, bend)[:, 0]
+                for k in np.argsort(np.abs(seed_sdf), kind="stable"):
+                    k = int(k)
+                    if k not in used:
+                        j = k
+                        break
+            if split_enabled and j is not None:
                 if self._reserve_split_bone_capacity(
                         j, centers, radii, rotations,
                         bone_assign, bone_counts, bone_caps, eps, bend):
@@ -7011,7 +7287,8 @@ class OptimizationWorker(QtCore.QThread):
                           inputs=[pred_centers, prev_centers, offset],
                           device=device)
             wp.launch(_sgd_step_vec3_range, dim=n_active,
-                      inputs=[pred_centers, tape.gradients[pred_centers], lr, offset],
+                      inputs=[pred_centers, tape.gradients[pred_centers],
+                              float(lr * self._lr_mult_centers), offset],
                       device=device)
             wp.launch(_sgd_step_vec3_range, dim=n_active,
                       inputs=[pred_radii, tape.gradients[pred_radii], lr, offset],
@@ -7687,6 +7964,15 @@ class OptimizationWorker(QtCore.QThread):
         ])
 
         bs = int(min(self._batch_size, 4096))
+        local_sampler = BandSampler(
+            pool_targets,
+            bs,
+            float(self._surface_band_vox) * local_dx,
+            self._surface_fraction,
+            rng=self._rng,
+            flat_thickness=(pool_thick if any_thick else None),
+            thickness_sampling_power=self._thickness_sampling_power,
+        )
         # Local LR remains user-controlled, but it may not exceed either the
         # current positive global schedule or half a high-resolution box voxel.
         # This prevents one Adam step from jumping several local voxels.
@@ -7766,7 +8052,8 @@ class OptimizationWorker(QtCore.QThread):
                 min_d_cache=buf['min_d_cache'], sdf_pred=buf['sdf_pred'],
                 pred_normals=buf['pred_normals'],
                 loss=buf['loss'], wp_indices=buf['wp_indices'],
-                opt_c=_PopulationAdam(buf['pred_centers'], lr0),
+                opt_c=_PopulationAdam(
+                    buf['pred_centers'], lr0 * self._lr_mult_centers),
                 opt_r=_PopulationAdam(
                     log_r, lr0 * self._lr_mult_radii),
                 opt_q=_PopulationAdam(
@@ -7992,7 +8279,7 @@ class OptimizationWorker(QtCore.QThread):
                     0.1
                     + 0.9 * 0.5 * (1.0 + np.cos(np.pi * progress)))
                 step_lr = float(lr0 * anneal)
-                batch = self._rng.integers(0, P, size=bs).astype(np.int32)
+                batch = local_sampler.next_batch()
                 wp_indices.assign(np.ascontiguousarray(batch))
 
                 tape = wp.Tape()
@@ -8096,7 +8383,7 @@ class OptimizationWorker(QtCore.QThread):
                     wp.launch(_zero_f32_prefix, dim=offset * 2,
                               inputs=[pred_bend_raw.grad], device=device)
 
-                state['opt_c'].lr = step_lr
+                state['opt_c'].lr = step_lr * self._lr_mult_centers
                 state['opt_r'].lr = step_lr * self._lr_mult_radii
                 state['opt_q'].lr = step_lr * self._lr_mult_rot
                 shape_step = int(gstep if gstep >= 0 else self._num_steps)
@@ -8561,10 +8848,11 @@ class OptimizationWorker(QtCore.QThread):
                     seen.add(v)
                     targets.append(v)
 
-        # Under-represented regions → SPLIT the nearest ellipsoid when one is
-        # close to the gap, else SPAWN a new ellipsoid guaranteed fully inside
-        # the mesh.  Detect on the *full* current config so areas still covered
-        # by a parent are not double-counted.
+        # Under-represented regions → SPAWN a small growth seed directly at the
+        # detected miss.  Split is only the fallback when Spawn is disabled;
+        # over-represented / bridging shapes were handled by the split pass
+        # above.  Detect on the full current config so existing coverage is
+        # accounted for by the analysis.
         spawn_c = np.empty((0, 3), np.float32)
         spawn_r = np.empty((0, 3), np.float32)
         spawn_q = np.empty((0, 4), np.float32)
@@ -8978,7 +9266,7 @@ class OptimizationWorker(QtCore.QThread):
             float(self._surface_band_vox) * float(dx),
             self._surface_fraction, rng=self._rng,
             flat_thickness=self._thickness_flat,
-            thin_bias=float(self._thin_sample_bias),
+            thickness_sampling_power=self._thickness_sampling_power,
         )
         wp_origin = wp.vec3(float(origin[0]), float(origin[1]), float(origin[2]))
         lr = 0.01
@@ -9120,7 +9408,8 @@ class OptimizationWorker(QtCore.QThread):
 
             if self._optimize_centers:
                 wp.launch(_sgd_step_vec3, dim=num_e,
-                          inputs=[pred_centers, tape.gradients[pred_centers], lr],
+                          inputs=[pred_centers, tape.gradients[pred_centers],
+                                  float(lr * self._lr_mult_centers)],
                           device=device)
             if self._optimize_radii:
                 wp.launch(_sgd_step_vec3, dim=num_e,
@@ -9354,12 +9643,26 @@ class OptimizationWorker(QtCore.QThread):
         # per-step cost is set by batch_size regardless, so half-sampling saved
         # nothing anyway.
         self.prep_progress.emit(0.80, "building sampler")
+        proposal_power = (
+            float(sample_targets.thickness_sampling_power)
+            if use_sample_targets else 0.0)
+        if (proposal_power > 0.0
+                and not np.isclose(
+                    proposal_power, self._thickness_sampling_power,
+                    atol=1.0e-12)):
+            raise ValueError(
+                "preweighted sparse samples use thickness_sampling_power "
+                f"{proposal_power:g}, but the optimizer requested "
+                f"{self._thickness_sampling_power:g}; rebuild the sparse "
+                "sample cloud with the requested power")
+        residual_sampling_power = (
+            self._thickness_sampling_power if proposal_power == 0.0 else 0.0)
         sampler = BandSampler(
             target_values_np, bs,
             float(self._surface_band_vox) * float(dx),
             self._surface_fraction, rng=self._rng,
             flat_thickness=target_thickness_np,
-            thin_bias=float(self._thin_sample_bias),
+            thickness_sampling_power=residual_sampling_power,
             coarse_mask=sample_targets.coarse_mask if use_sample_targets else None,
         )
         validation_sample = self._build_validation_sample()
@@ -9445,7 +9748,8 @@ class OptimizationWorker(QtCore.QThread):
                                  previous.get("eps"), lineage, 2))
                 state_bend = _PopulationAdam.remap(
                     previous.get("bend"), lineage, 2)
-            oc = _PopulationAdam(pred_centers, lr=lr, state=state_c)
+            oc = _PopulationAdam(
+                pred_centers, lr=lr * self._lr_mult_centers, state=state_c)
             orad = _PopulationAdam(log_r, lr=lr, state=state_r)
             oq = _PopulationAdam(pred_rot_flat, lr=lr, state=state_q)
             # Per-element ages let freshly spawned parameters begin with correct
@@ -10047,7 +10351,7 @@ class OptimizationWorker(QtCore.QThread):
 
             tape.backward(loss)
             # Per-group learning rates (centres / log-radii / rotation).
-            opt_c.lr = lr
+            opt_c.lr = lr * self._lr_mult_centers
             opt_r.lr = lr * self._lr_mult_radii
             opt_q.lr = lr * self._lr_mult_rot
             if self._optimize_centers and self._center_step_radius_frac > 0.0:
@@ -10187,11 +10491,14 @@ class OptimizationWorker(QtCore.QThread):
             if stop_for_patience:
                 break
 
-        # Always publish the best deterministic hold-out checkpoint, not merely
-        # the last stochastic mini-batch state.  This also provides a clean
-        # rollback if a late SQ/bend update becomes non-finite or overfits.
+        # By default publish the best deterministic hold-out checkpoint, not
+        # merely the last stochastic mini-batch state.  This also provides a
+        # clean rollback if a late SQ/bend update becomes non-finite or
+        # overfits.  Callers may explicitly keep the current state instead;
+        # useful local-fit changes can otherwise be replaced by an older global
+        # validation checkpoint at the very end of the run.
         final_step = int(step if "step" in locals() else self._num_steps)
-        if best_checkpoint.has_checkpoint:
+        if self._use_best_validation_result and best_checkpoint.has_checkpoint:
             best_state = best_checkpoint.restore()
             best_num = int(len(best_state["radii"]))
             best_centers_wp = wp.array(

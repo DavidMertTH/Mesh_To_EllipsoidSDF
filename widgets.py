@@ -18,7 +18,11 @@ import pyqtgraph.opengl as gl
 import theme
 import sdf_slice as slice_module
 from sdf_blowup import apply_thickness_relative_blowup
-from sdf_colormap import make_sdf_lut, colorize_sdf_slice
+from sdf_colormap import (
+    make_sdf_lut,
+    colorize_sdf_slice,
+    SLICE_EXTERIOR_BAND_VOXELS,
+)
 
 
 # ── wheel-scroll guard ───────────────────────────────────────────────────────
@@ -420,8 +424,8 @@ class SdfSlicePanel(QtWidgets.QWidget):
         self._combo_slice_mode.addItem(
             "Error (Color Coded)", "error")
         self._combo_slice_mode.setToolTip(
-            "SDF shows the mesh distance field. Error compares the fitted\n"
-            "ellipsoids with the mesh using a color-coded difference map.")
+            "SDF shows the mesh distance field. Error shows the signed SDF\n"
+            "residual of the ellipsoid fit across the full cross-section.")
         self._combo_slice_mode.currentIndexChanged.connect(
             self._on_slice_mode_changed)
         form.addRow("Mode:", self._combo_slice_mode)
@@ -585,7 +589,7 @@ class SdfSlicePanel(QtWidgets.QWidget):
                     "Under-coverage &nbsp; "
                     f"<span style='color:{theme.YELLOW_HEX}'>■</span> "
                     "Over-coverage &nbsp; "
-                    "Transparent: agreement")
+                    "Gray: close match &nbsp; Stronger color: larger error")
                 centers, radii, rotations = params
                 width, height = slice2d.shape
                 points = slice_module.slice_points(
@@ -594,19 +598,19 @@ class SdfSlicePanel(QtWidgets.QWidget):
                 ellipsoid_sdf = slice_module.ellipsoid_slice_sdf(
                     centers, radii, rotations, points).reshape(width, height)
                 rgba = slice_module.slice_rgba_error(
-                    ellipsoid_sdf, slice2d, theme.BLUE, theme.YELLOW)
+                    ellipsoid_sdf, slice2d, theme.BLUE, theme.YELLOW,
+                    dx=self._dx)
         else:
             self._set_slice_mode_hint("")
-            # Colour exactly like the 3-D slice: interior blends
-            # surface->deepest across the whole interior (full colour only at
-            # the deepest point), while the exterior fades within a few voxels.
+            # Colour exactly like the 3-D slice: a clearly filled interior plus
+            # a transparent exterior distance band for spatial context.
             requested = (
                 self._sdf_blowup_fraction * self._blowup_thickness_max)
             depth = max(
                 self._raw_sdf_depth + max(-requested, 0.0),
                 1.0e-4,
             )
-            out_band = 3.0 * float(self._dx)
+            out_band = SLICE_EXTERIOR_BAND_VOXELS * float(self._dx)
             rgba = colorize_sdf_slice(slice2d, self._lut, depth, out_band)
         # Pre-coloured RGBA → must be shown RAW.  ImageView otherwise applies a
         # LUT and (worse) levels=[0,1] to the uint8 image, scaling every channel

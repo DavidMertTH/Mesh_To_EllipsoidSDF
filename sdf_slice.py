@@ -14,7 +14,14 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
-from sdf_colormap import make_sdf_lut, colorize_sdf_slice, SLICE_INTERIOR_GAMMA
+from sdf_colormap import (
+    make_sdf_lut,
+    colorize_sdf_slice,
+    SLICE_EXTERIOR_ALPHA_GAMMA,
+    SLICE_EXTERIOR_BAND_VOXELS,
+    SLICE_INTERIOR_GAMMA,
+    SLICE_INTERIOR_MIN_ALPHA,
+)
 from ellipsoid import best_device
 
 # Plane label → normal world-axis index (x=0, y=1, z=2).
@@ -24,6 +31,14 @@ PLANE_LABELS = ("XY", "XZ", "YZ")
 # SDF display range (matches the 2-D SdfSlicePanel for a consistent look).
 SLICE_VMIN = -0.2
 SLICE_VMAX = 0.2
+
+# Error-slice scale in voxel units.  Keeping this fixed makes colours directly
+# comparable while stepping through slices; a per-slice maximum made the same
+# world-space error change colour whenever an outlier entered the plane.
+ERROR_SLICE_SCALE_VOXELS = 4.0
+ERROR_SLICE_CONTEXT_VOXELS = 3.0
+ERROR_SLICE_MIN_ALPHA = 200.0
+ERROR_SLICE_CONTEXT_GAMMA = 1.35
 
 # Interior colour easing constant lives in sdf_colormap (shared with the 2-D
 # SdfSlicePanel); re-exported here as the default for the GPU render functions.
@@ -109,16 +124,15 @@ def slice_rgba(slice2d: np.ndarray, lut: np.ndarray | None = None,
     """Map a 2-D SDF slice to an ``(W, H, 4)`` uint8 RGBA texture via the LUT.
 
     The interior and exterior are scaled **independently** so the slice reads as
-    a crisp cross-section instead of a soft halo:
+    a filled cross-section with useful signed-distance context:
 
       * interior (SDF < 0): normalised by ``depth`` (the deepest interior
         magnitude of the volume) — the maximum interior colour is reached only at
         the genuinely deepest point, and the gradient in between reveals depth
         structure;
-      * exterior (SDF > 0): normalised by a SMALL ``out_band`` (a few voxels) so
-        the colour fades to the background within a few voxels of the surface —
-        a sharp boundary, NOT a wide halo whose width grows with ``depth`` (which
-        made thin features look like grey smudges).
+      * exterior (SDF > 0): normalised by ``out_band`` and faded to transparent,
+        so nearby distances remain visible without showing the rectangular
+        bounds of the slice texture.
     """
     # Delegate to the shared (warp-free) colouriser so the 2-D SdfSlicePanel and
     # this 3-D slice render identically.  Matches the GPU _color_sdf_kernel.
@@ -148,36 +162,56 @@ def slice_rgba_diff(diff: np.ndarray, primary_rgb, secondary_rgb,
 
 
 def slice_rgba_error(ellipsoid_sdf: np.ndarray, mesh_sdf: np.ndarray,
-                     under_rgb, over_rgb) -> np.ndarray:
-    """Transparent, color-coded coverage error between two SDF slices.
+                     under_rgb, over_rgb, dx: float = 1.0,
+                     mid_rgb=(128, 128, 138)) -> np.ndarray:
+    """Filled, color-coded signed SDF residual between two slices.
 
-    Only the symmetric difference of the two interiors is an actual coverage
-    error. Mesh-inside/fit-outside pixels are under-coverage; fit-inside/
-    mesh-outside pixels are over-coverage. Agreement and the far field stay
-    transparent instead of filling the complete slice plane with irrelevant
-    signed-distance differences.
+    ``ellipsoid_sdf - mesh_sdf`` is positive for under-coverage and negative
+    for over-coverage.  The complete union of both interiors remains visible,
+    including errors where both fields have the same sign.  A short exterior
+    context band fades to transparent so the texture never appears as a large
+    rectangle.  Error magnitude is normalized to a fixed number of voxels,
+    making colours stable and comparable between slices.
     """
     ell = np.asarray(ellipsoid_sdf, dtype=np.float32)
     mesh = np.asarray(mesh_sdf, dtype=np.float32)
     if ell.shape != mesh.shape:
         raise ValueError("ellipsoid and mesh SDF slices must have equal shape")
 
-    under = (mesh < 0.0) & (ell >= 0.0)
-    over = (ell < 0.0) & (mesh >= 0.0)
-    mismatch = under | over
-    rgba = np.zeros(ell.shape + (4,), dtype=np.uint8)
-    if not np.any(mismatch):
-        return np.ascontiguousarray(rgba)
+    delta = ell - mesh
+    scale = max(ERROR_SLICE_SCALE_VOXELS * float(dx), 1.0e-9)
+    strength = np.sqrt(np.clip(np.abs(delta) / scale, 0.0, 1.0))
 
-    error = np.abs(ell - mesh)
-    scale = max(float(np.max(error[mismatch])), 1.0e-4)
-    strength = np.sqrt(np.clip(error / scale, 0.0, 1.0))
-    under_color = np.asarray(under_rgb, dtype=np.uint8)[:3]
-    over_color = np.asarray(over_rgb, dtype=np.uint8)[:3]
-    rgba[under, :3] = under_color
-    rgba[over, :3] = over_color
-    rgba[..., 3][mismatch] = np.clip(
-        96.0 + 159.0 * strength[mismatch], 0.0, 255.0).astype(np.uint8)
+    under_color = np.asarray(under_rgb, dtype=np.float32)[:3]
+    over_color = np.asarray(over_rgb, dtype=np.float32)[:3]
+    mid_color = np.asarray(mid_rgb, dtype=np.float32)[:3]
+    target = np.where(
+        (delta >= 0.0)[..., None], under_color, over_color)
+    rgb = (
+        mid_color * (1.0 - strength[..., None])
+        + target * strength[..., None]
+    )
+
+    # Full support inside either cross-section; outside, show only a narrow
+    # band around the nearest of the two surfaces.
+    context_band = max(ERROR_SLICE_CONTEXT_VOXELS * float(dx), 1.0e-9)
+    support_sdf = np.minimum(ell, mesh)
+    support = np.where(
+        support_sdf <= 0.0,
+        1.0,
+        np.power(
+            np.clip(1.0 - support_sdf / context_band, 0.0, 1.0),
+            ERROR_SLICE_CONTEXT_GAMMA,
+        ),
+    )
+    alpha = support * (
+        ERROR_SLICE_MIN_ALPHA
+        + (255.0 - ERROR_SLICE_MIN_ALPHA) * strength
+    )
+
+    rgba = np.empty(ell.shape + (4,), dtype=np.uint8)
+    rgba[..., :3] = np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+    rgba[..., 3] = np.clip(alpha, 0.0, 255.0).astype(np.uint8)
     return np.ascontiguousarray(rgba)
 
 
@@ -443,16 +477,14 @@ def _relative_grid_field_kernel(
 def _color_sdf_kernel(
     field: wp.array(dtype=wp.float32),
     depth: float, out_band: float, gamma: float,
+    interior_min_alpha: float, exterior_alpha_gamma: float,
     lut: wp.array(dtype=wp.float32), n_lut: int,   # flat (n_lut*4) RGBA 0..255
     surf_idx: int,                                 # LUT entry for the surface (t=0.5)
     rgba: wp.array(dtype=wp.uint8),                # flat (M*4)
 ):
-    # Exterior (SDF > 0): LUT mapping surface -> far, as before.
+    # Exterior (SDF > 0): surface -> far colour, fading to transparent.
     # Interior (SDF < 0): blend the LUT's SURFACE colour -> DEEPEST colour
-    # directly across the WHOLE interior, eased by gamma>1.  The shared LUT has
-    # an interior plateau (it hits ~full colour just past the surface), so
-    # indexing it would saturate early; lerping the two endpoints instead makes
-    # the full colour appear ONLY at the deepest point with a long, even blend.
+    # directly across the WHOLE interior and keep it visibly filled.
     tid = wp.tid()
     v = field[tid]
     o = tid * 4
@@ -462,7 +494,8 @@ def _color_sdf_kernel(
         rgba[o + 0] = wp.uint8(lut[si + 0] * (1.0 - mag) + lut[0] * mag)
         rgba[o + 1] = wp.uint8(lut[si + 1] * (1.0 - mag) + lut[1] * mag)
         rgba[o + 2] = wp.uint8(lut[si + 2] * (1.0 - mag) + lut[2] * mag)
-        rgba[o + 3] = wp.uint8(lut[si + 3] * (1.0 - mag) + lut[3] * mag)
+        rgba[o + 3] = wp.uint8(
+            interior_min_alpha + (255.0 - interior_min_alpha) * (1.0 - mag))
     else:
         s = wp.min(v / out_band, 1.0)
         t = 0.5 + 0.5 * s
@@ -471,47 +504,44 @@ def _color_sdf_kernel(
         rgba[o + 0] = wp.uint8(lut[li + 0])
         rgba[o + 1] = wp.uint8(lut[li + 1])
         rgba[o + 2] = wp.uint8(lut[li + 2])
-        rgba[o + 3] = wp.uint8(lut[li + 3])
-
-
-@wp.kernel
-def _maxabs_diff_kernel(
-    ell: wp.array(dtype=wp.float32), mesh: wp.array(dtype=wp.float32),
-    out_max: wp.array(dtype=wp.float32),
-):
-    tid = wp.tid()
-    ell_inside = ell[tid] < 0.0
-    mesh_inside = mesh[tid] < 0.0
-    if ell_inside != mesh_inside:
-        wp.atomic_max(out_max, 0, wp.abs(ell[tid] - mesh[tid]))
+        rgba[o + 3] = wp.uint8(255.0 * wp.pow(1.0 - s, exterior_alpha_gamma))
 
 
 @wp.kernel
 def _color_diff_kernel(
     ell: wp.array(dtype=wp.float32), mesh: wp.array(dtype=wp.float32),
-    scale: float, prim: wp.vec3, sec: wp.vec3, mid: wp.vec3,
+    scale: float, context_band: float, min_alpha: float,
+    context_gamma: float, prim: wp.vec3, sec: wp.vec3, mid: wp.vec3,
     rgba: wp.array(dtype=wp.uint8),
 ):
-    # Transparent agreement; primary=under-coverage, secondary=over-coverage.
+    # Signed SDF residual: primary=under-coverage, secondary=over-coverage.
+    # Both shared interiors and same-sign errors remain visible.
     tid = wp.tid()
     o = tid * 4
-    ell_inside = ell[tid] < 0.0
-    mesh_inside = mesh[tid] < 0.0
-    if ell_inside == mesh_inside:
-        rgba[o + 0] = wp.uint8(0)
-        rgba[o + 1] = wp.uint8(0)
-        rgba[o + 2] = wp.uint8(0)
-        rgba[o + 3] = wp.uint8(0)
-    else:
-        col = prim
-        if ell_inside:
-            col = sec
-        mag = wp.sqrt(wp.clamp(
-            wp.abs(ell[tid] - mesh[tid]) / scale, 0.0, 1.0))
-        rgba[o + 0] = wp.uint8(wp.clamp(col[0], 0.0, 255.0))
-        rgba[o + 1] = wp.uint8(wp.clamp(col[1], 0.0, 255.0))
-        rgba[o + 2] = wp.uint8(wp.clamp(col[2], 0.0, 255.0))
-        rgba[o + 3] = wp.uint8(96.0 + 159.0 * mag)
+    delta = ell[tid] - mesh[tid]
+    mag = wp.sqrt(wp.clamp(wp.abs(delta) / scale, 0.0, 1.0))
+    col = prim
+    if delta < 0.0:
+        col = sec
+
+    support_sdf = wp.min(ell[tid], mesh[tid])
+    support = 1.0
+    if support_sdf > 0.0:
+        support = wp.pow(
+            wp.clamp(1.0 - support_sdf / context_band, 0.0, 1.0),
+            context_gamma,
+        )
+
+    rgba[o + 0] = wp.uint8(wp.clamp(
+        mid[0] * (1.0 - mag) + col[0] * mag, 0.0, 255.0))
+    rgba[o + 1] = wp.uint8(wp.clamp(
+        mid[1] * (1.0 - mag) + col[1] * mag, 0.0, 255.0))
+    rgba[o + 2] = wp.uint8(wp.clamp(
+        mid[2] * (1.0 - mag) + col[2] * mag, 0.0, 255.0))
+    rgba[o + 3] = wp.uint8(wp.clamp(
+        support * (min_alpha + (255.0 - min_alpha) * mag),
+        0.0, 255.0,
+    ))
 
 
 def _plane_basis(origin, normal_idx, k, px, dx):
@@ -569,6 +599,8 @@ def render_ellipsoid(centers, radii, rotations, origin, normal_idx, k, W, H,
     rgba = wp.empty(M * 4, dtype=wp.uint8, device=dev)
     wp.launch(_color_sdf_kernel, dim=M,
               inputs=[field, float(depth), float(out_band), float(gamma),
+                      float(SLICE_INTERIOR_MIN_ALPHA),
+                      float(SLICE_EXTERIOR_ALPHA_GAMMA),
                       lut_wp, int(n_lut), (int(n_lut) - 1) // 2, rgba],
               device=dev)
     return rgba.numpy().reshape(int(W), int(H), 4)
@@ -606,6 +638,8 @@ def render_mesh(grid_wp, gorigin, dx, nx, ny, nz, origin, normal_idx, k, W, H,
     rgba = wp.empty(M * 4, dtype=wp.uint8, device=dev)
     wp.launch(_color_sdf_kernel, dim=M,
               inputs=[field, float(depth), float(out_band), float(gamma),
+                      float(SLICE_INTERIOR_MIN_ALPHA),
+                      float(SLICE_EXTERIOR_ALPHA_GAMMA),
                       lut_wp, int(n_lut), (int(n_lut) - 1) // 2, rgba],
               device=dev)
     return rgba.numpy().reshape(int(W), int(H), 4)
@@ -615,7 +649,7 @@ def render_diff(centers, radii, rotations, grid_wp, gorigin, dx, nx, ny, nz,
                 origin, normal_idx, k, W, H, px, primary_rgb, secondary_rgb,
                 mid_rgb=(128, 128, 138), thickness_fraction=0.0,
                 thickness_wp=None):
-    """GPU-render transparent, color-coded fit coverage error → uint8 RGBA.
+    """GPU-render the filled, signed fit-SDF residual → uint8 RGBA.
 
     ``thickness_fraction`` applies the same local-diameter-relative transform
     used by the fitting target before interpolation.
@@ -652,13 +686,17 @@ def render_diff(centers, radii, rotations, grid_wp, gorigin, dx, nx, ny, nz,
                 float(thickness_fraction), mesh,
             ],
             device=dev)
-    mx = wp.zeros(1, dtype=wp.float32, device=dev)
-    wp.launch(_maxabs_diff_kernel, dim=M, inputs=[ell, mesh, mx], device=dev)
-    scale = max(float(mx.numpy()[0]), 1e-4)
+    scale = max(ERROR_SLICE_SCALE_VOXELS * float(dx), 1.0e-9)
+    context_band = max(ERROR_SLICE_CONTEXT_VOXELS * float(dx), 1.0e-9)
     rgba = wp.empty(M * 4, dtype=wp.uint8, device=dev)
     prim = wp.vec3(*[float(c) for c in primary_rgb[:3]])
     sec = wp.vec3(*[float(c) for c in secondary_rgb[:3]])
     mid = wp.vec3(*[float(c) for c in mid_rgb[:3]])
     wp.launch(_color_diff_kernel, dim=M,
-              inputs=[ell, mesh, float(scale), prim, sec, mid, rgba], device=dev)
+              inputs=[
+                  ell, mesh, float(scale), float(context_band),
+                  float(ERROR_SLICE_MIN_ALPHA),
+                  float(ERROR_SLICE_CONTEXT_GAMMA),
+                  prim, sec, mid, rgba,
+              ], device=dev)
     return rgba.numpy().reshape(int(W), int(H), 4)

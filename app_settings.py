@@ -24,6 +24,7 @@ with ``kind`` ``"bool"`` (→ QCheckBox), ``"int"`` (→ QSpinBox), or
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 _FILE = Path(__file__).with_name("app_settings.json")
@@ -59,8 +60,8 @@ SETTINGS_SPEC = [
         ]),
         ("Spawn", [
             ("spawn_per_round", "Spawns per cycle", "int", 0, 50, 1, 0, 3,
-             "How many new ellipsoids may be spawned into under-represented\n"
-             "gaps per maintenance cycle."),
+             "How many 60%-of-local-thickness growth seeds may be spawned\n"
+             "directly at under-represented regions per maintenance cycle."),
         ]),
         ("Split", [
             ("split_per_round", "Splits per cycle", "int", 0, 50, 1, 0, 7,
@@ -100,8 +101,10 @@ SETTINGS_SPEC = [
     ("Local fit", [
         ("High-res region (SuperFit)", [
             ("region_radius_vox", "Region radius (vox)", "float", 1.0, 30.0, 0.5, 1, 6.0,
-             "Half-extent (in voxels) of the local box re-fitted around each\n"
-             "maintained region."),
+             "Base/minimum half-extent of a local-fit box, measured in global\n"
+             "SDF voxels. The actual box may be larger for a split primitive\n"
+             "and always includes a safety/blowup margin. All boxes use the\n"
+             "same Region resolution, so a larger box has less spatial detail."),
             ("region_res", "Region resolution", "int", 32, 256, 16, 0, 128,
              "Voxel resolution of the fresh high-res SDF box used for local fit."),
             ("region_steps", "Region steps", "int", 100, 20000, 100, 0, 400,
@@ -120,6 +123,13 @@ SETTINGS_SPEC = [
              1.0, 4.0, 0.05, 2, 1.5,
              "Maximum factor by which each radius may grow or shrink during\n"
              "one local fit (symmetric in log space)."),
+        ]),
+        ("Final result", [
+            ("use_best_validation_result", "Use best validation result", "bool",
+             0, 1, 1, 0, True,
+             "Restore the checkpoint with the lowest validation loss when the\n"
+             "fit finishes. Disable this to keep the final optimiser state,\n"
+             "including changes made by the last local fit."),
         ]),
     ]),
 
@@ -168,12 +178,10 @@ SETTINGS_SPEC = [
         ]),
         ("Thin features", [
             ("thin_loss_weight", "Thin loss weight", "float", 0.0, 10.0, 0.1, 1, 1.0,
-             "Boost the loss on thin structures (inverse local thickness)."),
+             "Additional inverse-thickness loss boost, applied on top of the\n"
+             "sampling distribution. Set to 0 for sampling-only emphasis."),
             ("thin_max_factor", "Thin max factor", "float", 1.0, 20.0, 0.5, 1, 6.0,
              "Cap on the thin-feature loss boost."),
-            ("thin_sample_bias", "Thin sample bias", "float", 0.0, 3.0, 0.1, 1, 1.0,
-             "Reserve more of the surface-band samples for thin features\n"
-             "(1.0 = default 30 %, 0 = off)."),
         ]),
         ("Under-representation", [
             ("underrep_rel_threshold", "Detection threshold", "float", 0.05, 2.0, 0.05, 2, 0.6,
@@ -209,6 +217,12 @@ SETTINGS_SPEC = [
              "Half-width (in voxels) of the surface band for importance sampling."),
             ("surface_fraction", "Surface fraction", "float", 0.0, 1.0, 0.05, 2, 0.75,
              "Fraction of each batch drawn from the surface band."),
+            ("thickness_sampling_power", "Thickness sampling power", "float",
+             0.0, 2.0, 0.10, 2, 1.00,
+             "Continuously weight surface sampling by local feature thickness.\n"
+             "0 = area-uniform, 1 = probability proportional to 1 / thickness,\n"
+             "2 = stronger 1 / thickness² weighting. There is no thin/thick split.\n"
+             "Thin loss weight can independently add further emphasis."),
             ("coverage_sample_size", "Coverage sample size", "int", 1000, 100000, 1000, 0, 20000,
              "Number of samples used to estimate coverage / under-representation."),
         ]),
@@ -216,6 +230,8 @@ SETTINGS_SPEC = [
 
     ("Advanced", [
         ("Learning-rate multipliers", [
+            ("lr_mult_centers", "LR × position", "float", 0.0, 10.0, 0.5, 1, 1.0,
+             "Per-group learning-rate multiplier for primitive centres."),
             ("lr_mult_radii", "LR × radii", "float", 0.0, 10.0, 0.5, 1, 2.0,
              "Per-group learning-rate multiplier for the (log-space) radii."),
             ("lr_mult_rot", "LR × rotation", "float", 0.0, 10.0, 0.5, 1, 1.0,
@@ -266,9 +282,59 @@ def load() -> dict:
     except Exception:
         return values
     if isinstance(data, dict):
+        migrated = False
+        # Older settings files predate selectable final-checkpoint restore.
+        # Persist the historical behaviour explicitly so reopening the dialog
+        # exposes the enabled checkbox without changing existing fits.
+        if "use_best_validation_result" not in data:
+            data["use_best_validation_result"] = values[
+                "use_best_validation_result"]
+            migrated = True
+        # The short-lived ``thin_surface_fraction`` setting used a binary
+        # thin/regular quota.  Its numeric value now migrates to the continuous
+        # inverse-thickness power so an explicit 1.0 becomes exactly 1/t.  The
+        # older bias mapped 1.0 to a 30 % quota, so retain that approximate
+        # strength as power 0.3 for legacy configurations.
+        if "thickness_sampling_power" not in data:
+            try:
+                if "thin_surface_fraction" in data:
+                    legacy = float(data["thin_surface_fraction"])
+                elif "thin_sample_bias" in data:
+                    legacy = 0.3 * float(data["thin_sample_bias"])
+                else:
+                    legacy = values["thickness_sampling_power"]
+                if not math.isfinite(legacy):
+                    raise ValueError("non-finite thickness sampling setting")
+                data["thickness_sampling_power"] = max(
+                    0.0, min(2.0, legacy))
+            except (TypeError, ValueError):
+                data["thickness_sampling_power"] = values[
+                    "thickness_sampling_power"]
+            migrated = migrated or bool(
+                "thin_surface_fraction" in data or "thin_sample_bias" in data)
+        for legacy_key in ("thin_surface_fraction", "thin_sample_bias"):
+            if legacy_key in data:
+                del data[legacy_key]
+                migrated = True
+        try:
+            sampling_power = float(data["thickness_sampling_power"])
+            if not math.isfinite(sampling_power):
+                raise ValueError("non-finite thickness_sampling_power")
+            sampling_power = max(0.0, min(2.0, sampling_power))
+        except (KeyError, TypeError, ValueError):
+            sampling_power = values["thickness_sampling_power"]
+        if data.get("thickness_sampling_power") != sampling_power:
+            data["thickness_sampling_power"] = sampling_power
+            migrated = True
         for key in values:
             if key in data:
                 values[key] = data[key]
+        if migrated:
+            try:
+                _FILE.write_text(json.dumps(data, indent=2, sort_keys=True),
+                                 encoding="utf-8")
+            except Exception:
+                pass
     return values
 
 

@@ -21,9 +21,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from main_window import MainWindow  # noqa: E402
+from main_window import (  # noqa: E402
+    MainWindow,
+    SdfWorker,
+    _bone_region_sparse_plan,
+)
 import mesh_io  # noqa: E402
 from optimization import OptimizationWorker  # noqa: E402
+from sdf_blowup import (  # noqa: E402
+    relative_blowup_extent_voxels,
+    sparse_band_offsets,
+)
+from sdf_compute import SdfComputer, SdfResult  # noqa: E402
 
 
 class _Recorder:
@@ -36,6 +45,21 @@ class _Recorder:
         return _record
 
 
+def _box_mesh() -> tuple[np.ndarray, np.ndarray]:
+    vertices = np.asarray([
+        [-1.0, -0.5, -0.5], [1.0, -0.5, -0.5],
+        [1.0, 0.5, -0.5], [-1.0, 0.5, -0.5],
+        [-1.0, -0.5, 0.5], [1.0, -0.5, 0.5],
+        [1.0, 0.5, 0.5], [-1.0, 0.5, 0.5],
+    ], dtype=np.float32)
+    faces = np.asarray([
+        [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
+        [0, 1, 5], [0, 5, 4], [3, 7, 6], [3, 6, 2],
+        [0, 4, 7], [0, 7, 3], [1, 2, 6], [1, 6, 5],
+    ], dtype=np.int32)
+    return vertices, faces
+
+
 class ApiBatchThroughputTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -45,6 +69,7 @@ class ApiBatchThroughputTests(unittest.TestCase):
         progress = _Recorder()
         button = _Recorder()
         started: list[bool] = []
+        seeded: list[object] = []
         owner = SimpleNamespace(
             _sdf_worker=object(),
             _mesh_settings=SimpleNamespace(blowup_fraction=lambda: 0.0),
@@ -56,6 +81,7 @@ class ApiBatchThroughputTests(unittest.TestCase):
             _btn_fit=button,
             _progress_set=progress._progress_set,
             _progress_end=progress._progress_end,
+            _api_seed_pose_thickness_cache=seeded.append,
             _api_start_fit=lambda: started.append(True),
         )
         result = SimpleNamespace(
@@ -74,6 +100,7 @@ class ApiBatchThroughputTests(unittest.TestCase):
         self.assertIs(owner._last_mesh_result, result)
         self.assertIsNone(result.blowup_thickness)
         self.assertEqual(result.blowup_thickness_extent_vox, 0.0)
+        self.assertEqual(seeded, [result])
         self.assertEqual(started, [True])
         self.assertEqual(button.calls, [])
         self.assertEqual(progress.calls, [])
@@ -125,6 +152,258 @@ class ApiBatchThroughputTests(unittest.TestCase):
                 owner, vertices, changed, True)
             self.assertEqual(repair.call_count, 2)
 
+    @staticmethod
+    def _pose_thickness_owner() -> SimpleNamespace:
+        vertices = np.array(
+            [[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0],
+             [-0.5, 0.5, 0.0]],
+            dtype=np.float32,
+        )
+        faces = np.array([[0, 1, 2]], dtype=np.int32)
+        return SimpleNamespace(
+            _api_batch_pipeline=True,
+            _api_fit_existing=True,
+            _api_batch_id="pose-batch-a",
+            _api_pose_index=0,
+            _api_pose_thickness_cache=None,
+            _api_norm=SimpleNamespace(
+                center=np.zeros(3, dtype=np.float64), scale=2.0),
+            _base_verts=vertices,
+            _base_faces=faces,
+            _settings={
+                "use_sparse_sdf": True,
+                "thickness_max_resolution": 64,
+            },
+        )
+
+    @staticmethod
+    def _uniform_thickness_result(
+        value: float = 4.0,
+        n: int = 3,
+    ) -> SdfResult:
+        grid = np.zeros((n, n, n), dtype=np.float32)
+        return SdfResult(
+            grid=grid,
+            n=n,
+            dx=1.0,
+            origin=np.full(3, -1.0, dtype=np.float32),
+            aabb_min=np.full(3, -1.0, dtype=np.float32),
+            aabb_max=np.full(3, 1.0, dtype=np.float32),
+            thickness=np.full_like(grid, value),
+        )
+
+    def test_pose_thickness_cache_reuses_matching_batch_in_new_normalization(
+            self) -> None:
+        owner = self._pose_thickness_owner()
+        result = self._uniform_thickness_result(value=4.0, n=3)
+
+        # The first pose stores normalized lengths (4) in original mesh units
+        # using scale 2.  A later pose normalized with scale 3 must therefore
+        # receive thickness 6, rather than blindly reusing the old value 4.
+        MainWindow._api_seed_pose_thickness_cache(owner, result)
+        owner._api_pose_index = 1
+        owner._api_norm = SimpleNamespace(
+            center=np.ones(3, dtype=np.float64), scale=3.0)
+        owner._base_verts = np.ascontiguousarray(
+            owner._base_verts * np.array([0.8, 1.1, 1.0], dtype=np.float32)
+            + np.array([0.2, -0.1, 0.3], dtype=np.float32)
+        )
+
+        reused = MainWindow._api_reusable_pose_face_corner_thickness(
+            owner, n=3, blowup_fraction=0.0)
+
+        self.assertIsNotNone(reused)
+        self.assertEqual(reused.dtype, np.float32)
+        self.assertEqual(reused.shape, owner._base_faces.shape)
+        np.testing.assert_allclose(reused, 6.0)
+        self.assertIn(
+            "original_face_corner_thickness",
+            owner._api_pose_thickness_cache,
+        )
+
+    def test_pose_thickness_cache_contract_and_supported_modes(
+            self) -> None:
+        owner = self._pose_thickness_owner()
+        MainWindow._api_seed_pose_thickness_cache(
+            owner, self._uniform_thickness_result())
+        original_faces = owner._base_faces.copy()
+        original_vertices = owner._base_verts.copy()
+
+        def lookup(*, n: int = 3, blowup: float = 0.0):
+            return MainWindow._api_reusable_pose_face_corner_thickness(
+                owner, n=n, blowup_fraction=blowup)
+
+        owner._api_batch_id = "pose-batch-b"
+        self.assertIsNone(lookup(), "a new explicit batch must miss")
+        owner._api_batch_id = "pose-batch-a"
+
+        owner._base_faces = np.array([[0, 2, 1]], dtype=np.int32)
+        self.assertIsNone(lookup(), "changed topology must miss")
+        owner._base_faces = original_faces
+
+        owner._base_verts = np.vstack([
+            original_vertices,
+            np.array([[0.5, 0.5, 0.0]], dtype=np.float32),
+        ])
+        self.assertIsNone(lookup(), "changed vertex count must miss")
+        owner._base_verts = original_vertices
+
+        owner._api_batch_id = None
+        self.assertIsNone(lookup(), "requests without an explicit batch must miss")
+        owner._api_batch_id = "pose-batch-a"
+
+        self.assertIsNotNone(
+            lookup(blowup=0.1),
+            "transported thickness must also feed thickness-relative blowup",
+        )
+        self.assertIsNone(lookup(n=4), "changed SDF resolution must miss")
+
+        owner._settings["thickness_max_resolution"] = 32
+        self.assertIsNone(
+            lookup(), "changed thickness resolution must miss")
+        owner._settings["thickness_max_resolution"] = 64
+
+        owner._settings["use_sparse_sdf"] = False
+        self.assertIsNotNone(
+            lookup(), "dense SDF fits must use the GPU-transported field")
+        owner._settings["use_sparse_sdf"] = True
+
+        owner._api_batch_pipeline = False
+        self.assertIsNone(lookup(), "non-batch fits must miss")
+
+    def test_pose_thickness_cache_rejects_unresolved_surface_values(
+            self) -> None:
+        owner = self._pose_thickness_owner()
+        MainWindow._api_seed_pose_thickness_cache(
+            owner, self._uniform_thickness_result(value=0.0))
+        self.assertIsNone(owner._api_pose_thickness_cache)
+
+    def test_pose_thickness_cache_rejects_one_fully_unresolved_face(
+            self) -> None:
+        owner = self._pose_thickness_owner()
+        owner._base_verts = np.zeros((30, 3), dtype=np.float32)
+        owner._base_faces = np.arange(30, dtype=np.int32).reshape(10, 3)
+        sampled = np.ones((10, 3), dtype=np.float32)
+        sampled[-1] = 0.0
+        result = self._uniform_thickness_result()
+        result._pose_face_corner_thickness = sampled
+
+        MainWindow._api_seed_pose_thickness_cache(owner, result)
+
+        # A global 90% resolved-value threshold would accept this exact case,
+        # even though the last triangle would lose both thin-feature weighting
+        # and relative blowup.  Every face must retain a resolved value.
+        self.assertIsNone(owner._api_pose_thickness_cache)
+
+    def test_dense_worker_uses_transported_thickness_for_blowup(
+            self) -> None:
+        vertices, faces = _box_mesh()
+        computer = SdfComputer(device="cpu")
+        computer.set_mesh(vertices, faces)
+        completed: list[SdfResult] = []
+        failed: list[str] = []
+        worker = SdfWorker(
+            computer,
+            n=16,
+            margin=0.5,
+            compute_thickness=False,
+            compute_blowup_thickness=True,
+            compute_sparse_samples=False,
+            transported_face_corner_thickness=np.ones(
+                faces.shape, dtype=np.float32),
+            max_dist=10.0,
+            sdf_blowup_fraction=0.1,
+        )
+        worker.done.connect(completed.append)
+        worker.failed.connect(failed.append)
+
+        worker.run()
+
+        self.assertEqual(failed, [])
+        self.assertEqual(len(completed), 1)
+        self.assertIsNotNone(completed[0].thickness)
+        self.assertIsNotNone(completed[0].blowup_thickness)
+        self.assertAlmostEqual(
+            completed[0]._sdf_blowup_applied_fraction, 0.1)
+
+    def test_sparse_worker_applies_transported_blowup_to_every_target(
+            self) -> None:
+        vertices, faces = _box_mesh()
+        computer = SdfComputer(device="cpu")
+        computer.set_mesh(vertices, faces)
+        completed: list[SdfResult] = []
+        failed: list[str] = []
+        fraction = 0.2
+        face_thickness = 4.0
+        worker = SdfWorker(
+            computer,
+            n=16,
+            margin=0.5,
+            compute_thickness=False,
+            compute_blowup_thickness=True,
+            compute_sparse_samples=True,
+            transported_face_corner_thickness=np.full(
+                faces.shape, face_thickness, dtype=np.float32),
+            max_dist=10.0,
+            sdf_blowup_fraction=fraction,
+            thin_surface_fraction=0.0,
+        )
+        worker.done.connect(completed.append)
+        worker.failed.connect(failed.append)
+
+        worker.run()
+
+        self.assertEqual(failed, [])
+        self.assertEqual(len(completed), 1)
+        result = completed[0]
+        samples = getattr(result, "_sparse_samples", None)
+        self.assertIsNotNone(samples)
+        self.assertIsNotNone(samples.thickness)
+        self.assertIsNotNone(samples.coarse_mask)
+        self.assertIsNotNone(result.blowup_thickness)
+
+        raw_sdf = computer.query_points(samples.points, max_dist=10.0)
+        expected = raw_sdf + np.float32(fraction) * samples.thickness
+        band = ~samples.coarse_mask
+        positive_coarse = samples.coarse_mask & (samples.thickness > 0.0)
+        self.assertTrue(np.any(band))
+        self.assertTrue(np.any(positive_coarse))
+        np.testing.assert_allclose(
+            samples.values[band], expected[band], rtol=0.0, atol=2.0e-6)
+        np.testing.assert_allclose(
+            samples.values[positive_coarse],
+            expected[positive_coarse],
+            rtol=0.0,
+            atol=2.0e-6,
+        )
+
+        blowup_vox = relative_blowup_extent_voxels(
+            fraction, result.blowup_thickness, result.dx)
+        offsets = sparse_band_offsets(
+            blowup_vox, base_offsets=(-2.0, -1.0, 0.0, 1.0, 2.0))
+        expanded_clouds = [
+            i for i, offset in enumerate(offsets) if abs(offset) > 2.0
+        ]
+        self.assertTrue(expanded_clouds)
+        sparse_plan = _bone_region_sparse_plan(
+            int(np.prod(result.grid.shape)), offsets=offsets)
+        surface_samples = 128 if sparse_plan is None else sparse_plan[0]
+        expanded_indices = np.concatenate([
+            np.arange(
+                cloud * surface_samples,
+                (cloud + 1) * surface_samples,
+                dtype=np.int64,
+            )
+            for cloud in expanded_clouds
+        ])
+        self.assertTrue(np.all(band[expanded_indices]))
+        np.testing.assert_allclose(
+            samples.thickness[expanded_indices],
+            face_thickness,
+            rtol=1.0e-6,
+            atol=2.0e-6,
+        )
+
     def test_scalar_fit_progress_reaches_api_without_geometry(self) -> None:
         registry = _Recorder()
         status = _Recorder()
@@ -175,6 +454,24 @@ class ApiBatchThroughputTests(unittest.TestCase):
         MainWindow._api_reset(owner)
         self.assertEqual(len(progress.calls), 1)
         self.assertFalse(owner._api_batch_pipeline)
+
+    def test_api_reset_clears_active_pose_ids_but_keeps_thickness_cache(
+            self) -> None:
+        progress = _Recorder()
+        cache = {"sentinel": object()}
+        owner = SimpleNamespace(
+            _api_batch_pipeline=True,
+            _api_batch_id="pose-batch-a",
+            _api_pose_index=7,
+            _api_pose_thickness_cache=cache,
+            _progress_end=progress._progress_end,
+        )
+
+        MainWindow._api_reset(owner)
+
+        self.assertIsNone(owner._api_batch_id)
+        self.assertIsNone(owner._api_pose_index)
+        self.assertIs(owner._api_pose_thickness_cache, cache)
 
     def test_batch_progress_keeps_result_without_render_frame(self) -> None:
         registry = _Recorder()

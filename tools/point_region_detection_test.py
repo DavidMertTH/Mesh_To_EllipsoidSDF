@@ -128,11 +128,114 @@ def test_thin_and_bone_quotas() -> bool:
     return bool(ok)
 
 
+def _sphere_fields(shape=(41, 41, 41), dx=0.01):
+    zz, yy, xx = np.indices(shape, dtype=np.float32)
+    centre = 0.5 * (np.asarray(shape[::-1], np.float32) - 1.0)
+    distance = np.sqrt(
+        (xx - centre[0]) ** 2
+        + (yy - centre[1]) ** 2
+        + (zz - centre[2]) ** 2
+    )
+    radius_vox = 11.0
+    target = ((distance - radius_vox) * dx).astype(np.float32)
+    thickness = np.zeros(shape, dtype=np.float32)
+    thickness[target < 0.0] = 2.0 * radius_vox * dx
+    return target, thickness
+
+
+def test_outside_quota_and_log_falloff() -> bool:
+    dx = 0.01
+    target, thickness = _sphere_fields(dx=dx)
+    worker = OptimizationWorker(
+        sdf_target_np=target,
+        origin=np.zeros(3, dtype=np.float32),
+        dx=dx,
+        n=max(target.shape),
+        num_ellipsoids=1,
+        num_steps=1,
+        thickness_np=thickness,
+        local_fit=False,
+        superfit=False,
+    )
+    worker._region_candidate_budget = 4000
+    candidates = worker._region_candidate_indices()
+    values = target.ravel()[candidates]
+    outside_values = values[values >= 0.0]
+    expected = int(round(
+        worker._region_candidate_budget
+        * worker._region_outside_candidate_fraction))
+    all_outside = target[target >= 0.0]
+    ok = (
+        len(outside_values) == expected
+        and float(np.mean(outside_values)) < float(np.mean(all_outside))
+        and worker._region_thin_candidate_fraction == 0.45
+    )
+    print("outside quota:", len(outside_values), "/", expected)
+    print(
+        "outside mean distance sampled/all:",
+        round(float(np.mean(outside_values) / dx), 3), "/",
+        round(float(np.mean(all_outside) / dx), 3),
+    )
+    return bool(ok)
+
+
+def test_exterior_error_projects_region_inside() -> bool:
+    dx = 0.01
+    target, thickness = _sphere_fields(dx=dx)
+    worker = OptimizationWorker(
+        sdf_target_np=target,
+        origin=np.zeros(3, dtype=np.float32),
+        dx=dx,
+        n=max(target.shape),
+        num_ellipsoids=1,
+        num_steps=1,
+        thickness_np=thickness,
+        local_fit=False,
+        superfit=False,
+        underrep_min_gap_vox=0.25,
+        underrep_min_thickness_vox=1.0,
+    )
+    worker._region_candidate_budget = 4000
+    candidates = worker._region_candidate_indices()
+    exterior = candidates[target.ravel()[candidates] >= 0.0]
+    chosen = int(exterior[np.argmin(target.ravel()[exterior])])
+    pred = target.copy()
+    pred.ravel()[chosen] += 0.08
+
+    def _sample_pred(self, points, _c, _r, _q):
+        ijk = np.floor(np.asarray(points) / dx).astype(np.int64)
+        return pred[ijk[:, 2], ijk[:, 1], ijk[:, 0]]
+
+    worker._pred_points_from_params = types.MethodType(_sample_pred, worker)
+    regions = worker._detect_worst_regions(
+        np.empty((0, 3), np.float32),
+        np.empty((0, 3), np.float32),
+        np.empty((0, 4), np.float32),
+        k=1,
+        min_severity=0.0,
+    )
+    if not regions:
+        print("exterior projection: no region")
+        return False
+    region = regions[0]
+    sample_value = worker._grid_value(target, region["sample_world"])
+    seed_value = worker._grid_value(target, region["seed_world"])
+    ok = (
+        sample_value >= 0.0
+        and seed_value < 0.0
+        and float(region["seed_thickness"]) > 0.0
+    )
+    print("exterior projection target values:", sample_value, "->", seed_value)
+    return bool(ok)
+
+
 def main() -> int:
     QtCore.QCoreApplication.instance() or QtCore.QCoreApplication(sys.argv)
     alias_ok = test_strided_alias()
     quota_ok = test_thin_and_bone_quotas()
-    ok = alias_ok and quota_ok
+    outside_ok = test_outside_quota_and_log_falloff()
+    projection_ok = test_exterior_error_projects_region_inside()
+    ok = alias_ok and quota_ok and outside_ok and projection_ok
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

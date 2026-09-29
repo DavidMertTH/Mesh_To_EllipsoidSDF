@@ -75,6 +75,10 @@ def _worker(
     origin: np.ndarray,
     primitive_count: int,
     dx: float = DX,
+    *,
+    thickness: np.ndarray | None = None,
+    thickness_sampling_power: float = 1.0,
+    primitive_shape: str = "superquadric",
 ) -> OptimizationWorker:
     return OptimizationWorker(
         sdf_target_np=np.asarray(sdf, dtype=np.float32),
@@ -88,9 +92,14 @@ def _worker(
         sample_budget=64,
         maintenance_every=0,
         local_fit=False,
-        primitive_shape="superquadric",
+        primitive_shape=primitive_shape,
         sq_eps1=1.0,
         sq_eps2=1.0,
+        thickness_np=(
+            None if thickness is None
+            else np.asarray(thickness, dtype=np.float32)
+        ),
+        thickness_sampling_power=thickness_sampling_power,
     )
 
 
@@ -216,6 +225,66 @@ class SuperquadricInitializationRegressionTest(unittest.TestCase):
             self.assertGreater(
                 float(radii[primitive, 2] / np.max(radii[primitive, :2])), 1.5)
         self._assert_no_gross_protrusion(initialized, analytic_union)
+
+    def test_initial_population_is_denser_in_thin_features(self) -> None:
+        """The fixed start budget follows thickness, not interior volume."""
+        component_centers = np.array(
+            [[-0.70, 0.0, 0.0], [0.70, 0.0, 0.0]], dtype=np.float64)
+        component_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        radii = np.array([0.32, 0.12], dtype=np.float64)
+        half_length = 0.82
+        component_sdfs = np.stack([
+            _capped_cylinder_sdf(
+                self.grid, component_centers[index], component_axis,
+                float(radii[index]), half_length,
+            )
+            for index in range(2)
+        ], axis=-1)
+        nearest_component = np.argmin(component_sdfs, axis=-1)
+        sdf = np.min(component_sdfs, axis=-1)
+        thickness = np.where(
+            sdf < 0.0,
+            (2.0 * radii)[nearest_component],
+            0.0,
+        ).astype(np.float32)
+
+        count = 12
+        weighted_worker = _worker(
+            sdf,
+            self.origin,
+            count,
+            thickness=thickness,
+            thickness_sampling_power=1.0,
+            primitive_shape="ellipsoid",
+        )
+        legacy_worker = _worker(
+            sdf,
+            self.origin,
+            count,
+            thickness=None,
+            primitive_shape="ellipsoid",
+        )
+        weighted_centers = weighted_worker._init_inside_mesh(count)[0]
+        legacy_centers = legacy_worker._init_inside_mesh(count)[0]
+        weighted_assignment = np.argmin(np.stack([
+            _capped_cylinder_sdf(
+                weighted_centers, component_centers[index], component_axis,
+                float(radii[index]), half_length,
+            )
+            for index in range(2)
+        ], axis=-1), axis=-1)
+        legacy_assignment = np.argmin(np.stack([
+            _capped_cylinder_sdf(
+                legacy_centers, component_centers[index], component_axis,
+                float(radii[index]), half_length,
+            )
+            for index in range(2)
+        ], axis=-1), axis=-1)
+
+        weighted_thin = int(np.sum(weighted_assignment == 1))
+        legacy_thin = int(np.sum(legacy_assignment == 1))
+        self.assertGreater(weighted_thin, count // 2)
+        self.assertGreater(weighted_thin, legacy_thin)
 
     def test_empty_and_degenerate_sdfs_have_finite_deterministic_fallbacks(
         self,
