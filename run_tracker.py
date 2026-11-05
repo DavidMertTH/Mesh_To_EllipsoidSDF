@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+import numpy as np
 from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
@@ -44,6 +45,9 @@ class RunRecord:
 
     steps: list[int] = field(default_factory=list)
     losses: list[float] = field(default_factory=list)
+    # Indices into ``steps`` where an independent optimisation starts (e.g. the
+    # next pose of a corrective run); the curve is not connected across them.
+    segment_starts: list[int] = field(default_factory=list)
 
     # ── serialisation ─────────────────────────────────────────────────
 
@@ -152,20 +156,37 @@ class RunTrackerPanel(QtWidgets.QWidget):
         return rec
 
     def record_step(self, step: int, loss: float) -> None:
-        """Append a (step, loss) data point to the current run."""
-        if self._current_run is None:
-            return
-        self._current_run.steps.append(step)
-        self._current_run.losses.append(loss)
-        self._update_plot_curve(self._current_run)
+        """Append a (step, loss) data point to the current run.
 
-    def finish_run(self) -> None:
-        """Mark the current run as finished."""
-        if self._current_run is not None:
-            self._current_run.finished = True
-            idx = self._find_combo_index(self._current_run.run_id)
+        Only a running run accepts points, and steps must advance: a frame
+        re-emitted at an earlier step (e.g. the restored best checkpoint) would
+        otherwise draw the curve backwards.
+        """
+        rec = self._current_run
+        if rec is None or rec.finished:
+            return
+        if rec.steps and int(step) <= rec.steps[-1]:
+            return
+        rec.steps.append(int(step))
+        rec.losses.append(float(loss))
+        self._update_plot_curve(rec)
+
+    def begin_segment(self) -> None:
+        """Start an independent part of the current run (no connecting line)."""
+        rec = self._current_run
+        if rec is None or rec.finished or not rec.steps:
+            return
+        if not rec.segment_starts or rec.segment_starts[-1] != len(rec.steps):
+            rec.segment_starts.append(len(rec.steps))
+
+    def finish_run(self, rec: RunRecord | None = None) -> None:
+        """Mark ``rec`` (default: the current run) as finished."""
+        rec = rec if rec is not None else self._current_run
+        if rec is not None:
+            rec.finished = True
+            idx = self._find_combo_index(rec.run_id)
             if idx >= 0:
-                self._run_combo.setItemText(idx, self._current_run.display_name)
+                self._run_combo.setItemText(idx, rec.display_name)
             self._update_info()
             self._refresh_plot_visibility()
 
@@ -315,10 +336,20 @@ class RunTrackerPanel(QtWidgets.QWidget):
         self._plot_items[rec.run_id] = curve
         return curve
 
+    @staticmethod
+    def _set_curve_data(curve: pg.PlotDataItem, rec: RunRecord) -> None:
+        connect = "auto"
+        if rec.segment_starts:
+            connect = np.ones(len(rec.steps), dtype=bool)
+            for start in rec.segment_starts:
+                if 0 < start <= len(rec.steps):
+                    connect[start - 1] = False
+        curve.setData(rec.steps, rec.losses, connect=connect)
+
     def _update_plot_curve(self, rec: RunRecord):
         curve = self._ensure_plot_curve(rec)
         if rec.steps and rec.losses:
-            curve.setData(rec.steps, rec.losses)
+            self._set_curve_data(curve, rec)
         self._refresh_plot_visibility()
 
     def _refresh_plot_visibility(self):
@@ -451,7 +482,7 @@ class RunTrackerPanel(QtWidgets.QWidget):
                 self._add_run_to_combo(rec)
                 curve = self._ensure_plot_curve(rec)
                 if rec.steps and rec.losses:
-                    curve.setData(rec.steps, rec.losses)
+                    self._set_curve_data(curve, rec)
                     curve.setVisible(False)
             except Exception as e:
                 print(f"[RunTracker] Could not load {fp.name}: {e}")

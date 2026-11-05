@@ -20,6 +20,7 @@ file and non-ASCII characters break the compile.
 from __future__ import annotations
 
 import numpy as np
+import primitive_material
 import warp as wp
 
 from ellipsoid import best_device
@@ -118,6 +119,8 @@ def _raymarch_kernel(
     surf_eps: float, normal_h: float, relax: float, max_steps: int,
     blend: float,                      # smooth-union width (world units)
     base: wp.vec3,                     # surface colour (0..1)
+    colors: wp.array(dtype=wp.vec3),
+    use_colors: int,
     bg: wp.vec3, bg_a: float,          # background colour (0..1) + alpha
     rgba: wp.array(dtype=wp.uint8),    # flat (W*H*4), row-major rows of width W
 ):
@@ -185,18 +188,35 @@ def _raymarch_kernel(
     if wp.dot(n, v) < 0.0:
         n = wp.vec3(-n[0], -n[1], -n[2])
 
-    # Three-light diffuse + ambient (world space, z up), gentle white specular.
+    # Coloured dielectric body with compact, neutral gloss highlights.
     l0 = wp.normalize(wp.vec3(0.4, 0.5, 0.85))       # key (from above)
     l1 = wp.normalize(wp.vec3(-0.6, -0.35, 0.45))    # fill
     l2 = wp.normalize(wp.vec3(0.15, -0.85, 0.35))    # rim
-    diff = 0.34                                       # ambient
-    diff = diff + wp.max(wp.dot(n, l0), 0.0) * 0.7
-    diff = diff + wp.max(wp.dot(n, l1), 0.0) * 0.35
-    diff = diff + wp.max(wp.dot(n, l2), 0.0) * 0.25
-    rgb = base * wp.min(diff, 1.25)
+    diff = primitive_material.AMBIENT
+    diff = diff + wp.max(wp.dot(n, l0), 0.0) * primitive_material.KEY_DIFFUSE
+    diff = diff + wp.max(wp.dot(n, l1), 0.0) * primitive_material.FILL_DIFFUSE
+    diff = diff + wp.max(wp.dot(n, l2), 0.0) * primitive_material.RIM_DIFFUSE
+    surface_color = base
+    if use_colors != 0:
+        # Color the surface by its nearest primitive, retaining fixed IDs.
+        nearest = float(1.0e6)
+        for e in range(num_e):
+            if wp.length(p - centers[e]) - rmax[e] > nearest:
+                continue
+            rot_offset = e * 4
+            q = wp.normalize(wp.quat(
+                rot_flat[rot_offset + 0], rot_flat[rot_offset + 1],
+                rot_flat[rot_offset + 2], rot_flat[rot_offset + 3]))
+            d = _mertstein(wp.quat_rotate_inv(q, p - centers[e]), radii[e])
+            if d < nearest:
+                nearest = d
+                surface_color = colors[e]
+    rgb = surface_color * wp.min(diff, primitive_material.DIFFUSE_CAP)
 
     hdir = wp.normalize(l0 + v)
-    spec = wp.pow(wp.max(wp.dot(n, hdir), 0.0), 48.0) * 0.5
+    spec = wp.pow(wp.max(wp.dot(n, hdir), 0.0), primitive_material.SPECULAR_POWER) * primitive_material.SPECULAR_STRENGTH
+    fill_hdir = wp.normalize(l1 + v)
+    spec = spec + wp.pow(wp.max(wp.dot(n, fill_hdir), 0.0), primitive_material.SPECULAR_POWER) * primitive_material.FILL_SPECULAR_STRENGTH
     rgb = rgb + wp.vec3(spec, spec, spec)
 
     rgba[o + 0] = wp.uint8(wp.clamp(rgb[0] * 255.0, 0.0, 255.0))
@@ -236,6 +256,8 @@ class Raymarcher:
         self._wr = None
         self._wq = None
         self._wrmax = None
+        self._colors = wp.zeros(1, dtype=wp.vec3, device=self._dev)
+        self._use_colors = False
         self._sph_c = (0.0, 0.0, 0.0)
         self._sph_r = 1.0
         self._char = 1.0
@@ -243,13 +265,18 @@ class Raymarcher:
         self._rgba = None
         self._rgba_cap = 0
 
-    def update(self, centers, radii, rotations) -> None:
+    def update(self, centers, radii, rotations, colors=None) -> None:
         """Upload a new ellipsoid population to the device (call on change)."""
         c = np.ascontiguousarray(centers, np.float32) if centers is not None \
             else np.zeros((0, 3), np.float32)
         self._n = int(c.shape[0])
+        self._use_colors = colors is not None and len(colors) == self._n
         if self._n == 0:
             return
+        if self._use_colors:
+            self._colors = wp.array(
+                np.ascontiguousarray(np.asarray(colors)[:, :3], dtype=np.float32),
+                dtype=wp.vec3, device=self._dev)
         r = np.ascontiguousarray(np.abs(radii), np.float32)
         rmax = np.ascontiguousarray(r.max(axis=1))
         self._wc = wp.array(c, dtype=wp.vec3, device=self._dev)
@@ -309,6 +336,7 @@ class Raymarcher:
                 float(surf_eps), float(normal_h), float(relax), int(max_steps),
                 float(blend_world),
                 wp.vec3(base[0], base[1], base[2]),
+                self._colors, int(self._use_colors),
                 wp.vec3(bg[0], bg[1], bg[2]), float(bg_alpha),
                 rgba,
             ],

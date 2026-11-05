@@ -17,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from joint_dof import JointDof
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  Quaternion helpers  (x, y, z, w)  — matches glTF / Warp convention
@@ -216,6 +218,8 @@ class Bone:
     inverse_bind_matrix : (4,4) float64
         Transforms a point from world space to this bone's local space
         in the bind pose.
+    joint_dof : JointDof
+        User-defined rotational allowances for the joint viewer.
     """
     name: str
     index: int
@@ -226,6 +230,7 @@ class Bone:
     inverse_bind_matrix: np.ndarray = field(
         default_factory=lambda: np.eye(4, dtype=np.float64),
     )
+    joint_dof: JointDof = field(default_factory=JointDof)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

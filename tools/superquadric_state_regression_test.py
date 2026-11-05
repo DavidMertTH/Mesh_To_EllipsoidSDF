@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
-from types import MethodType
+from types import MethodType, SimpleNamespace
 import unittest
 
 import numpy as np
@@ -308,6 +308,131 @@ class SuperquadricStateRegressionTest(unittest.TestCase):
                 if axis in (0, 1):
                     expected_projected[axis] *= -1.0
                 np.testing.assert_allclose(projected[2], expected_projected)
+
+    def test_mirror_mode_keeps_comparison_for_unedited_ellipsoids(self) -> None:
+        worker = _worker(symmetry_enabled=True, max_ellipsoids=8)
+        worker._sym_axis = 0
+        worker._sym_plane = 0.0
+        worker._grid_value = lambda _grid, center: (0.0 if center[0] < 0 else 1.0)
+        centers = np.array([
+            [0.35, 0.0, 0.0], [0.50, 0.2, 0.0],
+            [-0.30, 0.0, 0.0], [-0.50, 0.2, 0.0],
+        ], dtype=np.float32)
+        radii = np.array([
+            [0.09, 0.09, 0.09], [0.08, 0.08, 0.08],
+            [0.06, 0.06, 0.06], [0.04, 0.04, 0.04],
+        ], dtype=np.float32)
+        rotations = _identity_quats(4)
+        eps = np.array([[0.4, 0.5], [0.6, 0.7],
+                        [1.1, 1.2], [1.3, 1.4]], dtype=np.float32)
+        bend = np.array([[0.2, 0.1], [0.4, 0.1],
+                         [0.6, 0.1], [0.8, 0.1]], dtype=np.float32)
+        changed = np.array([True, False, False, False])
+
+        result = worker._carry_local_edits_to_mirror_source(
+            centers.copy(), radii.copy(), rotations.copy(), eps.copy(),
+            bend.copy(), np.arange(4), changed, (0, 2),
+            np.array([[0.30, 0.0, 0.0], [0.50, 0.2, 0.0],
+                      [-0.30, 0.0, 0.0], [-0.50, 0.2, 0.0]],
+                     dtype=np.float32), np.arange(4))
+        c, r, q, e, b, lineage, sign, priority = result
+        self.assertEqual(sign, -1.0)
+        np.testing.assert_array_equal(priority, [2])
+        np.testing.assert_array_equal(lineage, np.arange(4))
+        out_c, out_r, _, out_e, out_b = worker._build_symmetric_layout(
+            c, r, q, e, b, source_sign=sign,
+            priority_source_rows=priority)
+        np.testing.assert_allclose(out_c[:, 0], [-0.35, -0.50, 0.35, 0.50])
+        np.testing.assert_allclose(out_r[0], radii[0])
+        np.testing.assert_allclose(out_e[0], eps[0])
+        np.testing.assert_allclose(out_b[0], [-bend[0, 0], bend[0, 1]])
+        # The untouched pair still comes from the normally selected side.
+        np.testing.assert_allclose(out_r[1], radii[3])
+        np.testing.assert_allclose(out_e[1], eps[3])
+
+        baseline = worker._build_symmetric_layout(
+            centers, radii, rotations, eps, bend)
+        np.testing.assert_allclose(baseline[1][:2], radii[2:])
+        np.testing.assert_allclose(baseline[3][:2], eps[2:])
+
+    def test_new_local_ellipsoid_updates_its_spawned_mirror_twin(self) -> None:
+        worker = _worker(symmetry_enabled=True, max_ellipsoids=2)
+        worker._sym_axis = 0
+        worker._sym_plane = 0.0
+        worker._grid_value = lambda _grid, center: (0.0 if center[0] < 0 else 1.0)
+        pre_centers = np.array([[0.30, 0.0, 0.0], [-0.30, 0.0, 0.0],
+                                [0.60, 0.1, 0.0], [-0.60, 0.1, 0.0]],
+                               dtype=np.float32)
+        centers = pre_centers.copy()
+        centers[2, 0] = 0.67
+        radii = np.full((4, 3), 0.05, dtype=np.float32)
+        radii[2] = 0.08
+        eps = np.full((4, 2), 0.8, dtype=np.float32)
+        eps[2] = [0.45, 0.55]
+        bend = np.zeros((4, 2), dtype=np.float32)
+        result = worker._carry_local_edits_to_mirror_source(
+            centers, radii, _identity_quats(4), eps, bend,
+            np.array([0, 1, -1, -1]),
+            np.array([False, False, True, False]), (0, 1),
+            pre_centers, np.arange(4))
+        c, r, q, e, b, _, sign, priority = result
+        self.assertEqual(len(c), 4)
+        np.testing.assert_array_equal(priority, [3])
+        out_c, out_r, _, out_e, _ = worker._build_symmetric_layout(
+            c, r, q, e, b, source_sign=sign,
+            priority_source_rows=priority)
+        self.assertEqual(len(out_c), 2)
+        np.testing.assert_allclose(out_c[0, 0], -0.67)
+        np.testing.assert_allclose(out_r[0], radii[2])
+        np.testing.assert_allclose(out_e[0], eps[2])
+
+    def test_local_handoff_marks_only_geometry_that_actually_changed(self) -> None:
+        worker = _worker(
+            symmetry_enabled=True, local_fit=True, local_fit_every=1,
+            local_fit_start_frac=0.0, max_ellipsoids=6)
+        worker.blockSignals(True)
+        worker._sym_axis = 0
+        worker._sym_plane = 0.0
+        worker._grid_value = lambda _grid, center: (0.0 if center[0] > 0 else 1.0)
+        centers = np.array([[0.3, 0.0, 0.0], [-0.3, 0.0, 0.0]],
+                           dtype=np.float32)
+        radii = np.full((2, 3), 0.05, dtype=np.float32)
+        buf = worker._alloc_buffers(
+            2, 8, 125, centers, radii, _identity_quats(2))
+        worker._detect_bridging_ellipsoids = lambda *_args, **_kw: []
+        worker._detect_protruding_ellipsoids = lambda *_args, **_kw: []
+        worker._detect_worst_regions = lambda *_args, **_kw: [
+            {"seed_world": centers[0].copy()}]
+        worker._interior_ball_pool = lambda *_args: np.array([0], dtype=np.int32)
+        worker._region_box = lambda *_args: object()
+        worker._apply_blowup_to_region_result = lambda *_args: None
+        worker._sdf_computer = SimpleNamespace(
+            is_ready=True,
+            compute_box_grids_batch=lambda *_args, **_kw: [object()])
+
+        def local_fit(c, r, q, *_args, eps=None, bend=None, **_kw):
+            worker._last_local_fit_lineage = np.arange(len(c))
+            c = c.copy()
+            c[0, 0] += 0.05
+            return c, r, q, eps, bend
+
+        worker._local_fit_regions = local_fit
+        result = worker._maybe_superfit(
+            1, buf["pred_centers"], buf["pred_radii"],
+            buf["pred_rot_flat"], buf["pred_eps"], buf["pred_bend"])
+        self.assertIsNotNone(result)
+        np.testing.assert_array_equal(
+            worker._last_local_fit_changed_mask, [True, False])
+        np.testing.assert_array_equal(
+            worker._last_local_fit_origin_rows, [0, 1])
+
+        worker._local_fit_regions = lambda c, r, q, *_args, eps=None, bend=None, **_kw: (
+            c, r, q, eps, bend)
+        worker._maybe_superfit(
+            2, buf["pred_centers"], buf["pred_radii"],
+            buf["pred_rot_flat"], buf["pred_eps"], buf["pred_bend"])
+        np.testing.assert_array_equal(
+            worker._last_local_fit_changed_mask, [False, False])
 
     def test_split_children_inherit_parent_eps_and_bend(self) -> None:
         worker = _worker(

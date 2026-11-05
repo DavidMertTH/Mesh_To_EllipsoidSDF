@@ -25,6 +25,7 @@ import numpy as np
 import trimesh
 
 from skeleton import Bone, Pose, Skeleton, mat4_compose
+from humanoid_joint_limits import apply_humanoid_joint_limits
 
 # ── Data container ───────────────────────────────────────────────────────────
 
@@ -38,6 +39,9 @@ class RiggedMesh:
     skin_joints: np.ndarray           # (V, max_influences) int32 — bone indices
     poses: List[Pose] = field(default_factory=list)
     mesh_name: str = ""
+
+    def __post_init__(self) -> None:
+        apply_humanoid_joint_limits(self.skeleton)
 
 
 # ── glTF accessor helpers ────────────────────────────────────────────────────

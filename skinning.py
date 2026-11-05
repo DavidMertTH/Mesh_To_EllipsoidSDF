@@ -43,7 +43,7 @@ if _HAS_WARP:
         ry = float(0.0)
         rz = float(0.0)
 
-        for k in range(4):
+        for k in range(weights.shape[1]):
             w = weights[vid, k]
             if w < 1.0e-8:
                 continue

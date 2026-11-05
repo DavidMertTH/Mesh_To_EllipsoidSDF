@@ -662,8 +662,6 @@ class AdaptiveSdfBlowupTest(unittest.TestCase):
                 identity_linear,
                 zero_offset,
                 identity_rotation,
-                None,
-                0.0,
             )["sdf_target_np"]
 
         pose_a = target(2.0, dx=0.5)

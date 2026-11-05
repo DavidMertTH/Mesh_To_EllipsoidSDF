@@ -1,10 +1,7 @@
 """
 mesh_settings.py — panel for per-mesh adjustments fed into the SDF pipeline.
 
-Two controls:
-  * Rotation (X/Y/Z degrees) — slider AND a number field per axis; rotates the
-    loaded mesh.  For a rigged FBX the host applies the rotation across every
-    pose (and the skeleton) and re-computes the SDF asynchronously.
+Controls:
   * SDF Blowup — a signed percentage of local feature thickness (positive
     erodes / surface inward, negative dilates).  Shown live in the Slice panel
     and baked into the fit target.
@@ -13,8 +10,7 @@ Two controls:
     submesh radially outward so the regions can be inspected/verified.  Only
     available when a rigged mesh is loaded.
 
-Pure UI: emits ``rotationChanged(rx, ry, rz)`` (degrees),
-``blowupChanged(thickness_fraction)``,
+Pure UI: emits ``blowupChanged(thickness_fraction)``,
 ``regionPreviewToggled(on)`` and ``regionBlowupChanged(factor)``; the MainWindow
 does the actual work.
 """
@@ -58,9 +54,8 @@ def rotate_mesh(verts: np.ndarray, rx: float, ry: float, rz: float,
 
 
 class MeshSettingsPanel(QtWidgets.QWidget):
-    """Rotation (X/Y/Z, slider + number) + SDF blowup controls for the mesh."""
+    """SDF blowup + bone-region preview controls for the mesh."""
 
-    rotationChanged = QtCore.Signal(float, float, float)   # degrees
     blowupChanged = QtCore.Signal(float)                   # signed local-diameter fraction
     regionPreviewToggled = QtCore.Signal(bool)             # exploded preview on/off
     regionBlowupChanged = QtCore.Signal(float)             # explosion factor
@@ -77,34 +72,6 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(8)
-
-        # ── Rotation group ──
-        rot_box = QtWidgets.QGroupBox("Rotation")
-        rform = QtWidgets.QFormLayout(rot_box)
-        self._rot_sliders: dict[str, QtWidgets.QSlider] = {}
-        self._rot_spins: dict[str, QtWidgets.QDoubleSpinBox] = {}
-        for axis in ("X", "Y", "Z"):
-            sld = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-            sld.setRange(-180, 180)
-            sld.setValue(0)
-            spin = QtWidgets.QDoubleSpinBox()
-            spin.setRange(-180.0, 180.0)
-            spin.setDecimals(1)
-            spin.setSingleStep(1.0)
-            spin.setSuffix("°")
-            spin.setFixedWidth(72)
-            sld.valueChanged.connect(lambda _v, a=axis: self._sync_from_slider(a))
-            spin.valueChanged.connect(lambda _v, a=axis: self._sync_from_spin(a))
-            row = QtWidgets.QHBoxLayout()
-            row.addWidget(sld)
-            row.addWidget(spin)
-            rform.addRow(f"{axis}:", row)
-            self._rot_sliders[axis] = sld
-            self._rot_spins[axis] = spin
-        self._btn_reset_rot = QtWidgets.QPushButton("Reset rotation")
-        self._btn_reset_rot.clicked.connect(self.reset_rotation)
-        rform.addRow(self._btn_reset_rot)
-        outer.addWidget(rot_box)
 
         # ── SDF blowup group ──
         blow_box = QtWidgets.QGroupBox("SDF Blowup")
@@ -155,25 +122,6 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         outer.addWidget(self._region_box)
         outer.addStretch(1)
 
-    # ── rotation sync (slider ↔ number) ──
-
-    def _sync_from_slider(self, axis: str) -> None:
-        spin = self._rot_spins[axis]
-        spin.blockSignals(True)
-        spin.setValue(float(self._rot_sliders[axis].value()))
-        spin.blockSignals(False)
-        self._emit_rotation()
-
-    def _sync_from_spin(self, axis: str) -> None:
-        sld = self._rot_sliders[axis]
-        sld.blockSignals(True)
-        sld.setValue(int(round(self._rot_spins[axis].value())))
-        sld.blockSignals(False)
-        self._emit_rotation()
-
-    def _emit_rotation(self) -> None:
-        self.rotationChanged.emit(*self.rotation_deg())
-
     def _on_blowup(self, v: int) -> None:
         fraction = v / float(100 * self._BLOWUP_STEPS_PER_PERCENT)
         self._lbl_blowup.setText(f"{100.0 * fraction:+.1f} %")
@@ -189,11 +137,6 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         self.regionBlowupChanged.emit(factor)
 
     # ── public API ──
-
-    def rotation_deg(self) -> tuple[float, float, float]:
-        return (float(self._rot_spins["X"].value()),
-                float(self._rot_spins["Y"].value()),
-                float(self._rot_spins["Z"].value()))
 
     def blowup_fraction(self) -> float:
         """Signed fraction of the current region's local feature diameter."""
@@ -232,12 +175,6 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         shown = v / float(self._BLOWUP_STEPS_PER_PERCENT)
         self._lbl_blowup.setText(f"{shown:+.1f} %")
 
-    def reset_rotation(self) -> None:
-        for a in ("X", "Y", "Z"):
-            for w in (self._rot_sliders[a], self._rot_spins[a]):
-                w.blockSignals(True); w.setValue(0); w.blockSignals(False)
-        self._emit_rotation()
-
     def reset_blowup(self) -> None:
         self._blowup.blockSignals(True)
         self._blowup.setValue(0)
@@ -246,10 +183,7 @@ class MeshSettingsPanel(QtWidgets.QWidget):
         self.blowupChanged.emit(0.0)
 
     def reset(self) -> None:
-        """Reset both controls without emitting (e.g. on loading a new mesh)."""
-        for a in ("X", "Y", "Z"):
-            for w in (self._rot_sliders[a], self._rot_spins[a]):
-                w.blockSignals(True); w.setValue(0); w.blockSignals(False)
+        """Reset the controls without emitting (e.g. on loading a new mesh)."""
         self._blowup.blockSignals(True); self._blowup.setValue(0); self._blowup.blockSignals(False)
         self._lbl_blowup.setText("0.0 %")
         self._chk_region.blockSignals(True); self._chk_region.setChecked(False); self._chk_region.blockSignals(False)

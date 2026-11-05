@@ -348,58 +348,62 @@ def corrective_from_optimized_local(
     )
 
 
-def _pose_rotation_distance(skeleton: Skeleton, a: Pose, b: Pose) -> float:
-    """RMS angular pose distance, normalized to the [0, 1] half-turn range."""
-    _, qa = skeleton.compute_bone_positions_rotations(a)
-    _, qb = skeleton.compute_bone_positions_rotations(b)
-    qa = _normalize_quats(qa)
-    qb = _normalize_quats(qb)
-    dots = np.clip(np.abs(np.sum(qa * qb, axis=1)), 0.0, 1.0)
-    angles = 2.0 * np.arccos(dots)
-    return float(np.sqrt(np.mean(np.square(angles / np.pi))))
+def _most_similar_fitted(
+    skeleton: Skeleton,
+    pose: Pose,
+    fitted_poses: list[Pose | None],
+    assignments: np.ndarray,
+    context_depth: int = 1,
+    context_falloff: float = 0.35,
+) -> np.ndarray:
+    """Per primitive, the index of the most similar already fitted pose.
+
+    Similarity is the runtime morph driver's: joint-local rotations of the
+    primitive's bone, blended with its parent/child context. Exact ties prefer
+    candidate 0, the base fit, which the driver also shows where its pose ties
+    with the base; other ties choose the overall most similar pose, then the
+    earliest one.
+    """
+    # native_morph imports this module; share its pose similarity lazily.
+    from native_morph import _pose_rotations, _weight_contexts, rotation_distances
+    contexts = _weight_contexts(skeleton, context_depth, context_falloff)
+    current = _pose_rotations(skeleton, pose)
+    fitted = np.array([_pose_rotations(skeleton, p) for p in fitted_poses])
+    distances = rotation_distances(current[None], fitted) @ contexts.T
+    overall = np.mean(distances, axis=1)
+    bones = np.asarray(assignments, dtype=np.int64)
+    valid = (bones >= 0) & (bones < skeleton.num_bones)
+    local = np.where(valid[None], distances[:, np.where(valid, bones, 0)], overall[:, None])
+    tied = local <= np.min(local, axis=0, keepdims=True) + 1.0e-6
+    closest = np.argmin(np.where(tied, overall[:, None], np.inf), axis=0)
+    return np.where(tied[0], 0, closest)
 
 
-def _blend_local_seed(
+def _gather_local_seed(
     base: BoneLocalEllipsoids,
-    neighbor: BoneLocalEllipsoids | None,
-    weight: float,
+    fitted: list[BoneLocalEllipsoids],
+    sources: np.ndarray,
 ) -> BoneLocalEllipsoids:
-    if neighbor is not None and neighbor.primitive_type != base.primitive_type:
-        raise ValueError("cannot blend corrective seeds of different primitive types")
-    if neighbor is None or weight <= 1.0e-6:
-        centers = base.local_centers.copy()
-        radii = base.local_radii.copy()
-        rotations = base.local_rotations.copy()
-        shape_exponents = base.shape_exponents.copy()
-    else:
-        w = float(np.clip(weight, 0.0, 1.0))
-        centers = (
-            (1.0 - w) * base.local_centers
-            + w * neighbor.local_centers
-        ).astype(np.float32)
-        radii = np.exp(
-            (1.0 - w) * np.log(np.maximum(base.local_radii, 1.0e-7))
-            + w * np.log(np.maximum(neighbor.local_radii, 1.0e-7))
-        ).astype(np.float32)
-        rotations = np.array([
-            quat_slerp(base.local_rotations[i], neighbor.local_rotations[i], w)
-            for i in range(base.num_ellipsoids)
-        ], dtype=np.float32)
-        shape_exponents = np.exp(
-            (1.0 - w) * np.log(np.maximum(base.shape_exponents, 0.1))
-            + w * np.log(np.maximum(neighbor.shape_exponents, 0.1))
-        ).astype(np.float32)
+    """Take each primitive's parameters from its chosen fitted pose."""
+    if any(local.primitive_type != base.primitive_type for local in fitted):
+        raise ValueError("cannot seed correctives from different primitive types")
+    rows = np.arange(base.num_ellipsoids)
+
+    def pick(attribute):
+        return np.stack([np.asarray(getattr(local, attribute), dtype=np.float32)
+                         for local in fitted])[sources, rows]
+
     return BoneLocalEllipsoids(
-        local_centers=centers,
-        local_radii=radii,
-        local_rotations=_normalize_quats(rotations),
+        local_centers=pick("local_centers"),
+        local_radii=pick("local_radii"),
+        local_rotations=_normalize_quats(pick("local_rotations")),
         bone_assignments=base.bone_assignments.copy(),
         attachment_joints=(None if base.attachment_joints is None
                            else base.attachment_joints.copy()),
         attachment_weights=(None if base.attachment_weights is None
                             else base.attachment_weights.copy()),
         primitive_type=base.primitive_type,
-        shape_exponents=shape_exponents,
+        shape_exponents=pick("shape_exponents"),
     )
 
 
@@ -427,9 +431,13 @@ class PoseCorrectiveWorker(QtCore.QThread):
         margin: float,
         fit_kwargs: dict[str, Any],
         base_pose: Pose | None = None,
+        base_fit_pose: Pose | None = None,
+        reuse_base_pose: bool = False,
         target_vertices: list[np.ndarray] | None = None,
         sdf_blowup_fraction: float = 0.0,
         thickness_max_resolution: int | None = 128,
+        context_depth: int = 1,
+        context_falloff: float = 0.35,
         device: str | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
@@ -442,6 +450,13 @@ class PoseCorrectiveWorker(QtCore.QThread):
         self._margin = float(margin)
         self._fit_kwargs = dict(fit_kwargs or {})
         self._base_pose = base_pose
+        # The pose the base parameters were fitted in, if it differs from the
+        # runtime's neutral base_pose (e.g. a base fitted in an edited pose).
+        self._base_fit_pose = base_fit_pose if base_fit_pose is not None else base_pose
+        self._reuse_base_pose = bool(reuse_base_pose)
+        # Pose similarity for seeds uses the morph driver's joint context.
+        self._context_depth = int(context_depth)
+        self._context_falloff = float(context_falloff)
         self._sdf_blowup_fraction = float(sdf_blowup_fraction)
         if (not np.isfinite(self._sdf_blowup_fraction)
                 or not -0.5 < self._sdf_blowup_fraction < 0.5):
@@ -484,14 +499,35 @@ class PoseCorrectiveWorker(QtCore.QThread):
         rm = self._rigged_mesh
         skeleton = rm.skeleton
         keys: list[PoseCorrectiveKey] = []
-        trained_poses: list[Pose] = []
-        trained_locals: list[BoneLocalEllipsoids] = []
+        # Every fit starts from the most similar configuration fitted so far,
+        # chosen per primitive (see _optimizer_kwargs for its anchors). The
+        # base fit is the first such configuration.
+        fitted_poses: list[Pose | None] = [self._base_fit_pose]
+        fitted_locals: list[BoneLocalEllipsoids] = [self._base]
         total = len(self._poses)
         for idx, pose in enumerate(self._poses):
             if self._stop:
                 raise _PoseCorrectiveCanceled(
                     self._stop_reason or f"canceled before pose {idx}")
             pose_name = pose.name or f"Pose {idx + 1}"
+            if (idx == 0 and self._reuse_base_pose
+                    and self._target_vertices is None
+                    and all(np.allclose(
+                        pose.bone_locals.get(bi, bone.local_bind_transform),
+                        (self._base_pose.bone_locals.get(bi, bone.local_bind_transform)
+                         if self._base_pose is not None else bone.local_bind_transform),
+                        rtol=0.0, atol=1.0e-9)
+                        for bi, bone in enumerate(skeleton.bones))):
+                # The native sweep starts with the already fitted bind pose.
+                # Preserve its neutral key and timeline index, then move straight
+                # to the first deformed target instead of fitting it all again.
+                neutral = corrective_from_optimized_local(
+                    self._base, self._base, pose_name, 0.0, pose=pose)
+                # q^-1 * q can round to ~1e-18; the neutral key is exact.
+                neutral.delta_rotations[:] = np.array([0, 0, 0, 1], dtype=np.float32)
+                keys.append(neutral)
+                self.pose_finished.emit(idx, pose_name, 0.0)
+                continue
             self.pose_started.emit(idx, total, pose_name)
 
             if (self._target_vertices is not None
@@ -504,18 +540,11 @@ class PoseCorrectiveWorker(QtCore.QThread):
                     rm.vertices, rm.skin_joints, rm.skin_weights, skin_mats,
                     device=self._device,
                 )
-            neighbor_local = None
-            neighbor_strength = 0.0
-            if trained_poses:
-                distances = np.asarray([
-                    _pose_rotation_distance(skeleton, pose, trained_pose)
-                    for trained_pose in trained_poses
-                ], dtype=np.float64)
-                nearest = int(np.argmin(distances))
-                neighbor_local = trained_locals[nearest]
-                neighbor_strength = float(np.exp(-np.square(distances[nearest] / 0.25)))
-            initial_local = _blend_local_seed(
-                self._base, neighbor_local, neighbor_strength)
+            sources = _most_similar_fitted(
+                skeleton, pose, fitted_poses, self._base.bone_assignments,
+                self._context_depth, self._context_falloff)
+            initial_local = _gather_local_seed(self._base, fitted_locals, sources)
+            self._apply_refit_locks(initial_local)
             parameter_linear, parameter_offset, parameter_rotation_prefix = (
                 self._mapper.local_to_world_parameter_transform(self._base, pose=pose)
             )
@@ -579,8 +608,6 @@ class PoseCorrectiveWorker(QtCore.QThread):
                 parameter_linear,
                 parameter_offset,
                 parameter_rotation_prefix,
-                neighbor_local,
-                neighbor_strength,
             )
             opt = OptimizationWorker(**kwargs)
             self._active_optimizer = opt
@@ -621,7 +648,10 @@ class PoseCorrectiveWorker(QtCore.QThread):
                     last["shape_exponents"],
                 )
 
-            opt.step_visual.connect(_on_step)
+            # This optimizer runs synchronously inside our worker thread, which
+            # has no Qt event loop. Consume its snapshots here immediately;
+            # pose_fit_progress then queues the copied frame to the GUI thread.
+            opt.step_visual.connect(_on_step, QtCore.Qt.DirectConnection)
             opt.run()
             self._active_optimizer = None
             if step_error:
@@ -647,6 +677,7 @@ class PoseCorrectiveWorker(QtCore.QThread):
                 shape_exponents=np.asarray(
                     last["shape_exponents"], dtype=np.float32).copy(),
             )
+            self._apply_refit_locks(optimized)
             key = corrective_from_optimized_local(
                 self._base,
                 optimized,
@@ -654,9 +685,11 @@ class PoseCorrectiveWorker(QtCore.QThread):
                 float(last["loss"]),
                 pose=pose,
             )
+            if not self._fit_kwargs.get("optimize_rotations", True):
+                key.delta_rotations[:] = np.array([0, 0, 0, 1], dtype=np.float32)
             keys.append(key)
-            trained_poses.append(pose)
-            trained_locals.append(optimized)
+            fitted_poses.append(pose)
+            fitted_locals.append(optimized)
             self.pose_finished.emit(idx, pose_name, float(last["loss"]))
 
         if total > 0 and not keys:
@@ -670,6 +703,18 @@ class PoseCorrectiveWorker(QtCore.QThread):
             base_pose=self._base_pose,
         )
 
+    def _apply_refit_locks(self, local: BoneLocalEllipsoids) -> None:
+        """Locks apply to the base, including neighbour seeds and round trips."""
+        for flag, attribute in (
+                ("optimize_centers", "local_centers"),
+                ("optimize_rotations", "local_rotations"),
+                ("optimize_radii", "local_radii")):
+            if not self._fit_kwargs.get(flag, True):
+                setattr(local, attribute, getattr(self._base, attribute).copy())
+        if (not self._fit_kwargs.get("optimize_shape_exponents", True)
+                or self._fit_kwargs.get("sq_eps_mode") == "fixed"):
+            local.shape_exponents = self._base.shape_exponents.copy()
+
     def _optimizer_kwargs(
         self,
         sdf,
@@ -677,9 +722,15 @@ class PoseCorrectiveWorker(QtCore.QThread):
         parameter_linear: np.ndarray,
         parameter_offset: np.ndarray,
         parameter_rotation_prefix: np.ndarray,
-        neighbor_local: BoneLocalEllipsoids | None,
-        neighbor_strength: float,
     ) -> dict[str, Any]:
+        """Optimizer settings anchored at the seed and at the base.
+
+        ``initial_local`` holds each primitive's most similar fitted state. The
+        fit starts there, may move one trust-region step from it, and is pulled
+        toward it. An equally strong pull toward the base, and the base's own
+        trust region as an outer bound, keep per-fit noise from adding up
+        along chains of similar poses, so neighbouring keys stay consistent.
+        """
         kw = dict(self._fit_kwargs)
         primitive_type = str(
             getattr(initial_local, "primitive_type", "ellipsoid")
@@ -694,12 +745,14 @@ class PoseCorrectiveWorker(QtCore.QThread):
             raise ValueError(
                 "pose-corrective optimizer primitive_shape does not match "
                 f"the base ({requested_type!r} != {primitive_type!r})")
-        neighbor_weights = (
-            float(kw.pop("parameter_neighbor_center_regularization", 0.004)),
-            float(kw.pop("parameter_neighbor_radii_regularization", 0.002)),
-            float(kw.pop("parameter_neighbor_rotation_regularization", 0.0015)),
-        )
         count = initial_local.num_ellipsoids
+        weights = (
+            float(kw.get("parameter_center_regularization", 0.006)),
+            float(kw.get("parameter_radii_regularization", 0.003)),
+            float(kw.get("parameter_rotation_regularization", 0.002)),
+        )
+        center_trust = float(kw.get("parameter_center_trust_radius_factor", 1.75))
+        radii_trust = float(kw.get("parameter_radii_trust_factor", 2.5))
         sdf_target = np.asarray(sdf.grid, dtype=np.float32)
         blowup_thickness = None
         if self._sdf_blowup_fraction != 0.0:
@@ -725,19 +778,30 @@ class PoseCorrectiveWorker(QtCore.QThread):
             "parameter_linear_np": parameter_linear,
             "parameter_offset_np": parameter_offset,
             "parameter_rotation_prefix_np": parameter_rotation_prefix,
-            "parameter_anchor_centers": self._base.local_centers,
-            "parameter_anchor_radii": self._base.local_radii,
-            "parameter_anchor_rotations": self._base.local_rotations,
-            "parameter_center_regularization": float(
-                kw.get("parameter_center_regularization", 0.006)),
-            "parameter_radii_regularization": float(
-                kw.get("parameter_radii_regularization", 0.003)),
-            "parameter_rotation_regularization": float(
-                kw.get("parameter_rotation_regularization", 0.002)),
-            "parameter_center_trust_radius_factor": float(
-                kw.get("parameter_center_trust_radius_factor", 1.75)),
-            "parameter_radii_trust_factor": float(
-                kw.get("parameter_radii_trust_factor", 2.5)),
+            "parameter_anchor_centers": initial_local.local_centers,
+            "parameter_anchor_radii": initial_local.local_radii,
+            "parameter_anchor_rotations": initial_local.local_rotations,
+            "parameter_center_regularization": weights[0],
+            "parameter_radii_regularization": weights[1],
+            "parameter_rotation_regularization": weights[2],
+            "parameter_center_trust_radius_factor": center_trust,
+            "parameter_radii_trust_factor": radii_trust,
+            # The optimizer's second L2 anchor ("neighbor") holds the base.
+            "parameter_neighbor_centers": self._base.local_centers,
+            "parameter_neighbor_radii": self._base.local_radii,
+            "parameter_neighbor_rotations": self._base.local_rotations,
+            "parameter_neighbor_center_regularization": float(
+                kw.get("parameter_neighbor_center_regularization", weights[0])),
+            "parameter_neighbor_radii_regularization": float(
+                kw.get("parameter_neighbor_radii_regularization", weights[1])),
+            "parameter_neighbor_rotation_regularization": float(
+                kw.get("parameter_neighbor_rotation_regularization", weights[2])),
+            "parameter_bound_centers": self._base.local_centers,
+            "parameter_bound_radii": self._base.local_radii,
+            "parameter_bound_center_radius_factor": float(
+                kw.get("parameter_bound_center_radius_factor", center_trust)),
+            "parameter_bound_radii_factor": float(
+                kw.get("parameter_bound_radii_factor", radii_trust)),
             "maintenance_every": 0,
             "superfit": False,
             "local_fit": False,
@@ -768,18 +832,6 @@ class PoseCorrectiveWorker(QtCore.QThread):
         if loss_thickness is not None:
             kw["thickness_np"] = np.asarray(
                 loss_thickness, dtype=np.float32)
-        if neighbor_local is not None and neighbor_strength > 1.0e-4:
-            kw.update({
-                "parameter_neighbor_centers": neighbor_local.local_centers,
-                "parameter_neighbor_radii": neighbor_local.local_radii,
-                "parameter_neighbor_rotations": neighbor_local.local_rotations,
-                "parameter_neighbor_center_regularization": (
-                    neighbor_weights[0] * float(neighbor_strength)),
-                "parameter_neighbor_radii_regularization": (
-                    neighbor_weights[1] * float(neighbor_strength)),
-                "parameter_neighbor_rotation_regularization": (
-                    neighbor_weights[2] * float(neighbor_strength)),
-            })
         kw.pop("bone_aware", None)
         kw.pop("bone_centers_np", None)
         kw.pop("bone_expected_counts_np", None)

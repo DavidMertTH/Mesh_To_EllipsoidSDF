@@ -52,9 +52,10 @@ Request body for ``POST /fit`` (JSON)::
 (``numSteps`` is also accepted); if omitted, the running app's Steps control is
 used.  The value is independent for each queued ``/fit`` or ``/fit-pose`` job.
 For ``/fit-pose``, optional boolean ``options.pose_fit_position``,
-``options.pose_fit_rotation``, and ``options.pose_fit_scale`` override the
+``options.pose_fit_rotation``, ``options.pose_fit_scale``, and
+``options.pose_fit_exponents`` override the
 corresponding persistent EllipSDF Settings for that request.  A false value
-freezes that primitive transform channel; ``/fit`` base fitting is unaffected.
+freezes that primitive parameter channel; ``/fit`` base fitting is unaffected.
 
 Protocol v4 results include ``primitive_type`` both at the top level and on
 every entry, plus per-entry ``shape_exponents: [e1, e2]``.  Missing legacy
@@ -70,6 +71,14 @@ reading the body, so ``POST /fit/<id>/cancel`` can already address the job.
 Coordinate convention is caller-defined: vertices, rig transforms, and returned
 primitives stay in the same snapshot space.  The Unity bridge uses Unity world
 space so transformed and skinned meshes line up with the scene view.
+
+When rig.restVertices, bind matrices, and skinning weights are supplied, ingest
+reconstructs the current snapshot and every pose frame before fitting. A mesh/rig
+mismatch fails the job with measured offset/scale/error details; successful
+results include snapshot_validation. Optional rig.snapshotValidation and each
+pose frame's snapshotValidation declare comparisons skipped for active blend
+shapes, truncated influences, reduced skin quality, or missing bind poses.
+The server recomputes supported comparisons independently of client measurements.
 """
 
 from __future__ import annotations

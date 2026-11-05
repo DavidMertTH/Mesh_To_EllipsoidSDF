@@ -12,9 +12,36 @@ and persists them via :func:`app_settings.save`.
 
 from __future__ import annotations
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 import app_settings
+
+
+class _ColorButton(QtWidgets.QPushButton):
+    """A settings value with a swatch and a standard Qt colour picker."""
+
+    def __init__(self):
+        super().__init__()
+        self._color = QtGui.QColor("#a0a7b4")
+        self.clicked.connect(self._choose_color)
+
+    def setValue(self, value) -> None:
+        color = QtGui.QColor(str(value))
+        if color.isValid():
+            self._color = color
+        self.setText(self._color.name())
+        foreground = "#000000" if self._color.lightnessF() > 0.5 else "#ffffff"
+        self.setStyleSheet(
+            f"background-color: {self._color.name()}; color: {foreground};")
+
+    def value(self) -> str:
+        return self._color.name()
+
+    def _choose_color(self) -> None:
+        color = QtWidgets.QColorDialog.getColor(
+            self._color, self, "Choose pose-fitting color")
+        if color.isValid():
+            self.setValue(color.name())
 
 
 class SettingsDialog(QtWidgets.QDialog):
@@ -93,6 +120,8 @@ class SettingsDialog(QtWidgets.QDialog):
     def _make_widget(kind, mn, mx, step, dec) -> QtWidgets.QWidget:
         if kind == "bool":
             return QtWidgets.QCheckBox()
+        if kind == "color":
+            return _ColorButton()
         if kind == "int":
             w = QtWidgets.QSpinBox()
             w.setRange(int(mn), int(mx))

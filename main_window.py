@@ -45,7 +45,9 @@ import shape_plugins
 from shape_plugins import (
     widget_value, set_widget_value, widget_change_signal, available_shapes,
 )
-from api_rig_space import correct_unity_rig_space
+from api_rig_space import (
+    correct_unity_rig_space, rig_snapshot_error, validate_unity_rig_snapshot,
+)
 from mesh_io import load_and_prepare, load_and_prepare_arrays
 from sdf_compute import (
     SdfComputer,
@@ -76,13 +78,23 @@ from bonesep_controller import BoneSeparationController
 from batched_fit import BatchedFitWorker
 from ellipsoid import EllipsoidSet, SDF_QUILEZ, SDF_METHOD_NAMES, best_device
 from viewer3d import SceneViewer3D
+from humanoid_joint_limits import apply_humanoid_joint_limits
 from region_budget import build_mesh_region_budget
 from widgets import SdfSlicePanel
 from optimization import OptimizationWorker
+import detail_zone_stage
 from pose_correctives import PoseCorrectiveLibrary, PoseCorrectiveWorker
+from native_morph import NativeMorphDriver
+from native_morph_io import default_morph_fit_path, load_native_morph_fit, save_native_morph_fit
+from morph_curve_panel import MorphCurvePanel
+from morph_error import SurfaceErrorMeter
+from morph_error_panel import MorphErrorPanel
+from morph_function import JointFunctionModel
+from rig_world_transform import RigWorldTransform
 from run_tracker import RunTrackerPanel
 from dashboard import DashboardPanel
-from mesh_settings import MeshSettingsPanel, rotate_mesh
+from mesh_settings import MeshSettingsPanel, rotate_mesh, rotation_matrix
+from joint_dof import joint_rotation_frames
 from rig_panel import RigModePanel, try_load_rigged
 from rig_loader import RiggedMesh
 from skinning import deform_mesh
@@ -593,6 +605,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ellipsoids: EllipsoidSet | None = None
         self._fitted_primitive_type: str = "ellipsoid"
         self._fitted_shape_exponents: np.ndarray | None = None
+        # Raw per-primitive shape array of the last rendered optimizer frame
+        # ((N,2) exponents, or (N,4) with bend), reused by the detail-zone stage.
+        self._last_visual_shape: np.ndarray | None = None
+        # Detail zones: the plan made for the next full-object fit, the plan of
+        # the running global fit, and the zone stage that runs after it.
+        self._detail_zone_plan_pending = None
+        self._detail_zone_plan = None
+        self._detail_zone_stage = None
 
         self._last_mesh_result: SdfResult | None = None
 
@@ -633,6 +653,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._api_pose_index: int | None = None
         self._api_verts = None                    # original (un-normalized) verts
         self._api_rig: dict | None = None         # Unity skinning payload
+        self._api_rig_validation: dict | None = None
         self._api_base_pose: Pose | None = None
         self._api_unity_pose_frames: bool = False
 
@@ -695,13 +716,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_tracker = RunTrackerPanel()
         # Compact live status board (cards + mini graphs); complements the tracker.
         self._dashboard = DashboardPanel()
-        # Per-mesh adjustments: rotation (async SDF recompute) + live SDF blowup.
+        # Per-mesh adjustments: live SDF blowup + bone-region preview.
         self._mesh_settings = MeshSettingsPanel()
-        self._base_verts: np.ndarray | None = None       # un-rotated loaded mesh
+        self._base_verts: np.ndarray | None = None       # loaded mesh
         self._base_faces: np.ndarray | None = None
-        self._pending_rot_mesh: tuple | None = None       # (verts, faces) for recompute
-        self._mesh_rotation = (0.0, 0.0, 0.0)             # global deg, applied to
-        self._mesh_rot_center: np.ndarray | None = None   # all poses + skeleton
+        # Global display rotation (degrees) about a fixed pivot.  There is no
+        # UI for it any more, so GUI fits keep it at zero; the transform
+        # helpers stay so every pose/primitive path remains consistent.
+        self._mesh_rotation = (0.0, 0.0, 0.0)
+        self._mesh_rot_center: np.ndarray | None = None
 
         # ── Rig mode (modular) ──
         self._rig_panel = RigModePanel()
@@ -808,6 +831,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _tick(0.45, "Loading 3-D viewport & panels …")
 
         self._build_layout()
+        self._viewer.configure_pose_fit_colors(self._settings)
         _tick(0.80, "Building interface …")
         self._build_toolbar()
         _tick(0.92, "Building toolbar …")
@@ -838,10 +862,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_theme_signature = None
         self._pose_corrective_worker: PoseCorrectiveWorker | None = None
         self._pose_correctives: PoseCorrectiveLibrary | None = None
+        self._morph_driver: NativeMorphDriver | None = None
+        # (library, key count, model or None): joint functions fitted to the keys
+        self._joint_function = None
+        self._error_meter: SurfaceErrorMeter | None = None
+        self._rig_transform: RigWorldTransform | None = None
+        self._morph_preview_timer = QtCore.QTimer(self)
+        self._morph_preview_timer.setInterval(33)
+        self._morph_preview_timer.timeout.connect(self._on_morph_preview_tick)
+        self._morph_last_tick = time.perf_counter()
+        self._pending_systematic_after_sdf = None
+        self._fitted_primitive_rotation = (0.0, 0.0, 0.0)
+        self._native_sdf_context = None
+        self._fitted_primitive_context = None
         self._pose_corrective_cancel_requested = False
         self._pose_corrective_cancel_message: str | None = None
         self._pose_corrective_last_error: str | None = None
+        self._pending_pose_visual: tuple | None = None
+        self._pose_visual_timer = QtCore.QTimer(self)
+        self._pose_visual_timer.setInterval(45)
+        self._pose_visual_timer.timeout.connect(self._flush_pose_corrective_visual)
         self._pending_pose_corrective_after_base_fit = False
+        self._pending_base_assign_after_fit = False
+        self._pending_systematic_fit_morphs = True
         self._current_mesh_name: str = ""
         self._current_sdf_mode: int = SDF_QUILEZ
         # Bind-pose bone centres for the bone-awareness penalty (rigged meshes).
@@ -858,13 +901,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pose_sdf_timer.timeout.connect(self._recompute_pose_sdf)
         self._suppress_pose_sdf_recompute = False
 
-        # Mesh rotation: debounced async SDF recompute (the rotated mesh's SDF is
-        # n³ work, so it runs on the SdfWorker once the user stops sliding).
-        self._rot_sdf_timer = QtCore.QTimer(self)
-        self._rot_sdf_timer.setSingleShot(True)
-        self._rot_sdf_timer.setInterval(250)
-        self._rot_sdf_timer.timeout.connect(self._recompute_rotated_sdf)
-        self._mesh_settings.rotationChanged.connect(self._on_mesh_rotation_changed)
         self._mesh_settings.blowupChanged.connect(
             self._on_sdf_blowup_changed)
         self._mesh_settings.regionPreviewToggled.connect(
@@ -875,12 +911,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # Restore the right-hand options panel from the last session and keep it
         # persisted on every change (panel_settings.json).
         self._init_panel_persistence()
+        # Model loading can start workers and emit rig signals. All callbacks,
+        # timers and restored settings must exist before loading the default.
+        self._load_default_mesh()
 
     def _build_layout(self):
         """Build a Unity-style workspace from independently dockable panels."""
         self._build_option_widgets()
         mesh_panel = self._build_mesh_tab()
         self._options_panel = self._build_options_column()
+        self._morph_curves = MorphCurvePanel()
+        self._morph_error = MorphErrorPanel()
 
         self.setDockOptions(
             QtWidgets.QMainWindow.AnimatedDocks
@@ -913,6 +954,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Dashboard", "DockDashboard", self._dashboard),
             "runs": self._make_workspace_dock(
                 "Runs", "DockRuns", self._run_tracker),
+            "morph_curves": self._make_workspace_dock(
+                "Morph Curves", "DockMorphCurves", self._morph_curves),
+            "pose_error": self._make_workspace_dock(
+                "Pose Error", "DockPoseError", self._morph_error),
             "options": self._make_workspace_dock(
                 "Options", "DockOptions", self._options_panel),
         }
@@ -930,7 +975,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # completely closed panel is always easy to recover.
         self._build_view_menu()
         self._scan_mesh_dir()
-        self._load_default_mesh()
 
     def _make_workspace_dock(
             self, title: str, object_name: str,
@@ -1071,6 +1115,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, docks["dashboard"])
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, docks["mesh"])
         self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, docks["runs"])
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, docks["morph_curves"])
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, docks["pose_error"])
         for dock in docks.values():
             dock.setFloating(False)
 
@@ -1082,6 +1128,8 @@ class MainWindow(QtWidgets.QMainWindow):
             docks["sdf"], docks["dashboard"], QtCore.Qt.Vertical)
         self.tabifyDockWidget(docks["sdf"], docks["mesh"])
         self.tabifyDockWidget(docks["dashboard"], docks["runs"])
+        self.tabifyDockWidget(docks["dashboard"], docks["morph_curves"])
+        self.tabifyDockWidget(docks["dashboard"], docks["pose_error"])
 
         docks["sdf"].raise_()
         docks["dashboard"].raise_()
@@ -1422,8 +1470,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Expose every dock plus a one-click default-layout reset."""
         self._view_menu = self.menuBar().addMenu("Views")
         self._view_actions = {}
-        for key in ("scene", "sdf", "mesh", "dashboard", "runs", "options"):
-            dock = self._dock_widgets[key]
+        for dock in self._dock_widgets.values():
             act = dock.toggleViewAction()
             self._view_menu.addAction(act)
             self._view_actions[dock.windowTitle()] = act
@@ -1525,6 +1572,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 "thickness_sampling_power", 1.0))
             self._settings.update(self._settings_dialog.values())
             app_settings.save(self._settings)
+            self._viewer.configure_pose_fit_colors(self._settings)
+            if self._api_fit_existing and self._opt_worker is not None:
+                self._opt_worker._emit_intermediate_progress = bool(
+                    self._settings.get("pose_fit_live_preview", True))
+            if MainWindow._api_pose_live_preview_enabled(self):
+                self._visual_timer.start()
+            elif self._api_batch_pipeline:
+                self._visual_timer.stop()
             new_sampling_power = float(self._settings.get(
                 "thickness_sampling_power", 1.0))
             if not np.isclose(
@@ -1588,7 +1643,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("lr_final",        self._spin_lr_final,       "float"),
             ("lr_decay",        self._spin_lr_decay,       "float"),
             ("fit_scope",       self._cmb_fit_scope,       "combo_data"),
-        ]
+        ] + self._rig_panel.pose_tool_setting_specs()
 
     def _init_panel_persistence(self) -> None:
         """Restore saved panel values (shared + per-shape), then auto-persist."""
@@ -1705,10 +1760,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Rig mode signals ──
         self._rig_panel.poseChanged.connect(self._on_rig_pose_changed)
-        self._rig_panel.poseCorrectiveRequested.connect(
-            lambda: self._on_pose_corrective_fit_clicked(force_full_window=True))
-        self._rig_panel._btn_assign.clicked.connect(self._on_rig_assign_clicked)
-        self._rig_panel.autoPipelineRequested.connect(self._on_auto_pipeline_clicked)
+        self._rig_panel.jointEditRequested.connect(self._viewer.select_joint)
+        self._viewer.connect_joint_rotation_controls(
+            self._rig_panel.set_joint_rotation,
+            self._rig_panel.reset_joint_rotation,
+            self._rig_panel.reset_joint_rotations,
+            self._rig_panel.select_joint,
+            limits_changed=self._rig_panel._update_systematic_summary)
+        self._rig_panel.rigLoaded.connect(lambda _rig: MainWindow._sync_morph_curves(self))
+        self._rig_panel.fitRequested.connect(self._on_native_fit_requested)
+        self._rig_panel.morphPreviewChanged.connect(self._on_morph_preview_changed)
+        self._rig_panel.animationPoseChanged.connect(self._on_animation_pose)
+        self._rig_panel.animationStateChanged.connect(self._on_animation_state_changed)
+        self._rig_panel.saveMorphRequested.connect(self._on_save_morph_fit)
+        self._rig_panel.loadMorphRequested.connect(self._on_load_morph_fit)
         self._rig_panel.exportUnityRequested.connect(self._on_export_unity_clicked)
 
     # ── runtime light/dark switching ──────────────────────────────────────
@@ -1745,6 +1810,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mesh_sdf_panel.apply_theme()
             self._run_tracker.apply_theme()
             self._dashboard.apply_theme()
+            self._morph_curves.apply_theme()
+            self._morph_error.apply_theme()
             if not getattr(self, "_color_dialog_active", False):
                 self._schedule_brand_icon_update()
                 self._clear_custom_ui_style()
@@ -2021,6 +2088,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # ── Static mesh (original behaviour) ──
+        self._prepare_model_change()
         self._rig_panel.setChecked(False)  # Deactivate rig mode
         self._rig_panel.setVisible(False)  # Hide all rig/FBX options
         self._viewer.remove_skeleton()     # No skeleton → hide its overlay toggle
@@ -2029,6 +2097,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bone_centers = None
         self._bone_expected_counts = None
         self._pose_correctives = None
+        self._morph_driver = None
+        self._morph_preview_timer.stop()
+        self._pending_systematic_after_sdf = None
         try:
             mesh = load_and_prepare(path, target_scale=1.0)
             verts = mesh.vertices.view(np.ndarray)
@@ -2052,9 +2123,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_rigged_mesh(self, path: str, rigged):
         """Load a rigged mesh and activate rig mode."""
+        self._prepare_model_change()
         self._precomputed_meshes = {}
         self._pending_pose_mesh = None
         self._pose_correctives = None
+        self._morph_driver = None
+        self._morph_preview_timer.stop()
+        self._pending_systematic_after_sdf = None
         self._rig_panel.setVisible(True)  # Reveal rig/FBX options
         self._rig_panel.setChecked(True)
         self._rig_panel.set_rigged_mesh(rigged)
@@ -2069,7 +2144,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_base_mesh(verts, faces)
         self._viewer.show_mesh(verts, faces)
         self._ensure_sdf_idle()
-        self._sdf.set_mesh(verts, faces)
+        self._set_rig_sdf_mesh(verts, faces, Pose.t_pose())
         self._current_mesh_name = Path(path).name
 
         # Show skeleton bones in bind pose
@@ -2086,13 +2161,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _show_skeleton_for_pose(self, rigged, pose):
         """Render skeleton bones for a given pose (None = bind pose)."""
-        positions, _ = rigged.skeleton.compute_bone_positions_rotations(pose)
+        world = rigged.skeleton.compute_world_transforms(pose)
+        positions = world[:, :3, 3]
+        rotations = joint_rotation_frames(world)
+        rotations = rotation_matrix(*self._mesh_rotation)[None] @ rotations
         # The global mesh rotation applies to the skeleton too.
         positions = self._apply_rotation(np.asarray(positions, dtype=np.float32))
         parent_indices = np.array(
             [b.parent_index for b in rigged.skeleton.bones], dtype=np.int32,
         )
-        self._viewer.show_bones(positions, parent_indices)
+        angles = edited = None
+        panel = getattr(self, "_rig_panel", None)
+        if (panel is not None and panel.rigged_mesh is rigged and panel.is_active
+                and not panel._pose_training_running):
+            angles, edited = panel.joint_rotation_state(pose)
+        self._viewer.show_bones(
+            positions, parent_indices, joint_rotations=rotations,
+            joint_names=[bone.name for bone in rigged.skeleton.bones],
+            joint_dofs=[bone.joint_dof for bone in rigged.skeleton.bones],
+            rig_key=rigged.skeleton, joint_angles=angles, joint_edited=edited)
 
     @staticmethod
     def _compute_bone_centers(rigged) -> np.ndarray | None:
@@ -2164,9 +2251,13 @@ class MainWindow(QtWidgets.QMainWindow):
         rm = self._rig_panel.rigged_mesh
         if rm is None:
             return
+        if getattr(self._rig_panel, "animation_active", False):
+            MainWindow._on_animation_pose(self, self._rig_panel.current_pose, 0.0, None)
+            return
 
         frame = self._rig_panel.current_pose_frame
         pose = self._rig_panel.pose_at_frame(frame)
+        MainWindow._sync_morph_curves(self)
 
         # ── Instant, non-blocking visible update ──
         deformed = self._rig_panel.get_deformed_mesh(frame)
@@ -2185,35 +2276,405 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._pending_pose_mesh = (deformed, rm.faces)
                 self._pose_sdf_timer.start()
 
-        # Update ellipsoids if bone-local params exist.  Pose-corrective keys
-        # are relative to the base bone-local ellipsoids and ride on top of the
-        # current bone pose.
-        mapper = self._rig_panel.mapper
-        if (self._pose_correctives is not None and mapper is not None
-                and self._pose_correctives.base is self._rig_panel.bone_local):
-            corrected = self._pose_correctives.corrected_blend(frame)
-            wc, wr, wq = mapper.local_to_world_np(corrected, pose)
-            render_shape = self._shapes_by_id.get(
-                corrected.primitive_type, self._shape)
-            render_shape.render(
-                self._viewer, wc, wr, wq, corrected.shape_exponents)
-        else:
-            world_ell = self._rig_panel.get_world_ellipsoids(frame)
-            if world_ell is not None:
-                wc, wr, wq = world_ell
-                bone_local = self._rig_panel.bone_local
-                primitive_type = getattr(
-                    bone_local, "primitive_type", "ellipsoid")
-                shape_exponents = getattr(
-                    bone_local, "shape_exponents", None)
-                render_shape = self._shapes_by_id.get(
-                    primitive_type, self._shape)
-                render_shape.render(
-                    self._viewer, wc, wr, wq, shape_exponents)
+        MainWindow._render_rig_primitives(self, pose, frame=frame)
 
         self._status.showMessage(
             f"Pose {frame:.2f}: {pose.name}"
         )
+
+    def _sync_morph_curves(self):
+        panel = getattr(self, "_morph_curves", None)
+        if panel is None:
+            return
+        rig = self._rig_panel.rigged_mesh if self._rig_panel.is_active else None
+        library = getattr(self, "_pose_correctives", None)
+        if library is not None and library.base is not self._rig_panel.bone_local:
+            library = None
+        panel.set_source(rig, library)
+
+    def _render_rig_primitives(self, pose, *, frame=None, dt=0.0, playback_time=None):
+        """Draw the rig primitives in *pose*: morphed when a morph fit exists, else the base."""
+        panel = self._rig_panel
+        mapper = panel.mapper
+        library = self._pose_correctives
+        if library is not None and mapper is not None and library.base is panel.bone_local:
+            self._viewer.set_pose_fit_reference(library.base.local_radii)
+            self._render_pose_morph(pose, frame=frame, dt=dt, playback_time=playback_time)
+            return
+        self._viewer.set_pose_fit_reference(None)
+        bone_local = panel.bone_local
+        if bone_local is None or mapper is None:
+            MainWindow._update_pose_error(self, pose, None, None, "none", None, dt, playback_time)
+            return
+        pose_map = MainWindow._rig_pose_map(self, bone_local, pose)
+        wc, wr, wq = (RigWorldTransform.apply(bone_local, pose_map) if pose_map is not None
+                      else mapper.local_to_world_np(bone_local, pose))
+        render_shape = self._shapes_by_id.get(
+            getattr(bone_local, "primitive_type", "ellipsoid"), self._shape)
+        wc, wq = MainWindow._pose_preview_parameters(self, wc, wq)
+        render_shape.render(self._viewer, wc, wr, wq, getattr(bone_local, "shape_exponents", None))
+        MainWindow._update_pose_error(self, pose, None, bone_local, "none", None, dt, playback_time,
+                                      pose_map)
+
+    def _morph_driver_for(self, library):
+        panel = self._rig_panel
+        settings = panel.morph_settings()
+        driver = getattr(self, "_morph_driver", None)
+        if (driver is None or driver.library is not library
+                or driver.skeleton is not panel.rigged_mesh.skeleton or driver.settings != settings):
+            driver = NativeMorphDriver(panel.rigged_mesh.skeleton, library, settings)
+            self._morph_driver = driver
+        return driver
+
+    def _joint_function_for(self, library):
+        """Joint functions fitted to *library*'s keys (cached; refitted when the keys change)."""
+        cached = getattr(self, "_joint_function", None)
+        if cached is not None and cached[0] is library and cached[1] == len(library.keys):
+            return cached[2]
+        panel = self._rig_panel
+        try:
+            model = JointFunctionModel(panel.rigged_mesh.skeleton, library)
+            text = f"Joint functions: {model.summary()} · fitted in {model.fit_seconds:.1f} s"
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            model, text = None, f"Joint functions unavailable: {exc}"
+        self._joint_function = (library, len(library.keys), model)
+        if hasattr(panel, "set_function_summary"):
+            panel.set_function_summary(text)
+        return model
+
+    def _rig_pose_map(self, layout, pose):
+        """Vectorized local→world map shared by the preview and the error meter."""
+        rig = self._rig_panel.rigged_mesh
+        if rig is None or layout is None:
+            return None
+        transform = getattr(self, "_rig_transform", None)
+        try:
+            if transform is None or not transform.matches(rig.skeleton, layout):
+                transform = RigWorldTransform(rig.skeleton, layout)
+                self._rig_transform = transform
+            return transform.pose_map(pose)
+        except (ValueError, np.linalg.LinAlgError):
+            return None
+
+    def _update_pose_error(self, pose, library, shown, active, driver, dt=0.0, playback_time=None,
+                           pose_map=None):
+        """Measure the total error of the shown primitives (and the alternatives) in *pose*."""
+        view = getattr(self, "_morph_error", None)
+        panel = self._rig_panel
+        rig = panel.rigged_mesh
+        if view is None:
+            return
+        base = library.base if library is not None else shown
+        if rig is None or base is None:
+            view.set_unavailable("Fit a base pose to measure the error.")
+            return
+        if playback_time is not None:
+            # While playing, about 8 measurements per second are enough for the
+            # plot; the skipped time still advances the reference key blend.
+            self._error_pending_dt = getattr(self, "_error_pending_dt", 0.0) + float(dt or 0.0)
+            last = getattr(self, "_error_last_playback", None)
+            if last is not None and 0 <= playback_time - last < 0.12:
+                return
+            self._error_last_playback = playback_time
+            dt, self._error_pending_dt = self._error_pending_dt, 0.0
+        meter = getattr(self, "_error_meter", None)
+        try:
+            if meter is None or not meter.matches(rig, base):
+                meter = SurfaceErrorMeter(rig, base, getattr(library, "base_pose", None))
+                self._error_meter = meter
+            series = {"none": base}
+            if active != "none":
+                series[active] = shown
+            if library is not None and not panel._pose_training_running:
+                if "keys" not in series:
+                    reference = driver if driver is not None else MainWindow._morph_driver_for(self, library)
+                    if reference.has_descriptors:
+                        series["keys"] = reference.evaluate(pose, dt=dt)
+                if "function" not in series:
+                    function = MainWindow._joint_function_for(self, library)
+                    if function is not None:
+                        series["function"] = function.evaluate(pose)
+            errors = meter.measure_many(pose, series, pose_map=pose_map)
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+            view.set_unavailable(f"Error could not be measured: {exc}")
+            return
+        view.update_errors(errors, active, height=meter.height, playback_time=playback_time)
+
+    def _render_pose_morph(self, pose, *, frame=None, dt=0.0, playback_time=None):
+        """Update shape deltas from actual joint rotations, independently of source."""
+        panel = self._rig_panel
+        library = self._pose_correctives
+        timer = getattr(self, "_morph_preview_timer", None)
+        if library is None or panel.rigged_mesh is None or library.base is not panel.bone_local:
+            if timer is not None:
+                timer.stop()
+            return
+        driver, active = None, "none"
+        if panel.morph_preview_enabled:
+            driver = MainWindow._morph_driver_for(self, library)
+            function = None
+            if getattr(panel, "morph_model", "keys") == "function" and not panel._pose_training_running:
+                function = MainWindow._joint_function_for(self, library)
+            if function is not None:
+                corrected, active = function.evaluate(pose), "function"
+                if timer is not None:
+                    timer.stop()
+            else:
+                # Older in-memory libraries without descriptors retain their original
+                # timeline preview. New/native and API-trained keys use pose matching.
+                corrected = (driver.evaluate(pose, dt=dt) if driver.has_descriptors
+                             else library.corrected_blend(panel.current_pose_frame if frame is None else frame))
+                active = "keys"
+                if (timer is not None and not driver.settled and not panel._pose_training_running
+                        and not getattr(panel, "animation_playing", False)):
+                    if not timer.isActive():
+                        self._morph_last_tick = time.perf_counter()
+                        timer.start()
+                elif timer is not None:
+                    timer.stop()
+        else:
+            corrected = library.corrected_bone_local(None)
+            if timer is not None:
+                timer.stop()
+        pose_map = MainWindow._rig_pose_map(self, library.base, pose)
+        wc, wr, wq = (RigWorldTransform.apply(corrected, pose_map) if pose_map is not None
+                      else panel.mapper.local_to_world_np(corrected, pose))
+        wc, wq = MainWindow._pose_preview_parameters(self, wc, wq)
+        render_shape = self._shapes_by_id.get(corrected.primitive_type, self._shape)
+        render_shape.render(self._viewer, wc, wr, wq, corrected.shape_exponents)
+        MainWindow._update_pose_error(self, pose, library, corrected, active, driver, dt,
+                                      playback_time, pose_map)
+
+    def _on_animation_pose(self, pose, dt=0.0, playback_time=None):
+        """Show one animation frame: skinned mesh, skeleton and live primitives (no SDF work)."""
+        panel = self._rig_panel
+        rig = panel.rigged_mesh
+        if rig is None or pose is None or not panel.is_active:
+            return
+        deformed = deform_mesh(rig.vertices, rig.skin_joints, rig.skin_weights,
+                               rig.skeleton.compute_skin_matrices(pose))
+        self._viewer.show_mesh(self._apply_rotation(deformed), rig.faces)
+        self._show_skeleton_for_pose(rig, pose)
+        MainWindow._render_rig_primitives(self, pose, dt=dt, playback_time=playback_time)
+
+    def _on_animation_state_changed(self, active):
+        panel = self._rig_panel
+        self._morph_preview_timer.stop()
+        if active:
+            # Animation frames never change the numerical mesh SDF.
+            self._cancel_pending_pose_sdf()
+            self._morph_error.clear_history()
+            self._error_last_playback = None
+            self._error_pending_dt = 0.0
+            dock = getattr(self, "_dock_widgets", {}).get("pose_error")
+            if dock is not None and dock.isVisible():
+                dock.raise_()
+            return
+        if panel.is_active and panel.rigged_mesh is not None:
+            # Back to the timeline pose, whose SDF is still current.
+            self._suppress_pose_sdf_recompute = True
+            try:
+                self._on_rig_pose_changed(panel.current_pose_index)
+            finally:
+                self._suppress_pose_sdf_recompute = False
+
+    def _pose_preview_parameters(self, centers, rotations):
+        """Apply the same display rotation to primitives as to the skinned mesh."""
+        angles = getattr(self, "_mesh_rotation", (0.0, 0.0, 0.0))
+        if not any(angles):
+            return centers, rotations
+        global_q = quat_from_matrix(rotation_matrix(*angles))
+        rotations = np.array([quat_multiply(global_q, q) for q in rotations], dtype=np.float32)
+        return self._apply_rotation(centers), rotations
+
+    def _fitted_parameters_in_rig_space(self):
+        """Undo the display rotation baked into a native base optimization."""
+        centers, rotations = self._ellipsoids.centers, self._ellipsoids.rotations
+        angles = getattr(self, "_fitted_primitive_rotation", getattr(self, "_mesh_rotation", (0, 0, 0)))
+        if self._api_job_id is not None or not any(angles):
+            return centers, rotations
+        matrix = rotation_matrix(*angles)
+        pivot = np.asarray(self._mesh_rot_center)
+        centers = np.asarray((centers - pivot) @ matrix + pivot, dtype=np.float32)
+        inverse_q = quat_from_matrix(matrix.T)
+        rotations = np.array([quat_multiply(inverse_q, q) for q in rotations], dtype=np.float32)
+        return centers, rotations
+
+    def _set_rig_sdf_mesh(self, vertices, faces, pose):
+        """Keep the source pose with the numerical mesh, across UI changes."""
+        self._sdf.set_mesh(vertices, faces)
+        self._native_sdf_context = (
+            self._rig_panel.rigged_mesh,
+            Pose(pose.name, {i: local.copy() for i, local in pose.bone_locals.items()}),
+            tuple(self._mesh_rotation))
+
+    def _native_base_assignment_pose(self, rigged):
+        context = getattr(self, "_fitted_primitive_context", None)
+        return context[1] if context is not None and context[0] is rigged else Pose.t_pose()
+
+    @staticmethod
+    def _assignment_mesh(rigged, pose):
+        return deform_mesh(rigged.vertices, rigged.skin_joints, rigged.skin_weights,
+                           rigged.skeleton.compute_skin_matrices(pose))
+
+    def _on_morph_preview_tick(self):
+        panel = self._rig_panel
+        if not panel.is_active or panel._pose_training_running or self._pose_correctives is None:
+            self._morph_preview_timer.stop()
+            return
+        now = time.perf_counter()
+        dt = max(0, now - self._morph_last_tick)
+        self._morph_last_tick = now
+        self._render_pose_morph(panel.current_pose, dt=dt)
+
+    def _on_morph_preview_changed(self):
+        if not hasattr(self, "_morph_preview_timer"):
+            return
+        self._morph_preview_timer.stop()
+        self._morph_driver = None
+        if self._rig_panel.is_active and not self._rig_panel._pose_training_running:
+            self._render_pose_morph(self._rig_panel.current_pose)
+
+    def _on_native_fit_requested(self, fit_base=True, fit_morphs=True):
+        """Native rig workflow: fit the base pose, then the joint-range morph poses.
+
+        ``fit_base`` refits the bind pose from scratch and assigns it to bones.
+        ``fit_morphs`` fits every nearby joint-range pose as a morph key with
+        the panel's own "Steps per morph pose" and saves the morph fit.
+        """
+        if self._api_job_id is not None:
+            self._status.showMessage("Finish or stop the active Unity API job before starting a native pose fit.")
+            return
+        if not self._rig_panel.is_active or self._rig_panel.rigged_mesh is None:
+            return
+        if fit_morphs and not self._rig_panel.generate_systematic_source():
+            self._status.showMessage("No movable joint ranges selected for morph poses.")
+            return
+        if not fit_base:
+            if self._rig_panel.bone_local is None and self._ellipsoids is None:
+                self._status.showMessage("Fit the base pose first (1 · Fit Base Pose).")
+                return
+            self._on_auto_pipeline_clicked()
+            return
+        self.stop_optimization()
+        self._stop_pose_corrective_fit()
+        self._morph_preview_timer.stop()
+        # The base pose is the bind pose (frame 0 of the joint-range poses).
+        self._suppress_pose_sdf_recompute = True
+        try:
+            self._rig_panel.reset_pose_to_start(emit=True)
+        finally:
+            self._suppress_pose_sdf_recompute = False
+        self._cancel_pending_pose_sdf()
+        rm = self._rig_panel.rigged_mesh
+        self._pending_systematic_after_sdf = rm
+        self._pending_systematic_fit_morphs = bool(fit_morphs)
+        self._rig_panel.set_auto_pipeline_running(True)
+        if MainWindow._bind_pose_sdf_ready(self, rm):
+            self._start_systematic_after_sdf()
+            return
+        # Needs a fresh bind-pose SDF even if the user previously scrubbed to
+        # another pose or manually edited joints.
+        self._ensure_sdf_idle()
+        self._set_rig_sdf_mesh(self._apply_rotation(rm.vertices), rm.faces, Pose.t_pose())
+        self._last_mesh_result = None
+        self._on_compute_all()
+
+    def _bind_pose_sdf_ready(self, rigged) -> bool:
+        """Whether the finished mesh SDF already is this rig's bind pose."""
+        context = getattr(self, "_native_sdf_context", None)
+        return (self._last_mesh_result is not None
+                and getattr(self, "_sdf_worker", None) is None
+                and not getattr(self, "_sdf_finalize_active", False)
+                and context is not None and context[0] is rigged
+                and not context[1].bone_locals and not any(context[2]))
+
+    def _prepare_model_change(self):
+        """Retire all work before replacing its rig and shared SDF mesh."""
+        if (self._api_job_id is not None or self._sdf_worker is not None
+                or self._opt_worker is not None or self._pose_corrective_worker is not None
+                or self._batched_worker is not None or self._region_fit_worker is not None
+                or self._region_sdf_worker is not None or self._bonesep_ctl is not None
+                or getattr(self, "_detail_zone_stage", None) is not None
+                or self._pending_systematic_after_sdf is not None):
+            self._cancel_active_work(api_job_id=self._api_job_id, api_reason="Model changed")
+        self._morph_preview_timer.stop()
+        self._rig_panel.stop_animation(notify=False)
+        self._cancel_pending_pose_sdf()
+
+    def _start_systematic_after_sdf(self):
+        rig = self._pending_systematic_after_sdf
+        fit_morphs = getattr(self, "_pending_systematic_fit_morphs", True)
+        self._pending_systematic_after_sdf = None
+        self._rig_panel.set_auto_pipeline_running(False)
+        if (rig is self._rig_panel.rigged_mesh and self._api_job_id is None
+                and self._rig_panel.is_active and self._last_mesh_result is not None):
+            MainWindow._start_native_base_fit(self, fit_morphs)
+
+    def _start_native_base_fit(self, fit_morphs: bool) -> None:
+        """Fit the bind pose from scratch; then assign to bones (+ morph poses)."""
+        self._rig_panel.set_bone_local(None)
+        self._pose_correctives = None
+        self._morph_driver = None
+        MainWindow._sync_morph_curves(self)
+        self._pending_base_assign_after_fit = True
+        self._pending_pose_corrective_after_base_fit = bool(fit_morphs)
+        self._rig_panel.set_auto_pipeline_running(True)
+        self._status.showMessage("Fitting the base pose…")
+        self._start_base_pose_optimization()
+
+    def _on_save_morph_fit(self):
+        rm = self._rig_panel.rigged_mesh
+        library = self._pose_correctives
+        if rm is None or library is None or not library.keys or library.base is not self._rig_panel.bone_local:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save native morph fit",
+            f"{Path(self._current_mesh_name).stem or 'model'}_morph_fit.json", "JSON files (*.json)")
+        if path:
+            try:
+                save_native_morph_fit(library, rm, path)
+                self._status.showMessage(f"Saved morph fit: {path}")
+            except (OSError, ValueError) as exc:
+                self._status.showMessage(f"Morph fit could not be saved: {exc}")
+
+    def _autosave_morph_fit(self):
+        """Store a finished native morph-pose fit at its default location."""
+        rm = self._rig_panel.rigged_mesh
+        library = self._pose_correctives
+        if rm is None or library is None or not library.keys:
+            return None
+        path = default_morph_fit_path(self._current_mesh_name or rm.mesh_name)
+        try:
+            save_native_morph_fit(library, rm, path)
+        except (OSError, ValueError) as exc:
+            self._status.showMessage(f"Morph poses fitted, but could not be saved: {exc}")
+            return None
+        self._rig_panel.set_morph_saved_path(path)
+        self._status.showMessage(
+            f"Morph poses fitted — {len(library.keys)} pose key(s) saved to {path}")
+        return path
+
+    def _on_load_morph_fit(self):
+        rm = self._rig_panel.rigged_mesh
+        if rm is None or self._api_job_id is not None or self._rig_panel._pose_training_running:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load native morph fit", "", "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            library = load_native_morph_fit(rm, path)
+            # Validate/cache the complete runtime before replacing visible data.
+            driver = NativeMorphDriver(rm.skeleton, library, self._rig_panel.morph_settings())
+            driver.evaluate(self._rig_panel.current_pose)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self._status.showMessage(f"Morph fit could not be loaded: {exc}")
+            return
+        self._rig_panel.set_bone_local(library.base)
+        self._pose_correctives = library
+        self._morph_driver = driver
+        self._rig_panel.set_morph_library_count(len(library.keys))
+        self._on_rig_pose_changed(self._rig_panel.current_pose_index)
+        self._status.showMessage(f"Loaded {len(library.keys)} morph keys from {Path(path).name}")
 
     def _recompute_pose_sdf(self) -> None:
         """Debounced async SDF recompute for the current rig pose.
@@ -2243,7 +2704,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         deformed, faces = pending
         self._pending_pose_mesh = None
-        self._sdf.set_mesh(deformed, faces)
+        self._set_rig_sdf_mesh(deformed, faces, self._rig_panel.current_pose)
         self._on_compute_all()
 
     def _cancel_pending_pose_sdf(self) -> None:
@@ -2251,12 +2712,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_pose_mesh = None
         self._pose_sdf_timer.stop()
 
-    # ── Mesh settings: rotation + SDF blowup ───────────────────────────
+    # ── Mesh settings: SDF blowup ───────────────────────────
     def _set_base_mesh(self, verts: np.ndarray, faces: np.ndarray) -> None:
-        """Remember the un-rotated mesh + a fixed rotation pivot; reset controls."""
+        """Remember the loaded mesh + a fixed rotation pivot; reset controls."""
+        self._ellipsoids = None
+        self._fitted_primitive_type = "ellipsoid"
+        self._fitted_shape_exponents = None
+        self._native_sdf_context = None
+        self._fitted_primitive_context = None
+        MainWindow._sync_morph_curves(self)
+        self._viewer.clear_ellipsoids()
         # Drop any exploded region preview from the previous mesh (reset() below
         # unchecks the toggle silently, so clear the cached geometry here).
         self._clear_region_preview_state()
+        self._viewer.set_pose_fit_reference(None)
         self._base_verts = np.ascontiguousarray(verts, dtype=np.float32)
         self._base_faces = np.ascontiguousarray(faces)
         # Keep the old raw preview visible until the new SDF arrives, but release
@@ -2269,7 +2738,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mesh_rot_center = 0.5 * (self._base_verts.min(axis=0)
                                        + self._base_verts.max(axis=0))
         self._mesh_rotation = (0.0, 0.0, 0.0)
-        self._pending_rot_mesh = None
+        self._fitted_primitive_rotation = (0.0, 0.0, 0.0)
         startup_blowup = getattr(
             self, "_startup_blowup_fraction", None)
         self._mesh_settings.reset()
@@ -2295,7 +2764,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mesh_rot_center = 0.5 * (
             self._base_verts.min(axis=0) + self._base_verts.max(axis=0))
         self._mesh_rotation = (0.0, 0.0, 0.0)
-        self._pending_rot_mesh = None
 
     def _on_sdf_blowup_changed(self, thickness_fraction: float) -> None:
         """Keep both previews on the same local-thickness-relative request."""
@@ -2434,42 +2902,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return np.asarray(points, dtype=np.float32)
         return rotate_mesh(points, rx, ry, rz, center=self._mesh_rot_center)
 
-    def _on_mesh_rotation_changed(self, rx: float, ry: float, rz: float) -> None:
-        """Store the rotation and re-apply it to the current mesh (and pose)."""
-        self._mesh_rotation = (rx, ry, rz)
-        # Keep the exploded region preview (if any) aligned with the rotation.
-        if self._region_parts is not None:
-            self._refresh_region_preview()
-        # Rigged: re-render the active pose so the rotation rides on top of it
-        # (mesh + skeleton) and the SDF recompute uses the rotated posed mesh.
-        if self._rig_panel.is_active and self._rig_panel.rigged_mesh is not None:
-            self._on_rig_pose_changed(self._rig_panel.current_pose_index)
-            return
-        if self._base_verts is None or self._base_faces is None:
-            return
-        rotated = self._apply_rotation(self._base_verts)
-        self._viewer.show_mesh(rotated, self._base_faces)     # immediate visual
-        self._pending_rot_mesh = (rotated, self._base_faces)  # SDF recompute soon
-        self._rot_sdf_timer.start()
-
-    def _recompute_rotated_sdf(self) -> None:
-        """Debounced async SDF recompute for the rotated mesh (never blocks)."""
-        pending = self._pending_rot_mesh
-        if pending is None:
-            return
-        if self._sdf_worker is not None and self._sdf_worker.isRunning():
-            self._rot_sdf_timer.start()                       # retry shortly
-            return
-        verts, faces = pending
-        self._pending_rot_mesh = None
-        self._sdf.set_mesh(verts, faces)
-        self._on_compute_all()
-
     # ── Rig-mode: one-click auto pipeline ───────────────────────────
 
     def _on_auto_pipeline_clicked(self):
         """One-click: train pose-corrective layers from the current base fit."""
         if not self._rig_panel.is_active:
+            return
+        if self._api_job_id is not None:
+            self._status.showMessage("Finish or stop the active Unity API job before starting a native pose fit.")
             return
         rm = self._rig_panel.rigged_mesh
         if rm is None:
@@ -2487,65 +2927,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self._rig_panel.set_auto_pipeline_running(True)
             self._status.showMessage(
                 "Pose correctives: fitting the base pose first...")
-            self.start_optimization(
-                num_ellipsoids=self._spin_num_ellipsoids.value(),
-                max_ellipsoids=self._spin_max_ellipsoids.value(),
-                bone_aware=(self._grp_rig.isVisible()
-                            and self._chk_bone_aware.isChecked()
-                            and self._bone_centers is not None),
-                bone_centers=self._bone_centers,
-                bone_expected_counts=self._bone_expected_counts,
-                **self._gather_fit_kwargs(),
-            )
+            self._start_base_pose_optimization()
             return
         if not self._ensure_pose_corrective_base():
             return
         self._on_pose_corrective_fit_clicked(force_full_window=True)
 
-    # ── Rig-mode: assign to bones ────────────────────────────────────
-
-    def _on_rig_assign_clicked(self):
-        """Assign current ellipsoids to bones based on T-pose fit."""
-        if not self._rig_panel.is_active:
-            return
-        rm = self._rig_panel.rigged_mesh
-        mapper = self._rig_panel.mapper
-        if rm is None or mapper is None:
-            self._status.showMessage("Load a rigged mesh first.")
-            return
-
-        if self._ellipsoids is None:
-            self._status.showMessage("Fit ellipsoids in T-pose first (press ▶ Fit).")
-            return
-
-        self._status.showMessage("Assigning ellipsoids to bones…")
-        QtWidgets.QApplication.processEvents()
-
-        try:
-            primitive_type, shape_exponents = (
-                self._current_fitted_primitive_state(
-                    self._ellipsoids.count))
-        except ValueError as exc:
-            self._status.showMessage(f"Bone assignment unavailable: {exc}")
-            return
-
-        bone_local = mapper.assign_to_bones(
-            world_centers=self._ellipsoids.centers,
-            world_radii=self._ellipsoids.radii,
-            world_rotations=self._ellipsoids.rotations,
-            mesh_vertices=rm.vertices,
-            skin_joints=rm.skin_joints,
-            skin_weights=rm.skin_weights,
-            pose=Pose.t_pose(),
-            primitive_type=primitive_type,
-            shape_exponents=shape_exponents,
-        )
-
-        self._rig_panel.set_bone_local(bone_local)
-        self._pose_correctives = None
-        self._status.showMessage(
-            f"Assigned {bone_local.num_ellipsoids} ellipsoids to bones. "
-            "Ready for pose-corrective training."
+    def _start_base_pose_optimization(self) -> None:
+        num, max_count = MainWindow._plan_detail_zones(self)
+        self.start_optimization(
+            num_ellipsoids=num,
+            max_ellipsoids=max_count,
+            bone_aware=(self._grp_rig.isVisible()
+                        and self._chk_bone_aware.isChecked()
+                        and self._bone_centers is not None),
+            bone_centers=self._bone_centers,
+            bone_expected_counts=self._bone_expected_counts,
+            **self._gather_fit_kwargs(),
         )
 
     def _ensure_pose_corrective_base(self) -> bool:
@@ -2555,7 +2953,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rm = self._rig_panel.rigged_mesh
         mapper = self._rig_panel.mapper
         if rm is None or mapper is None:
-            self._status.showMessage("Pose correctives need a loaded humanoid rig.")
+            self._status.showMessage("Pose correctives need a loaded rig.")
             return False
         if self._rig_panel.bone_local is not None:
             return True
@@ -2563,8 +2961,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._ellipsoids is not None:
             self._status.showMessage("Pose correctives: assigning current base fit to bones...")
             QtWidgets.QApplication.processEvents()
-            base_pose = Pose.t_pose()
-            assignment_vertices = rm.vertices
+            base_pose = MainWindow._native_base_assignment_pose(self, rm)
+            assignment_vertices = MainWindow._assignment_mesh(rm, base_pose)
             if self._api_job_id is not None and self._api_base_pose is not None:
                 base_pose = self._api_base_pose
                 if (self._base_verts is not None
@@ -2577,10 +2975,11 @@ class MainWindow(QtWidgets.QMainWindow):
             except ValueError as exc:
                 self._status.showMessage(f"Pose correctives unavailable: {exc}")
                 return False
+            rig_centers, rig_rotations = MainWindow._fitted_parameters_in_rig_space(self)
             bone_local = mapper.assign_to_bones(
-                world_centers=self._ellipsoids.centers,
+                world_centers=rig_centers,
                 world_radii=self._ellipsoids.radii,
-                world_rotations=self._ellipsoids.rotations,
+                world_rotations=rig_rotations,
                 mesh_vertices=assignment_vertices,
                 skin_joints=rm.skin_joints,
                 skin_weights=rm.skin_weights,
@@ -2596,6 +2995,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._rig_panel.set_bone_local(bone_local)
         self._pose_correctives = None
+        MainWindow._sync_morph_curves(self)
         return True
 
     # ── Rig-mode: pose-corrective training ───────────────────────────
@@ -2619,6 +3019,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._api_job_id is not None
             and self._api_stage == "correctives"
         )
+        self._morph_preview_timer.stop()
+        self._morph_driver = None
         if not api_corrective_start:
             self.stop_optimization()
         else:
@@ -2636,12 +3038,15 @@ class MainWindow(QtWidgets.QMainWindow):
         blowup_fraction = self._mesh_settings.blowup_fraction()
         margin = required_relative_sdf_margin(
             requested_margin, blowup_fraction, int(grid_n))
-        training_poses = list(self._rig_panel.active_poses)
+        training_poses = [self._rig_panel.pose_at_frame(float(i))
+                          for i in range(len(self._rig_panel.active_poses))]
         source_label = self._rig_panel.current_source_label
         if not training_poses:
             self._status.showMessage("No poses selected for corrective training.")
             return
-        target_vertices = getattr(rm, "_unity_pose_vertices", None)
+        target_vertices = (getattr(rm, "_unity_pose_vertices", None)
+                           if self._rig_panel.current_source == self._rig_panel.NATIVE
+                           else None)
         if target_vertices is not None:
             target_vertices = list(target_vertices)
             if len(target_vertices) != len(training_poses):
@@ -2655,6 +3060,7 @@ class MainWindow(QtWidgets.QMainWindow):
             source_label = f"Unity sampled frames ({len(training_poses)} frames)"
 
         fit_kwargs = self._pose_corrective_fit_kwargs()
+        morph_settings = self._rig_panel.morph_settings()
         self._pose_corrective_cancel_requested = False
         self._pose_corrective_cancel_message = None
         self._pose_corrective_last_error = None
@@ -2671,10 +3077,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self._api_job_id is not None and self._api_base_pose is not None
                 else Pose.t_pose()
             ),
+            # Seeds compare against the pose the native base was fitted in.
+            base_fit_pose=(None if self._api_job_id is not None
+                           else self._native_base_assignment_pose(rm)),
+            reuse_base_pose=(
+                self._api_job_id is None
+                and self._rig_panel.current_source == self._rig_panel.SYSTEMATIC
+                and not self._native_base_assignment_pose(rm).bone_locals),
             target_vertices=target_vertices,
             sdf_blowup_fraction=self._mesh_settings.blowup_fraction(),
             thickness_max_resolution=int(
                 self._settings.get("thickness_max_resolution", 128)),
+            context_depth=morph_settings.context_depth,
+            context_falloff=morph_settings.context_falloff,
             device=self._device,
             parent=self,
         )
@@ -2695,23 +3110,52 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_pose_corrective_worker_finished)
 
         self._opt_total_steps = max(1, int(fit_kwargs["num_steps"]))
+        # Own run: per-pose steps restart at 0, so writing them into the last
+        # fit's curve drew lines back to the start.
+        self._pose_corrective_run = self._run_tracker.begin_run(
+            mesh_name=self._current_mesh_name,
+            method="pose-corrective",
+            num_ellipsoids=len(bl.local_centers),
+            grid_n=int(grid_n),
+        )
+        self._pending_pose_visual = None
+        self._viewer.clear_ellipsoid_metrics()
+        self._pose_visual_timer.start()
         self._pose_corrective_worker.start()
         self._btn_fit.setEnabled(False)
         self._btn_stop.setEnabled(True)
         self._progress_begin("Pose correctives …")
         self._rig_panel.set_auto_pipeline_running(True)
+        self._morph_preview_timer.stop()
         self._status.showMessage(
             f"Pose correctives: training {len(training_poses)} pose key(s) "
             f"from {source_label}…")
 
     def _stop_pose_corrective_fit(self):
-        if (self._pose_corrective_worker is not None
-                and self._pose_corrective_worker.isRunning()):
-            self._pose_corrective_cancel_requested = True
-            self._pose_corrective_worker.request_stop(
-                "MainWindow._stop_pose_corrective_fit")
-            self._pose_corrective_worker.wait()
+        self._pose_visual_timer.stop()
+        self._pending_pose_visual = None
+        worker = self._pose_corrective_worker
+        # Retire before joining: any already queued callbacks must not update
+        # a subsequent model or training run.
         self._pose_corrective_worker = None
+        if worker is not None and worker.isRunning():
+            self._pose_corrective_cancel_requested = True
+            worker.request_stop(
+                "MainWindow._stop_pose_corrective_fit")
+            worker.wait()
+        if worker is not None:
+            self._rig_panel.set_auto_pipeline_running(False)
+            MainWindow._finish_pose_corrective_run(self)
+
+    def _finish_pose_corrective_run(self):
+        run = getattr(self, "_pose_corrective_run", None)
+        self._pose_corrective_run = None
+        if run is not None:
+            self._run_tracker.finish_run(run)
+
+    def _pose_corrective_event_is_current(self):
+        sender = getattr(self, "sender", lambda: None)()
+        return not isinstance(sender, PoseCorrectiveWorker) or sender is self._pose_corrective_worker
 
     def _pose_corrective_fit_kwargs(self) -> dict:
         """Optimizer settings for fixed-ID per-pose corrective fits."""
@@ -2729,9 +3173,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "merge_enabled",
         ):
             advanced.pop(key, None)
+        # GUI morph-pose fits have their own step budget; API jobs keep the
+        # per-request budget from ``_gather_fit_kwargs``.
+        num_steps = (int(fk["num_steps"]) if self._api_job_id is not None
+                     else int(self._rig_panel.morph_steps))
         advanced.update({
             "method": "adam",
-            "num_steps": int(fk["num_steps"]),
+            "num_steps": num_steps,
             "report_every": int(self._report_every),
             "lr_init": float(self._spin_lr_init.value()),
             "lr_final": float(self._spin_lr_final.value()),
@@ -2741,10 +3189,17 @@ class MainWindow(QtWidgets.QMainWindow):
             "soft_union": bool(fk.get("soft_union", False)),
             "primitive_shape": primitive_type,
         })
+        advanced.update(MainWindow._api_pose_fit_transform_flags(
+            self._settings,
+            self._api_options if self._api_job_id is not None else None))
         return self._optimizer_settings(advanced)
 
     def _on_corrective_pose_started(self, index: int, total: int, pose_name: str):
+        if not MainWindow._pose_corrective_event_is_current(self):
+            return
         self._rig_panel.set_progress(index, max(1, total))
+        # Each pose is a fresh fit; don't connect its curve to the previous one.
+        self._run_tracker.begin_segment()
         self._status.showMessage(
             f"Pose corrective {index + 1}/{total}: preparing {pose_name}…")
 
@@ -2761,15 +3216,25 @@ class MainWindow(QtWidgets.QMainWindow):
         pose,
     ):
         """Show the exact mesh/ellipsoid state this corrective is about to fit."""
-        self._viewer.show_mesh(vertices, faces)
+        if not MainWindow._pose_corrective_event_is_current(self):
+            return
+        # A queued target for the next pose supersedes any pending old frame.
+        self._pending_pose_visual = None
+        sync_pose = getattr(self._rig_panel, "show_training_pose", None)
+        if sync_pose is not None:
+            sync_pose(index, pose_name)
+        self._viewer.set_pose_fit_reference(
+            self._rig_panel.bone_local.local_radii)
+        self._viewer.show_mesh(self._apply_rotation(vertices), faces)
         rm = self._rig_panel.rigged_mesh
         if rm is not None:
             self._show_skeleton_for_pose(rm, pose)
         primitive_type = getattr(
             self._rig_panel.bone_local, "primitive_type", "ellipsoid")
         render_shape = self._shapes_by_id.get(primitive_type, self._shape)
+        preview_centers, preview_rotations = MainWindow._pose_preview_parameters(self, centers, rotations)
         render_shape.render(
-            self._viewer, centers, radii, rotations, shape_exponents)
+            self._viewer, preview_centers, radii, preview_rotations, shape_exponents)
         total = max(1, len(self._rig_panel.active_poses))
         if (self._api_job_id is not None
                 and self._api_stage == "correctives"
@@ -2793,6 +3258,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Pose corrective {index + 1}/{total}: target {pose_name}")
 
     def _on_corrective_sdf_progress(self, index: int, frac: float, label: str):
+        if not MainWindow._pose_corrective_event_is_current(self):
+            return
         total = max(1, len(self._rig_panel.active_poses))
         pose_base = float(index) / float(total)
         pct = (pose_base + 0.35 * float(np.clip(frac, 0.0, 1.0)) / total) * 100.0
@@ -2804,11 +3271,25 @@ class MainWindow(QtWidgets.QMainWindow):
         centers: np.ndarray, radii: np.ndarray, rotations: np.ndarray,
         shape_exponents: np.ndarray,
     ):
+        # Bound rendering cost even when small poses emit many frames per second.
+        if not MainWindow._pose_corrective_event_is_current(self):
+            return
+        self._pending_pose_visual = (
+            pose_index, step, loss, centers, radii, rotations, shape_exponents)
+
+    def _flush_pose_corrective_visual(self, force: bool = False):
+        pending = self._pending_pose_visual
+        if pending is None:
+            return
+        self._pending_pose_visual = None
+        pose_index, step, loss, centers, radii, rotations, shape_exponents = pending
         primitive_type = getattr(
             self._rig_panel.bone_local, "primitive_type", "ellipsoid")
         render_shape = self._shapes_by_id.get(primitive_type, self._shape)
-        render_shape.render(
-            self._viewer, centers, radii, rotations, shape_exponents)
+        if force or self._settings.get("pose_fit_live_preview", True):
+            preview_centers, preview_rotations = MainWindow._pose_preview_parameters(self, centers, rotations)
+            render_shape.render(
+                self._viewer, preview_centers, radii, preview_rotations, shape_exponents)
         total = getattr(self, "_opt_total_steps", 0)
         pose_total = max(1, len(self._rig_panel.active_poses))
         pose_index = max(0, min(pose_total - 1, int(pose_index)))
@@ -2843,20 +3324,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status.showMessage(
             f"Pose corrective — step {opt_step}/{total}  loss={opt_loss:.6f}"
         )
-        self._run_tracker.record_step(opt_step, opt_loss)
+        # Poses share one run; offset each pose so the step axis keeps advancing.
+        self._run_tracker.record_step(
+            pose_index * max(1, total) + opt_step, opt_loss)
 
     def _on_corrective_pose_finished(self, index: int, pose_name: str, loss: float):
+        if not MainWindow._pose_corrective_event_is_current(self):
+            return
+        self._flush_pose_corrective_visual(force=True)
         total = max(1, len(self._rig_panel.active_poses))
         self._rig_panel.set_progress(index + 1, total)
         self._status.showMessage(
             f"Pose corrective {index + 1}/{total} done: {pose_name} loss={loss:.6f}")
 
     def _on_pose_corrective_worker_failed(self, msg: str) -> None:
+        if not MainWindow._pose_corrective_event_is_current(self):
+            return
         self._pose_corrective_last_error = str(msg or "unknown error")
         self._status.showMessage(
             f"Pose correctives failed: {self._pose_corrective_last_error}")
 
+    def _restore_rig_preview(self):
+        """Restore the selected pose without scheduling another SDF job."""
+        previous = getattr(self, "_suppress_pose_sdf_recompute", False)
+        self._suppress_pose_sdf_recompute = True
+        try:
+            self._on_rig_pose_changed(self._rig_panel.current_pose_index)
+        finally:
+            self._suppress_pose_sdf_recompute = previous
+
     def _on_pose_corrective_worker_finished(self):
+        if not MainWindow._pose_corrective_event_is_current(self):
+            return
+        self._pose_visual_timer.stop()
+        self._flush_pose_corrective_visual(force=True)
+        MainWindow._finish_pose_corrective_run(self)
         canceled = (
             self._pose_corrective_cancel_requested
             or self._api_stage == "canceled"
@@ -2870,6 +3372,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if canceled:
             self._pose_corrective_worker = None
+            self._pose_corrective_last_error = None
+            MainWindow._restore_rig_preview(self)
             msg = (
                 self._pose_corrective_cancel_message
                 or "Pose corrective training stopped."
@@ -2882,6 +3386,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pose_corrective_last_error = None
         if worker_error:
             self._pose_corrective_worker = None
+            MainWindow._restore_rig_preview(self)
             msg = f"Pose correctives failed: {worker_error}"
             self._status.showMessage(msg)
             if (self._api_job_id is not None
@@ -2893,9 +3398,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pose_correctives = self._pose_corrective_worker.result
 
         n_keys = len(self._pose_correctives.keys) if self._pose_correctives else 0
+        self._morph_driver = None
+        self._rig_panel.set_morph_library_count(n_keys)
         self._pose_corrective_worker = None
         self._status.showMessage(
             f"Pose corrective training finished — {n_keys} pose key(s).")
+        if self._api_job_id is None and n_keys:
+            MainWindow._autosave_morph_fit(self)
 
         if (self._api_job_id is not None
                 and self._api_stage == "correctives"
@@ -3007,6 +3516,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 worker, generation, api_job_id):
             return
         try:
+            context = getattr(worker, "_native_fit_context", None)
+            if context is not None:
+                result._native_fit_context = context
             self._on_sdf_done(result, api_job_id)
         except Exception as exc:
             message = f"SDF result handling failed: {exc}"
@@ -3143,6 +3655,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     BLOWUP_CARRIER_MARGIN_VOXELS),
             )
             generation = self._next_worker_generation()
+            worker._native_fit_context = (getattr(self, "_native_sdf_context", None)
+                                          if api_job_id is None else None)
             self._sdf_worker = worker
             self._sdf_worker_generation = generation
             worker.progress.connect(
@@ -3336,6 +3850,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     lambda j=api_job_id:
                     MainWindow._api_start_fit_if_current(self, j),
                 )
+            elif getattr(self, "_pending_systematic_after_sdf", None) is not None:
+                QtCore.QTimer.singleShot(0, self._start_systematic_after_sdf)
             else:
                 QtCore.QTimer.singleShot(
                     250,
@@ -3398,11 +3914,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if any(getattr(self, name, None) is not None for name in (
                 "_sdf_worker", "_opt_worker", "_pose_corrective_worker",
-                "_region_sdf_worker", "_region_fit_worker", "_batched_worker")):
+                "_region_sdf_worker", "_region_fit_worker", "_batched_worker",
+                "_detail_zone_stage")):
             return
         self._progress_end()
 
     def _on_sdf_failed(self, msg: str) -> None:
+        if getattr(self, "_pending_systematic_after_sdf", None) is not None:
+            self._pending_systematic_after_sdf = None
+            self._rig_panel.set_auto_pipeline_running(False)
         canceled = str(msg).strip().lower() == SDF_CANCELED
         self._sdf_worker = None
         self._sdf_finalize_active = False
@@ -3452,6 +3972,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Persist the latest options-panel state before shutting down.
         self._save_panel_settings()
         self._save_workspace_layout()
+        self._morph_preview_timer.stop()
+        self._cancel_active_work(api_job_id=self._api_job_id, api_reason="Window closed")
         # Don't let a running SDF worker be destroyed mid-flight (crash risk).
         self._ensure_sdf_idle()
         super().closeEvent(event)
@@ -3510,9 +4032,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _start_full_object_fit(self) -> None:
         """Start the normal whole-mesh optimizer with the live fit settings."""
+        num, max_count = MainWindow._plan_detail_zones(self)
         self.start_optimization(
-            num_ellipsoids=self._spin_num_ellipsoids.value(),
-            max_ellipsoids=self._spin_max_ellipsoids.value(),
+            num_ellipsoids=num,
+            max_ellipsoids=max_count,
             bone_aware=(self._grp_rig.isVisible()
                         and self._chk_bone_aware.isChecked()
                         and self._bone_centers is not None),
@@ -3520,6 +4043,19 @@ class MainWindow(QtWidgets.QMainWindow):
             bone_expected_counts=self._bone_expected_counts,
             **self._gather_fit_kwargs(),
         )
+
+    def _plan_detail_zones(self) -> tuple[int, int]:
+        """Budget of the next full-object fit after reserving detail zones."""
+        num = self._spin_num_ellipsoids.value()
+        max_count = self._spin_max_ellipsoids.value()
+        self._detail_zone_plan_pending = None
+        try:
+            num, max_count, plan = detail_zone_stage.plan_full_fit(self, num, max_count)
+        except Exception as exc:          # zones are an optional refinement
+            print(f"[DetailZones] planning failed: {exc}")
+            return self._spin_num_ellipsoids.value(), self._spin_max_ellipsoids.value()
+        self._detail_zone_plan_pending = plan
+        return num, max_count
 
     def _effective_symmetry_enabled(self) -> bool:
         """Return the UI setting, unless an active API base fit overrides it."""
@@ -3564,6 +4100,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._opt_cancel_requested = True
         self._pending_pose_corrective_after_base_fit = False
+        self._pending_base_assign_after_fit = False
+        self._pending_systematic_after_sdf = None
         self._pose_corrective_cancel_message = (
             "API job canceled." if api_job_id is not None else "Stopped."
         )
@@ -3572,6 +4110,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._cancel_pending_pose_sdf()
         self._rig_panel.set_auto_pipeline_running(False)
+        # Detail zones: stop the zone stage and keep the global result.
+        self._detail_zone_plan_pending = None
+        self._detail_zone_plan = None
+        stage = getattr(self, "_detail_zone_stage", None)
+        self._detail_zone_stage = None
+        if stage is not None:
+            stage.cancel()
         # Cancel the bone-separation pipeline (controller + workers).
         if self._bonesep_ctl is not None:
             self._bonesep_ctl.cancel()
@@ -3614,6 +4159,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._progress_end()
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._btn_stop.setEnabled(False)
+        if self._rig_panel.is_active:
+            MainWindow._restore_rig_preview(self)
         if api_job_id is not None:
             if api_server is not None:
                 api_server.registry.complete_cancel(api_job_id, api_reason)
@@ -4008,7 +4555,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 bl = mapper.world_to_local(
                     centers, radii, rotations, bone_idx, pose=None)
                 self._rig_panel.set_bone_local(bl)
-                self._rig_panel._btn_assign.setEnabled(True)
             except Exception as e:
                 self._status.showMessage(
                     f"Bone Separation: local mapping failed: {e}")
@@ -4179,7 +4725,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "use_sparse_sdf", "thickness_max_resolution",
             "size_region_budget_enabled", "size_region_target_capacity",
             "size_region_min_capacity", "size_region_area_power",
-            "pose_fit_position", "pose_fit_rotation", "pose_fit_scale",
+            "pose_fit_position", "pose_fit_rotation", "pose_fit_scale", "pose_fit_exponents",
+            "pose_fit_live_preview", "pose_fit_color_changes",
+            "pose_fit_size_tolerance_pct", "pose_fit_color_span_pct", "pose_fit_growth_color",
+            "pose_fit_shrink_color", "pose_fit_neutral_color",
+            *detail_zone_stage.SETTING_KEYS,
         }
         ignored = sorted(
             key for key in src
@@ -4283,7 +4833,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.stop_optimization()
+        previous_stage = getattr(self, "_detail_zone_stage", None)
+        self._detail_zone_stage = None
+        if previous_stage is not None:
+            previous_stage.cancel()
+        # Only the fit that was planned right before this call owns the plan.
+        self._detail_zone_plan = getattr(self, "_detail_zone_plan_pending", None)
+        self._detail_zone_plan_pending = None
         self._current_sdf_mode = sdf_mode
+        self._fitted_primitive_rotation = (self._mesh_rotation if self._api_job_id is None
+                                           else (0.0, 0.0, 0.0))
+        self._fitted_primitive_context = getattr(self._last_mesh_result, "_native_fit_context", None)
+        if self._api_job_id is None and self._fitted_primitive_context is not None:
+            self._fitted_primitive_rotation = self._fitted_primitive_context[2]
+        if not (self._api_job_id is not None and self._api_fit_existing):
+            self._viewer.set_pose_fit_reference(None)
 
         advanced_settings = dict(advanced or {})
         use_sparse_sdf = bool(advanced_settings.pop("use_sparse_sdf", True))
@@ -4435,6 +4999,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self._api_batch_pipeline:
                 self._mesh_sdf_panel.set_sparse_samples(None)
                 self._viewer.set_sparse_samples(None)
+        zone_plan = getattr(self, "_detail_zone_plan", None)
+        if zone_plan is not None:
+            try:
+                target_grid, sparse_samples = detail_zone_stage.carve_global_target(
+                    zone_plan, target_grid, r.origin, float(r.dx), sparse_samples)
+            except Exception as exc:          # fall back to a plain fit
+                print(f"[DetailZones] disabled for this fit: {exc}")
+                zone_plan = None
+                self._detail_zone_plan = None
         worker_kwargs = dict(
             sdf_target_np=target_grid,
             sdf_samples=sparse_samples,
@@ -4542,7 +5115,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 getattr(self, "_active_ellipsoid_metric", "default"))
             self._opt_phase = "global"
             self._pending_visual = None
-            if not self._api_batch_pipeline:
+            if (not self._api_batch_pipeline
+                    or MainWindow._api_pose_live_preview_enabled(self)):
                 self._visual_timer.start()  # decouple GUI refresh from step rate
             for signal, slot in (
                 (worker.step_status, self._on_opt_step_status),
@@ -4588,6 +5162,14 @@ class MainWindow(QtWidgets.QMainWindow):
             # Start only after all callbacks and UI bookkeeping succeeded.  Any
             # synchronous exception before this line owns no live QThread.
             worker.start()
+            zone_plan = getattr(self, "_detail_zone_plan", None)
+            self._detail_zone_plan = None
+            if zone_plan is not None:
+                stage = detail_zone_stage.DetailZoneRun(self, zone_plan)
+                stage.finished.connect(
+                    lambda _merged: MainWindow._on_detail_zones_finished(self))
+                self._detail_zone_stage = stage
+                stage.start()
         except Exception:
             self._visual_timer.stop()
             if worker is not None and worker.isRunning():
@@ -4642,11 +5224,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 # explicitly instead of publishing a silently rounded SQ.
                 output_eps = None
             self._api_last = (centers, radii, rotations, output_eps)
-            if self._api_batch_pipeline:
-                # The optimizer result still has to be captured for correctness,
-                # but rendering it and building a world-space preview competes
-                # with short pose fits.  Scalar progress is emitted separately
-                # by ``step_status``, without a GPU array copy.
+            if (self._api_batch_pipeline
+                    and not getattr(self, "_api_fit_existing", False)):
+                # Base batch jobs retain their existing scalar-only path.
                 return
         self._pending_visual = (int(step), float(loss),
                                 centers, radii, rotations, eps)
@@ -4683,13 +5263,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 and self._api_stage in ("fit", "bonesep")):
             primitive_type = getattr(self, "_api_primitive_type", "ellipsoid")
             render_shape = self._shapes_by_id.get(primitive_type, self._shape)
-        render_shape.render(self._viewer, centers, radii, rotations, eps)
+        stage = getattr(self, "_detail_zone_stage", None)
+        if stage is not None and stage.active:
+            shown = stage.preview((centers, radii, rotations, eps))
+            render_shape.render(self._viewer, *shown)
+        else:
+            render_shape.render(self._viewer, centers, radii, rotations, eps)
         self._viewer.tick_op_gizmos(step)
         self._lbl_ell_count.setText(f"Count: {len(centers)}")
 
         # Keep ellipsoids reference for rig assignment.
         self._ellipsoids = EllipsoidSet(device=self._device)
         self._ellipsoids.set_parameters(centers, radii, rotations)
+        self._last_visual_shape = (
+            None if eps is None else np.asarray(eps, dtype=np.float32).copy())
+        if (self._api_job_id is None and self._rig_panel.bone_local is not None
+                and not self._region_fit_active and self._bonesep_ctl is None
+                and self._batched_worker is None):
+            # A new population replaces its old bone assignments and morphs.
+            self._rig_panel.set_bone_local(None)
+            self._pose_correctives = None
+            self._morph_driver = None
+            self._morph_preview_timer.stop()
+            MainWindow._sync_morph_curves(self)
         if primitive_type in ("ellipsoid", "superquadric"):
             self._fitted_primitive_type = primitive_type
             try:
@@ -4902,14 +5498,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_fit.setEnabled(self._last_mesh_result is not None)
         self._btn_stop.setEnabled(False)
 
-        # Enable bone assignment if rig mode is active
-        if self._rig_panel.is_active and self._ellipsoids is not None:
-            self._rig_panel._btn_assign.setEnabled(True)
-
         if canceled:
+            stage = getattr(self, "_detail_zone_stage", None)
+            self._detail_zone_stage = None
+            if stage is not None:
+                stage.cancel()
+            if (self._pending_pose_corrective_after_base_fit
+                    or getattr(self, "_pending_base_assign_after_fit", False)):
+                self._pending_pose_corrective_after_base_fit = False
+                self._pending_base_assign_after_fit = False
+                self._rig_panel.set_auto_pipeline_running(False)
             return
 
         if worker_error:
+            stage = getattr(self, "_detail_zone_stage", None)
+            self._detail_zone_stage = None
+            if stage is not None:
+                stage.cancel()
+            if (self._pending_pose_corrective_after_base_fit
+                    or getattr(self, "_pending_base_assign_after_fit", False)):
+                self._pending_pose_corrective_after_base_fit = False
+                self._pending_base_assign_after_fit = False
+                self._rig_panel.set_auto_pipeline_running(False)
             message = f"Optimization failed: {worker_error}"
             if self._api_job_id is not None and self._api_stage == "fit":
                 self._api_fail(self._api_job_id, message)
@@ -4917,11 +5527,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._status.showMessage(message)
             return
 
+        stage = getattr(self, "_detail_zone_stage", None)
+        if stage is not None and self._api_job_id is None:
+            # Zones were fitted in parallel; merge once all of them are done.
+            stage.on_global_finished()
+            return
+        MainWindow._finish_full_fit_followups(self)
+
+    def _on_detail_zones_finished(self) -> None:
+        """Zones merged (or skipped): continue exactly like a finished fit."""
+        self._detail_zone_stage = None
+        self._btn_fit.setEnabled(self._last_mesh_result is not None)
+        self._btn_stop.setEnabled(False)
+        MainWindow._finish_full_fit_followups(self)
+
+    def _finish_full_fit_followups(self) -> None:
+        """Bone assignment / morph fitting / API publishing after a full fit."""
+        assign_base = getattr(self, "_pending_base_assign_after_fit", False)
+        self._pending_base_assign_after_fit = False
         if self._pending_pose_corrective_after_base_fit:
             self._pending_pose_corrective_after_base_fit = False
+            self._rig_panel.set_auto_pipeline_running(False)
             if self._api_job_id is None and self._ensure_pose_corrective_base():
                 self._on_pose_corrective_fit_clicked(force_full_window=True)
                 return
+        elif assign_base:
+            self._rig_panel.set_auto_pipeline_running(False)
+            if self._api_job_id is None and self._ensure_pose_corrective_base():
+                self._status.showMessage(
+                    f"Base pose fitted: {self._rig_panel.bone_local.num_ellipsoids} "
+                    "primitives assigned to bones. Next: 2 · Fit Morph Poses.")
 
         # (Bone Separation no longer runs through the OptimizationWorker, so there
         # is nothing to bank here — it finishes via ``_on_batched_finished``.)
@@ -4985,6 +5620,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._api_progress_stage = None
         self._api_verts = None
         self._api_rig = None
+        self._api_rig_validation = None
         self._api_base_pose = None
         self._api_unity_pose_frames = False
 
@@ -5107,11 +5743,12 @@ class MainWindow(QtWidgets.QMainWindow):
         settings: dict | None,
         options: dict | None,
     ) -> dict[str, bool]:
-        """Resolve which primitive transforms a pose refit may optimize.
+        """Resolve which primitive parameters a pose refit may optimize.
 
         Persisted Settings supply the defaults.  Optional per-request values
         override them so a Unity batch can freeze its own choices for a run.
-        These flags are applied only to fixed-population ``/fit-pose`` jobs.
+        These flags apply to native pose correctives and fixed-population
+        ``/fit-pose`` jobs; the initial base fit remains unrestricted.
         """
         settings = settings or {}
         options = options or {}
@@ -5119,6 +5756,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("pose_fit_position", "optimize_centers"),
             ("pose_fit_rotation", "optimize_rotations"),
             ("pose_fit_scale", "optimize_radii"),
+            ("pose_fit_exponents", "optimize_shape_exponents"),
         )
         resolved = {}
         for option_name, worker_name in mapping:
@@ -5583,6 +6221,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return any((
             self._sdf_worker is not None,
             getattr(self, "_sdf_finalize_active", False),
+            getattr(self, "_pending_systematic_after_sdf", None) is not None,
+            getattr(self, "_pending_pose_corrective_after_base_fit", False),
+            getattr(self, "_pending_base_assign_after_fit", False),
+            getattr(getattr(self, "_rig_panel", None), "_pose_training_running", False),
             self._opt_worker is not None,
             self._pose_corrective_worker is not None,
             self._region_sdf_worker is not None,
@@ -5590,6 +6232,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._batched_worker is not None,
             self._bonesep_ctl is not None,
             self._region_fit_active,
+            getattr(self, "_detail_zone_stage", None) is not None,
         ))
 
     def _api_on_fit_requested(self, job_id: str) -> None:
@@ -5856,6 +6499,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._api_resolve_primitive_request(payload, api_options))
             verts = np.asarray(payload["vertices"], dtype=np.float32).reshape(-1, 3)
             faces = np.asarray(payload["faces"], dtype=np.int64).reshape(-1, 3)
+            rig_validation = validate_unity_rig_snapshot(payload.get("rig"), verts)
+            if rig_validation["status"] == "mismatch":
+                raise ValueError(rig_snapshot_error(rig_validation))
             mesh, transform = MainWindow._api_prepare_mesh_arrays(
                 self, verts, faces, batch_pose_request)
             nverts = mesh.vertices.view(np.ndarray)
@@ -5927,6 +6573,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._api_pose_corrective_source = str(
                 self._api_pose_corrective_source).strip() or None
         self._api_rig = payload.get("rig")
+        self._api_rig_validation = rig_validation
+        checked = [r for r in rig_validation["snapshots"] if r["status"] == "ok"]
+        max_error = max((r["maxError"] for r in checked), default=0.0)
+        print(f"[UnityRig] snapshot validation: {rig_validation['status']}, "
+              f"{len(checked)} checked, max error {max_error:.6g}")
         if rig_space_reason:
             delta_text = ", ".join(f"{float(v):.5g}" for v in rig_delta)
             print(f"[UnityRig] corrected rig/mesh space: {rig_space_reason}")
@@ -5950,6 +6601,9 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if fast_pose_batch:
                 self._set_api_batch_mesh(nverts, nfaces)
+                if MainWindow._api_pose_live_preview_enabled(self):
+                    self._viewer.show_mesh(nverts, nfaces)
+                    self._api_show_rig_bones(self._api_rig, transform)
             else:
                 self._set_base_mesh(nverts, nfaces)
                 # API jobs fit flat in the Python UI (the rig is only overlaid),
@@ -6067,7 +6721,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._api_fail(job_id, f"SDF worker start failed: {exc}")
 
     def _api_show_rig_bones(self, rig: dict | None, transform) -> None:
-        """Overlay the posted rig's bind-pose skeleton on the displayed mesh.
+        """Overlay the posted rig's current skeleton on the displayed mesh.
 
         The rig payload's bone positions are in the posted snapshot's original
         space (Unity world space for the Unity bridge); the viewport shows the
@@ -6080,16 +6734,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             skeleton = build_skeleton_from_bones(rig["bones"])
-            positions, _ = skeleton.compute_bone_positions_rotations(None)
-            positions = (np.asarray(positions, dtype=np.float64) - transform.center) \
-                * transform.scale
+            world = skeleton.compute_world_transforms(None)
+            positions = world[:, :3, 3]
+            positions = transform.to_normalized_point(positions)
             positions = positions.astype(np.float32)
             # The skeleton itself is flat (each bone a root, by design — see
             # rig_ingest); use the payload's parent indices only to draw the
             # connecting bone segments.
             parent_indices = np.array(
                 [int(b.get("parent", -1)) for b in rig["bones"]], dtype=np.int32)
-            self._viewer.show_bones(positions, parent_indices)
+            if all(b.get("matrix") is not None for b in rig["bones"]):
+                reference_world = np.asarray([
+                    b["matrix"] for b in rig["bones"]
+                ], dtype=np.float64).reshape(-1, 4, 4)
+                apply_humanoid_joint_limits(skeleton, reference_world=reference_world)
+            self._viewer.show_bones(
+                positions, parent_indices,
+                joint_rotations=joint_rotation_frames(world),
+                joint_names=[bone.name for bone in skeleton.bones],
+                joint_dofs=[bone.joint_dof for bone in skeleton.bones])
         except Exception as e:                       # malformed rig → skip overlay
             self._viewer.remove_skeleton()
             self._status.showMessage(f"API rig overlay skipped: {e}")
@@ -6126,18 +6789,12 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 rest_orig = np.asarray(
                     rig["restVertices"], dtype=np.float64).reshape(len(verts), 3)
-                rest_vertices = (
-                    (rest_orig - transform.center) * float(transform.scale)
-                ).astype(np.float32)
+                rest_vertices = transform.to_normalized_point(rest_orig).astype(np.float32)
             except Exception as e:
                 raise ValueError(f"bad Unity restVertices: {e}") from e
 
         def _normalized_matrix(raw) -> np.ndarray:
-            m = np.asarray(raw, dtype=np.float64).reshape(4, 4).copy()
-            m[:3, 3] = (
-                m[:3, 3] - np.asarray(transform.center, dtype=np.float64)
-            ) * float(transform.scale)
-            return m
+            return transform.to_normalized_bone_matrix(raw)
 
         def _normalized_matrix_from_payload(b: dict, key: str) -> np.ndarray | None:
             raw = b.get(key)
@@ -6150,7 +6807,9 @@ class MainWindow(QtWidgets.QMainWindow):
         parents: list[int] = []
         for i, b in enumerate(src_bones):
             parent = int(b.get("parent", -1))
-            if parent < 0 or parent >= len(src_bones):
+            if parent < 0 or parent >= len(src_bones) or parent == i:
+                # Legacy Unity exports could accidentally point a root at
+                # itself. Deriving inv(world) @ world would erase its origin.
                 parent = -1
             parents.append(parent)
 
@@ -6161,7 +6820,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 scale = np.asarray(
                     b.get("scale", [1.0, 1.0, 1.0]), dtype=np.float64,
                 ).reshape(3)
-                pos_norm = (pos - transform.center) * float(transform.scale)
+                pos_norm = transform.to_normalized_point(pos)
                 bind_world = mat4_compose(pos_norm, rot, scale)
             world_norm.append(bind_world)
 
@@ -6226,16 +6885,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     raw_vertices, dtype=np.float64).reshape(len(verts), 3)
             except Exception as e:
                 raise ValueError(f"bad Unity poseFrames[{fi}]: {e}") from e
-            verts_norm = (
-                (verts_orig - transform.center) * float(transform.scale)
-            ).astype(np.float32)
+            verts_norm = transform.to_normalized_point(verts_orig).astype(np.float32)
             pose_name = str(frame.get("name") or f"Unity Pose {fi:02d}")
             unity_poses.append(_pose_from_world_mats(pose_name, mats_norm))
             unity_pose_vertices.append(verts_norm)
 
         if unity_poses:
-            current_pose = unity_poses[0]
-            self._api_base_pose = current_pose
+            # Pose-library frames are separate targets. The displayed mesh is
+            # the current snapshot and must use bones[].currentMatrix.
             self._api_unity_pose_frames = True
 
         rigged = RiggedMesh(
@@ -6274,8 +6931,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rig_panel.setChecked(True)
         self._rig_panel.blockSignals(True)
         self._rig_panel.set_rigged_mesh(rigged)
-        if self._api_unity_pose_frames:
-            self._rig_panel.select_source("native")
+        # The GUI always previews joint ranges; API jobs default to the mesh's
+        # own (Unity) poses unless the request names another source.
+        self._rig_panel.select_source("native")
         self._rig_panel.blockSignals(False)
         self._grp_rig.setVisible(True)
         self._mesh_settings.set_region_available(True)
@@ -6317,6 +6975,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not c:
             return
         verts, faces = c["verts"], c["faces"]
+        self._prepare_model_change()
         self._set_base_mesh(verts, faces)
         self._viewer.show_mesh(verts, faces)
         self._ensure_sdf_idle()
@@ -6403,6 +7062,12 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._on_fit_clicked()
 
+    def _api_pose_live_preview_enabled(self) -> bool:
+        """Whether the current Unity pose fit should update the scene live."""
+        return (bool(getattr(self, "_api_fit_existing", False))
+                and bool((getattr(self, "_settings", {}) or {}).get(
+                    "pose_fit_live_preview", True)))
+
     def _api_start_existing_ellipsoid_fit(self) -> None:
         """Fit the Unity-posted ellipsoid IDs to the current Unity pose mesh."""
         if self._api_initial_ellipsoids is None:
@@ -6460,10 +7125,8 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         parameter_options = dict(parameter_options or {})
         parameter_options.update(transform_flags)
-        if self._api_batch_pipeline:
-            # Keep validation/checkpoint cadence unchanged, but avoid copying
-            # every ellipsoid array back to the GUI at each reporting step.
-            parameter_options["emit_intermediate_progress"] = False
+        parameter_options["emit_intermediate_progress"] = (
+            MainWindow._api_pose_live_preview_enabled(self))
         self._api_last = (
             np.asarray(centers, dtype=np.float32).copy(),
             np.asarray(radii, dtype=np.float32).copy(),
@@ -6471,6 +7134,11 @@ class MainWindow(QtWidgets.QMainWindow):
             np.asarray(shape_exponents, dtype=np.float32).copy(),
         )
         self._api_stage = "fit"
+        self._viewer.set_pose_fit_reference(radii)
+        self._viewer.clear_ellipsoid_metrics()
+        render_shape = self._shapes_by_id.get(self._api_primitive_type, self._shape)
+        render_shape.render(
+            self._viewer, centers, radii, rotations, shape_exponents)
         self.start_optimization(
             num_ellipsoids=int(len(fit_centers)),
             max_ellipsoids=int(len(fit_centers)),
@@ -6765,6 +7433,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "count": len(entries),
             "ellipsoids": entries,
         }
+        validation = getattr(self, "_api_rig_validation", None)
+        if validation is not None:
+            result["snapshot_validation"] = validation
         if self._api_fit_existing:
             result["fit_mode"] = "fit_pose"
         else:

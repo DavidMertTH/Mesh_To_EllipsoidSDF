@@ -21,7 +21,7 @@ from bone_ellipsoid_mapper import (  # noqa: E402
 from pose_correctives import (  # noqa: E402
     PoseCorrectiveLibrary,
     PoseCorrectiveWorker,
-    _blend_local_seed,
+    _gather_local_seed,
     corrective_from_optimized_local,
 )
 from skeleton import Bone, Pose, Skeleton, mat4_compose  # noqa: E402
@@ -99,12 +99,17 @@ class PoseCorrectiveSuperquadricTest(unittest.TestCase):
             atol=1.0e-6,
         )
 
-    def test_seed_blends_exponents_in_log_space(self) -> None:
-        base = _local([[0.25, 0.5]])
-        neighbor = _local([[1.0, 2.0]])
-        blended = _blend_local_seed(base, neighbor, 0.5)
-        np.testing.assert_allclose(blended.shape_exponents, [[0.5, 1.0]])
-        self.assertEqual(blended.primitive_type, "superquadric")
+    def test_seed_takes_each_primitive_from_its_chosen_pose(self) -> None:
+        base = _local([[0.25, 0.5], [0.3, 0.6]])
+        fitted = _local([[1.0, 2.0], [1.5, 1.8]])
+        fitted.local_centers += 1.0
+        seed = _gather_local_seed(base, [base, fitted], np.array([1, 0]))
+        np.testing.assert_allclose(seed.shape_exponents, [[1.0, 2.0], [0.3, 0.6]])
+        np.testing.assert_allclose(seed.local_centers, [[1.0, 1.0, 1.0], [0.1, 0.0, 0.0]])
+        self.assertEqual(seed.primitive_type, "superquadric")
+        with self.assertRaisesRegex(ValueError, "different primitive types"):
+            _gather_local_seed(base, [_local([[1.0, 1.0]] * 2, primitive_type="ellipsoid")],
+                               np.zeros(2, dtype=int))
 
     def test_worker_passes_per_primitive_initial_eps(self) -> None:
         base = _local([[0.35, 0.55], [1.4, 1.8]])
@@ -133,8 +138,6 @@ class PoseCorrectiveSuperquadricTest(unittest.TestCase):
             np.tile(
                 np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
                 (count, 1)),
-            None,
-            0.0,
         )
         self.assertEqual(kwargs["primitive_shape"], "superquadric")
         np.testing.assert_allclose(kwargs["initial_eps"], base.shape_exponents)
@@ -150,8 +153,6 @@ class PoseCorrectiveSuperquadricTest(unittest.TestCase):
                 np.tile(
                     np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
                     (count, 1)),
-                None,
-                0.0,
             )
 
     def test_real_worker_keeps_sq_state_through_one_pose_fit(self) -> None:

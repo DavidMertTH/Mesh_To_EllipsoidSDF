@@ -165,6 +165,8 @@ def run_case(mesh_name: str, clip_name: str, pose_count: int = 3) -> None:
         assert np.isfinite(key.delta_rotations).all()
         assert np.isfinite(key.delta_log_radii).all()
         assert np.isfinite(key.delta_log_shape_exponents).all()
+        # Fits chain from the most similar fitted pose, but every key stays
+        # inside the base's trust region.
         center_limits = 1.75 * np.max(base.local_radii, axis=1)
         assert np.all(np.linalg.norm(key.delta_centers, axis=1) <= center_limits + 2e-5)
         assert np.max(np.abs(key.delta_log_radii)) <= np.log(2.5) + 2e-5

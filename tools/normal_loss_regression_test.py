@@ -695,6 +695,88 @@ class NormalLossRegressionTest(unittest.TestCase):
         self.assertTrue(np.isfinite([loss for _step, loss in reported]).all())
         self.assertTrue(np.isfinite(worker.best_validation_loss))
 
+    def test_reported_loss_ignores_normal_warmup_schedule(self) -> None:
+        """The live curve must not climb just because the normal ramp runs."""
+        n = 4
+        dx = 0.5
+        origin = np.full(3, -1.0, dtype=np.float32)
+        coords = origin[0] + (
+            np.arange(n, dtype=np.float32) + np.float32(0.5)) * dx
+        z, y, x = np.meshgrid(coords, coords, coords, indexing="ij")
+        dense = (np.sqrt(x * x + y * y + z * z) - 0.5).astype(np.float32)
+        points = np.array([
+            [0.5, 0.0, 0.0],
+            [-0.5, 0.0, 0.0],
+            [0.0, 0.5, 0.0],
+            [0.0, -0.5, 0.0],
+            [0.0, 0.0, 0.5],
+            [0.0, 0.0, -0.5],
+        ], dtype=np.float32)
+        samples = SdfSampleSet(
+            points=points,
+            values=np.zeros(len(points), dtype=np.float32),
+            # Perpendicular to the true normals → a clearly non-zero term.
+            normals=np.roll(points / 0.5, 1, axis=1),
+            thickness=np.full(len(points), 1.0, dtype=np.float32),
+            coarse_mask=np.zeros(len(points), dtype=np.bool_),
+            dx=dx,
+            source="normal-report-schedule",
+        )
+
+        def reported_losses(**normal_settings) -> list[float]:
+            worker = OptimizationWorker(
+                sdf_target_np=dense,
+                sdf_samples=samples,
+                origin=origin,
+                dx=dx,
+                n=n,
+                num_ellipsoids=1,
+                num_steps=3,
+                report_every=1,
+                sample_budget=len(points),
+                maintenance_every=0,
+                containment_weight=0.0,
+                flat_weight=0.0,
+                superfit=False,
+                local_fit=False,
+                validation_patience=None,
+                use_best_validation_result=False,
+                # Frozen parameters: every difference comes from reporting.
+                lr_init=0.0,
+                lr_final=0.0,
+                initial_centers=np.zeros((1, 3), dtype=np.float32),
+                initial_radii=np.array([[0.6, 0.4, 0.5]], dtype=np.float32),
+                initial_rotations=np.array(
+                    [[0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
+                **normal_settings,
+            )
+            worker._rng = np.random.default_rng(7)
+            reported: list[float] = []
+            worker.step_status.connect(
+                lambda _step, loss: reported.append(float(loss)))
+            previous_device = optimization_module.device
+            optimization_module.device = DEVICE
+            try:
+                worker._reset_stale_tape()
+                worker._run_adam()
+            finally:
+                optimization_module.device = previous_device
+            return reported
+
+        # Steps 0 and 1 lie inside the warm-up, so their gradient ignores the
+        # normal term — the reported value must still include it in full.
+        warming_up = reported_losses(
+            normal_loss_weight=1.0, normal_warmup_frac=0.9,
+            normal_ramp_frac=0.0)
+        always_on = reported_losses(
+            normal_loss_weight=1.0, normal_warmup_frac=0.0,
+            normal_ramp_frac=0.0)
+        without = reported_losses(normal_loss_weight=0.0)
+
+        self.assertEqual(len(warming_up), 3)
+        np.testing.assert_allclose(warming_up, always_on, rtol=1.0e-5)
+        self.assertTrue(np.all(np.asarray(warming_up) > np.asarray(without)))
+
     def test_disabled_normal_loss_skips_dense_normals_and_work_buffers(self) -> None:
         n = 3
         dx = 0.5

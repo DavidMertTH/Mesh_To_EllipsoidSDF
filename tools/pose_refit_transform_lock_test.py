@@ -179,6 +179,28 @@ class PoseRefitTransformLockTest(unittest.TestCase):
         np.testing.assert_allclose(rotations, INITIAL_ROTATION,
                                    rtol=1.0e-6, atol=1.0e-6)
 
+    def test_disabled_exponents_preserve_each_row_and_exact_bounds_in_all_modes(self) -> None:
+        from tools.superquadric_state_regression_test import _worker
+        eps = np.array([[.1, 2.], [.4, 1.6]], dtype=np.float32)
+        for mode in ("per_primitive", "shared", "fixed"):
+            with self.subTest(mode=mode):
+                worker = _worker(primitive_shape="superquadric", num_ellipsoids=2,
+                    initial_centers=np.repeat(INITIAL_CENTER, 2, axis=0),
+                    initial_radii=np.repeat(INITIAL_RADII, 2, axis=0),
+                    initial_rotations=np.repeat(INITIAL_ROTATION, 2, axis=0),
+                    initial_eps=eps, optimize_shape_exponents=False,
+                    sq_eps_mode=mode, sq_unlock_frac=0, num_steps=4,
+                    validation_patience=None, superfit=False)
+                snapshots, failures = [], []
+                worker.step_visual.connect(lambda *_args: snapshots.append(np.asarray(_args[-1]).copy()))
+                worker.failed.connect(failures.append)
+                worker.run()
+                self.assertEqual(failures, [])
+                self.assertTrue(snapshots)
+                self.assertFalse(worker._eps_is_trainable(3))
+                for snapshot in snapshots:
+                    np.testing.assert_array_equal(snapshot, eps)
+
     def test_sgd_fallback_honors_zero_center_lr_multiplier(self) -> None:
         centers, radii, rotations = _run_fit(
             method="sgd", lr_mult_centers=0.0)

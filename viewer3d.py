@@ -6,9 +6,9 @@ Hierarchy:
   ViewportOverlay   – floating in-viewport menu: per-element display toggles
                       + render-mode selector (wireframe / transparent / lighting)
   SceneViewer3D     – one GL scene holding the mesh, skeleton bones and the
-                      fitted ellipsoids together.  Ellipsoids are drawn as a
-                      single concatenated GLMeshItem built from a precomputed
-                      unit icosphere (scale → rotate → translate on CPU).
+                      fitted primitives together.  Primitives are drawn as
+                      instances of one unit icosphere; the vertex shader
+                      builds each surface (see ``primitive_gpu``).
 
 Render modes are applied uniformly to the mesh and ellipsoids; visibility of
 each element is toggled independently via the overlay.
@@ -25,9 +25,12 @@ import pyqtgraph.opengl as gl
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import theme
+import app_settings
 import raymarch
 import sdf_slice as slice_module
 from widgets import DropGLView
+from joint_view import JointOverlay
+import primitive_gpu
 
 
 # ── Ellipsoid colour ──────────────────────────────────────────────────────────
@@ -41,6 +44,54 @@ _ELLIPSOID_ALPHA = 179 / 255.0
 def ellipsoid_color() -> np.ndarray:
     """Current ellipsoid RGBA (brand secondary colour from ``theme``)."""
     return theme.rgba_array(theme.YELLOW, _ELLIPSOID_ALPHA)
+
+
+def pose_fit_size_colors(radii, base_radii, settings: dict) -> Optional[np.ndarray]:
+    """Continuously tint fixed IDs by the displayed volume's change from base."""
+    if base_radii is None or not settings.get("pose_fit_color_changes", True):
+        return None
+    r = np.asarray(radii, dtype=np.float64)
+    base = np.asarray(base_radii, dtype=np.float64)
+    if r.shape != base.shape or r.ndim != 2 or r.shape[1] != 3:
+        return None
+    defaults = app_settings.defaults()
+
+    def rgba(key):
+        color = QtGui.QColor(str(settings.get(key, defaults[key])))
+        if not color.isValid():
+            color = QtGui.QColor(defaults[key])
+        return np.array([color.redF(), color.greenF(), color.blueF(),
+                         _ELLIPSOID_ALPHA], dtype=np.float32)
+
+    colors = np.tile(rgba("pose_fit_neutral_color"), (len(r), 1))
+    valid = (np.isfinite(r).all(axis=1) & np.isfinite(base).all(axis=1)
+             & (r > 0.0).all(axis=1) & (base > 0.0).all(axis=1))
+    # The constant 4*pi/3 cancels. Log ratios remain stable even for tiny radii.
+    log_ratio = np.zeros(len(r), dtype=np.float64)
+    log_ratio[valid] = np.sum(np.log(r[valid]) - np.log(base[valid]), axis=1)
+    try:
+        tolerance = float(settings.get("pose_fit_size_tolerance_pct", 1.0)) / 100.0
+        if not np.isfinite(tolerance):
+            raise ValueError("invalid tolerance")
+        tolerance = np.clip(tolerance, 0.0, 1.0)
+    except (TypeError, ValueError):
+        tolerance = 0.01
+    try:
+        span = float(settings.get("pose_fit_color_span_pct", 25.0)) / 100.0
+        if not np.isfinite(span) or span <= 0:
+            raise ValueError("invalid color transition span")
+        span = np.clip(span, 0.001, 10.0)
+    except (TypeError, ValueError):
+        span = 0.25
+    # Cap large growth before exponentiation: colours are already saturated
+    # beyond this volume ratio, and even extreme finite radii remain safe.
+    change = np.expm1(np.minimum(log_ratio, np.log1p(tolerance + span)))
+    weight = np.clip((np.abs(change) - tolerance) / span, 0.0, 1.0)
+    weight[~valid | (np.abs(change) <= tolerance + 1e-7)] = 0.0
+    targets = np.where((change >= 0)[:, None], rgba("pose_fit_growth_color"),
+                       rgba("pose_fit_shrink_color"))
+    colors += weight[:, None] * (targets - colors)
+    return colors
 
 
 def _ellipsoid_metric_heatmap(values: np.ndarray, alpha: float = _ELLIPSOID_ALPHA) -> np.ndarray:
@@ -95,6 +146,9 @@ def _make_unit_icosphere(subdivisions: int = 3):
 _UNIT_VERTS, _UNIT_FACES = _make_unit_icosphere(3)
 _UNIT_N_VERTS = _UNIT_VERTS.shape[0]
 _UNIT_N_FACES = _UNIT_FACES.shape[0]
+_UNIT_EDGES = np.unique(np.sort(np.concatenate([
+    _UNIT_FACES[:, [0, 1]], _UNIT_FACES[:, [1, 2]], _UNIT_FACES[:, [2, 0]],
+]), axis=1), axis=0)
 
 
 def superquadric_unit_verts(e1: float, e2: float) -> np.ndarray:
@@ -228,29 +282,6 @@ def build_concatenated_mesh(
         all_face_colors[fs:fs + F] = c
 
     return all_verts, all_faces, all_face_colors
-
-
-def ellipsoid_vertex_normals(radii: np.ndarray,
-                             rotations: np.ndarray) -> np.ndarray:
-    """Analytic per-vertex surface normals for N ellipsoids → ``(N·V, 3)``.
-
-    For a scaled+rotated unit sphere the surface normal at icosphere vertex ``u``
-    (which is also the unit-sphere normal) is ``normalize(R · (u / radii))`` — the
-    inverse-transpose of the scaling.  This is far cheaper than pyqtgraph's
-    per-vertex Python loop (it recomputes face + vertex normals on every update),
-    which is what makes the lighting render mode crawl during live fitting.
-    """
-    n_ell = len(radii)
-    V = _UNIT_N_VERTS
-    out = np.empty((n_ell * V, 3), dtype=np.float32)
-    u = _UNIT_VERTS                                   # (V,3) unit normals
-    for i in range(n_ell):
-        R = _quat_to_rotation_matrix(rotations[i])
-        inv_r = 1.0 / np.maximum(np.abs(radii[i]), 1e-9)
-        n = (u * inv_r) @ R.T                         # (V,3)
-        n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
-        out[i * V:(i + 1) * V] = n
-    return out
 
 
 # ── Thickness colour mapping ────────────────────────────────────────────────--
@@ -845,12 +876,12 @@ class ViewportOverlay(QtWidgets.QFrame):
 
     Mesh and ellipsoids each get a visibility checkbox and their own render-mode
     dropdown.  The mesh dropdown additionally offers a "Dicke" (thickness
-    heatmap) mode.  The skeleton has a checkbox only, shown only when a skeleton
-    is present (see :meth:`set_skeleton_available`).
+    heatmap) mode. Skeleton lines and joints have independent checkboxes,
+    shown when a skeleton is present (see :meth:`set_skeleton_available`).
 
     Signals
     -------
-    visibilityChanged(str, bool)   — (key, on) for keys: mesh, skeleton, ellipsoids
+    visibilityChanged(str, bool)   — (key, on), including mesh, skeleton, joints
     renderModeChanged(str, str)    — (target, mode); target ∈ {mesh, ellipsoids},
                                      mode is one of the RENDER_* constants
     """
@@ -920,6 +951,7 @@ class ViewportOverlay(QtWidgets.QFrame):
         rows = (
             ("mesh", "Mesh", True),
             ("skeleton", "Skeleton", False),
+            ("joints", "Joint", False),
             ("ellipsoids", "Ellipsoids", True),
             ("operations", "Operations", False),
             ("analysis", "Analysis", False),
@@ -958,6 +990,9 @@ class ViewportOverlay(QtWidgets.QFrame):
             "  pink = bridging (spans a gap between structures)")
 
         # No skeleton until one is loaded.
+        self._checks["joints"].setToolTip(
+            "Show joints independently of the skeleton. Hover to preview local\n"
+            "rotational degrees of freedom; click to rotate or edit angle limits.")
         self.set_skeleton_available(False)
 
         # ── raymarch blend (only shown in the Raymarch ellipsoid mode) ──
@@ -1121,10 +1156,9 @@ class ViewportOverlay(QtWidgets.QFrame):
         )
 
     def set_skeleton_available(self, available: bool) -> None:
-        """Show the skeleton checkbox only when a skeleton actually exists."""
-        cb = self._checks.get("skeleton")
-        if cb is not None:
-            cb.setVisible(available)
+        """Show skeleton and joint controls only when a skeleton exists."""
+        for key in ("skeleton", "joints"):
+            self._checks[key].setVisible(available)
 
     def is_checked(self, key: str) -> bool:
         cb = self._checks.get(key)
@@ -1159,7 +1193,6 @@ class SceneViewer3D(_BaseViewer):
     # the GL items render with translucent (not additive) blending so the
     # colours stay true instead of washing out to white on a light background.
     BONE_COLOR = (0.90, 0.20, 0.20, 1.0)    # warm red bones
-    JOINT_COLOR = (1.0, 0.45, 0.0, 1.0)     # vivid orange joints
 
     def __init__(self):
         super().__init__()
@@ -1180,6 +1213,8 @@ class SceneViewer3D(_BaseViewer):
         self._ell_base_colors: Optional[np.ndarray] = None
         self._ell_metric_mode = "default"
         self._ell_metric_values: dict[str, np.ndarray] = {}
+        self._pose_fit_base_radii: Optional[np.ndarray] = None
+        self._pose_fit_color_settings: dict = {}
         self._slice_data_changed_callbacks: list = []
 
         self._bone_positions: Optional[np.ndarray] = None
@@ -1200,7 +1235,7 @@ class SceneViewer3D(_BaseViewer):
 
         # ── GL items ──
         self._mesh_item: Optional[gl.GLMeshItem] = None
-        self._ell_item: Optional[gl.GLMeshItem] = None
+        self._ell_item: Optional[primitive_gpu.PrimitiveInstancesItem] = None
         self._slice_item: Optional[gl.GLImageItem] = None
         self._slice_sparse_item: Optional[gl.GLScatterPlotItem] = None
         self._sparse_sample_points: Optional[np.ndarray] = None
@@ -1216,7 +1251,6 @@ class SceneViewer3D(_BaseViewer):
         # Render primitive kind ("capsule" builds capsule meshes), or None.
         self._ell_primitive: Optional[str] = None
         self._bone_line_item: Optional[gl.GLLinePlotItem] = None
-        self._joint_item: Optional[gl.GLScatterPlotItem] = None
         self._region_item: Optional[gl.GLLinePlotItem] = None
         # Exploded per-bone region preview (Bone-Separation verification).
         self._region_preview_item: Optional[gl.GLMeshItem] = None
@@ -1232,12 +1266,13 @@ class SceneViewer3D(_BaseViewer):
         self._op_gizmo_life = 50
 
         # ── densify analysis overlay (transparent spheres, current snapshot) ──
-        self._analysis_item: Optional[gl.GLMeshItem] = None
+        self._analysis_item: Optional[primitive_gpu.PrimitiveInstancesItem] = None
         self._analysis_regions: dict = {}
 
         # ── display flags ──
         self._show_mesh = True
         self._show_skeleton = True
+        self._show_joints = True
         self._show_ellipsoids = True
         self._show_op_gizmos = True
         self._show_analysis = True
@@ -1273,6 +1308,16 @@ class SceneViewer3D(_BaseViewer):
         # the rest of the GL scene composites through.  A poll timer re-renders
         # whenever the camera or viewport size changes.
         self._build_raymarch_overlay()
+
+        # Paint joints above both GL surfaces and the raymarch image. The
+        # mouse-transparent layer shares its projection with joint picking.
+        self._joint_overlay = JointOverlay(self._view)
+        self._view.add_corner_widget(self._joint_overlay, corner="fill", margin=0)
+        self._view.add_corner_widget(self._joint_overlay.editor, corner="br", margin=52)
+        self._joint_overlay.set_enabled(False)
+        self._joint_overlay.editor.hide()
+        for widget in (self._overlay, self._slice_error_legend, self._slice_slider_frame):
+            widget.raise_()
 
     def _build_raymarch_overlay(self) -> None:
         self._rm_label = QtWidgets.QLabel()
@@ -1398,6 +1443,7 @@ class SceneViewer3D(_BaseViewer):
         """
         self._view.setBackgroundColor(theme.bg((0, 0, 0)))
         self._overlay.apply_theme()
+        self._joint_overlay.editor.apply_theme()
         self._slice_error_legend.apply_theme()
         self._style_slice_slider()
         self._rebuild_mesh()
@@ -1418,9 +1464,11 @@ class SceneViewer3D(_BaseViewer):
             self._set_region_budget_labels_visible()
         elif key == "skeleton":
             self._show_skeleton = on
-            for it in (self._bone_line_item, self._joint_item):
-                if it is not None:
-                    it.setVisible(on)
+            if self._bone_line_item is not None:
+                self._bone_line_item.setVisible(on)
+        elif key == "joints":
+            self._show_joints = on
+            self._joint_overlay.set_enabled(on)
         elif key == "ellipsoids":
             self._show_ellipsoids = on
             if self._ell_item is not None:
@@ -1565,7 +1613,7 @@ class SceneViewer3D(_BaseViewer):
         if self._rm_dirty:
             try:
                 self._rm.update(self._ell_centers, self._ell_radii,
-                                self._ell_rotations)
+                                self._ell_rotations, colors=self._ell_colors)
             except Exception:
                 return
             self._rm_dirty = False
@@ -1850,6 +1898,7 @@ class SceneViewer3D(_BaseViewer):
 
     def clear_ellipsoids(self) -> None:
         self._ell_centers = None
+        self._pose_fit_base_radii = None
         self._ell_base_colors = None
         self._ell_colors = None
         self._rm_dirty = True
@@ -1902,14 +1951,36 @@ class SceneViewer3D(_BaseViewer):
     def _apply_ellipsoid_metric_colors(self) -> None:
         mode = getattr(self, "_ell_metric_mode", "default")
         n = 0 if self._ell_centers is None else len(self._ell_centers)
+        base_colors = self._ell_base_colors
+        if n:
+            pose_colors = pose_fit_size_colors(
+                self._ell_radii, getattr(self, "_pose_fit_base_radii", None),
+                getattr(self, "_pose_fit_color_settings", {}))
+            if pose_colors is not None:
+                base_colors = pose_colors
         if mode == "default" or n == 0:
-            self._ell_colors = self._ell_base_colors
+            self._ell_colors = base_colors
             return
         values = self._ell_metric_values.get(mode)
         if values is None or len(values) != n:
-            self._ell_colors = self._ell_base_colors
+            self._ell_colors = base_colors
             return
         self._ell_colors = _ellipsoid_metric_heatmap(values)
+
+    def configure_pose_fit_colors(self, settings: dict) -> None:
+        """Apply appearance settings immediately to the displayed pose."""
+        self._pose_fit_color_settings = dict(settings)
+        self._apply_ellipsoid_metric_colors()
+        self._rm_dirty = True
+        if self._ell_centers is not None:
+            self._rebuild_ellipsoids()
+
+    def set_pose_fit_reference(self, radii: Optional[np.ndarray]) -> None:
+        """Set the immutable base for the next fixed-population pose preview."""
+        self._pose_fit_base_radii = (
+            None if radii is None else np.asarray(radii, dtype=np.float32).copy())
+        self._apply_ellipsoid_metric_colors()
+        self._rm_dirty = True
 
     def _align_stored_ellipsoid_population(self) -> None:
         """Repair a stale partial population before any rendering path uses it."""
@@ -1961,108 +2032,94 @@ class SceneViewer3D(_BaseViewer):
                 self._ell_item_mode = None
             return
 
-        verts, faces, face_colors = build_concatenated_mesh(
+        # The surfaces are built by the vertex shader from one instance row per
+        # primitive, so an update only replaces that small buffer.  One item
+        # serves every render mode.
+        mode = self._ell_render_mode
+        alpha = (_WIRE_ALPHA if mode == RENDER_WIREFRAME
+                 else _ell_alpha_for_mode(mode))
+        instances = primitive_gpu.instance_data(
             self._ell_centers, self._ell_radii, self._ell_rotations,
-            self._ell_colors,
-            sq_eps=getattr(self, "_ell_sq_eps", None),
-            sq_bend=getattr(self, "_ell_sq_bend", None),
-            primitive=getattr(self, "_ell_primitive", None),
+            self._ell_colors, default_color=ellipsoid_color(), alpha=alpha,
+            eps=getattr(self, "_ell_sq_eps", None),
+            bend=getattr(self, "_ell_sq_bend", None),
         )
-        if verts.shape[0] == 0:
-            if self._ell_item is not None:
-                self._view.removeItem(self._ell_item)
-                self._ell_item = None
-                self._ell_item_mode = None
-            return
-
-        # Fast path: same render mode → update the existing item's mesh data in
-        # place.  Recreating the GLMeshItem (new GL buffers) every fit step is
-        # what made live fitting crawl.
-        if self._ell_item is not None and self._ell_item_mode == self._ell_render_mode:
-            fc = face_colors.astype(np.float32, copy=True)
-            fc[:, 3] = _ell_alpha_for_mode(self._ell_render_mode)
-            md = gl.MeshData(vertexes=verts, faces=faces, faceColors=fc)
-            if self._ell_render_mode in (RENDER_LIGHTING, RENDER_THICKNESS):
-                # Inject precomputed normals so pyqtgraph skips its per-vertex
-                # Python normal loop (the reason lighting crawled while fitting).
-                md._vertexNormals = self._smooth_vertex_normals(verts, faces)
-            self._ell_item.setMeshData(meshdata=md)
-            self._ell_item.setVisible(self._show_ellipsoids)
-            return
-
-        # Slow path: (re)create the item for a new render mode.
-        if self._ell_item is not None:
-            self._view.removeItem(self._ell_item)
-            self._ell_item = None
-        self._ell_item = _build_mesh_item(
-            verts, faces, self._ell_render_mode,
-            face_colors=face_colors, cull=True,
-        )
-        if self._ell_render_mode in (RENDER_LIGHTING, RENDER_THICKNESS):
-            md = self._ell_item.opts.get("meshdata")
-            if md is not None:
-                md._vertexNormals = self._smooth_vertex_normals(verts, faces)
-                self._ell_item.meshDataChanged()
-        self._ell_item_mode = self._ell_render_mode
-        self._ell_item.setVisible(self._show_ellipsoids)
-        self._view.addItem(self._ell_item)
-
-    def _smooth_vertex_normals(self, verts: np.ndarray,
-                               faces: np.ndarray) -> np.ndarray:
-        """Per-vertex normals for the smooth (lighting/thickness) modes.
-
-        Analytic for plain ellipsoids (cheapest); vectorised face-average
-        fallback for superquadrics / capsules.  Either way, far faster than
-        pyqtgraph recomputing them in a Python loop on each update.
-        """
-        bend = getattr(self, "_ell_sq_bend", None)
-        if (getattr(self, "_ell_sq_eps", None) is None
-                and getattr(self, "_ell_primitive", None) not in ("capsule",)
-                and (bend is None or not np.any(bend))
-                and self._ell_radii is not None
-                and self._ell_rotations is not None
-                and len(self._ell_radii) == len(self._ell_rotations)
-                and len(self._ell_radii) == len(self._ell_centers)):
-            return ellipsoid_vertex_normals(self._ell_radii, self._ell_rotations)
-        return _vertex_normals(verts, faces)
+        item = self._ell_item
+        if not isinstance(item, primitive_gpu.PrimitiveInstancesItem):
+            if item is not None:
+                self._view.removeItem(item)
+            item = primitive_gpu.PrimitiveInstancesItem(
+                _UNIT_VERTS, _UNIT_FACES, _UNIT_EDGES)
+            self._ell_item = item
+            self._view.addItem(item)
+        if mode == RENDER_WIREFRAME:
+            item.set_style(primitive_gpu.STYLE_WIRE)
+            item.setGLOptions(_gl_opts(RENDER_WIREFRAME))
+        else:
+            item.set_style(primitive_gpu.STYLE_LIT if mode == RENDER_LIGHTING
+                           else primitive_gpu.STYLE_UNLIT)
+            item.setGLOptions(_gl_opts(mode, cull=True))
+        item.set_instances(
+            instances, capsule=getattr(self, "_ell_primitive", None) == "capsule")
+        self._ell_item_mode = mode
+        item.setVisible(self._show_ellipsoids)
 
     # ── skeleton ────────────────────────────────────────────────────────
 
-    def show_bones(self, positions: np.ndarray, parent_indices: np.ndarray) -> None:
+    def connect_joint_rotation_controls(self, rotate, reset_joint, reset_pose, selected, limits_changed=None):
+        self._joint_overlay.rotationChanged.connect(rotate)
+        self._joint_overlay.resetJointRequested.connect(reset_joint)
+        self._joint_overlay.resetPoseRequested.connect(reset_pose)
+        self._joint_overlay.jointSelected.connect(selected)
+        if limits_changed is not None:
+            self._joint_overlay.limitsChanged.connect(limits_changed)
+
+    def select_joint(self, index: int) -> None:
+        if not 0 <= index < len(self._joint_overlay.positions):
+            return
+        self._overlay._checks["joints"].setChecked(True)
+        self._joint_overlay.set_enabled(True)
+        self._joint_overlay.select_joint(index)
+
+    def show_bones(self, positions: np.ndarray, parent_indices: np.ndarray, *,
+                   joint_rotations=None, joint_names=None, joint_dofs=None,
+                   rig_key=None, joint_angles=None, joint_edited=None) -> None:
         self._bone_positions = np.ascontiguousarray(positions, dtype=np.float32)
         self._bone_parents = parent_indices
-        self.clear_bones()
 
         line_pts = []
         for i, pi in enumerate(parent_indices):
-            if pi >= 0:
+            if 0 <= pi < len(positions):
                 line_pts.append(positions[pi])
                 line_pts.append(positions[i])
         if line_pts:
             pts = np.array(line_pts, dtype=np.float32)
-            self._bone_line_item = gl.GLLinePlotItem(
-                pos=pts, color=self.BONE_COLOR, width=3.0, mode='lines',
-                antialias=True, glOptions='translucent',
-            )
+            if self._bone_line_item is None:
+                self._bone_line_item = gl.GLLinePlotItem(
+                    pos=pts, color=self.BONE_COLOR, width=3.0, mode='lines',
+                    antialias=True, glOptions='translucent',
+                )
+                self._view.addItem(self._bone_line_item)
+            else:
+                self._bone_line_item.setData(pos=pts)
             self._bone_line_item.setVisible(self._show_skeleton)
-            self._view.addItem(self._bone_line_item)
+        elif self._bone_line_item is not None:
+            self._view.removeItem(self._bone_line_item)
+            self._bone_line_item = None
 
-        self._joint_item = gl.GLScatterPlotItem(
-            pos=positions, color=self.JOINT_COLOR, size=8.0, pxMode=True,
-            glOptions='translucent',
-        )
-        self._joint_item.setVisible(self._show_skeleton)
-        self._view.addItem(self._joint_item)
+        self._joint_overlay.set_joints(
+            positions, joint_rotations, joint_names, joint_dofs, rig_key,
+            angles=joint_angles, edited=joint_edited)
+        self._joint_overlay.set_enabled(self._show_joints)
 
         # A skeleton now exists → reveal its checkbox in the overlay.
-        self._overlay.set_skeleton_available(True)
+        self._overlay.set_skeleton_available(bool(len(positions)))
 
     def clear_bones(self) -> None:
-        for attr in ("_bone_line_item", "_joint_item"):
-            it = getattr(self, attr)
-            if it is not None:
-                self._view.removeItem(it)
-                setattr(self, attr, None)
+        if self._bone_line_item is not None:
+            self._view.removeItem(self._bone_line_item)
+            self._bone_line_item = None
+        self._joint_overlay.set_joints(np.empty((0, 3)))
 
     def remove_skeleton(self) -> None:
         """Drop the skeleton entirely and hide its overlay control.
@@ -2225,42 +2282,34 @@ class SceneViewer3D(_BaseViewer):
             self._analysis_item = None
 
     def _rebuild_analysis(self) -> None:
-        """Concatenate one transparent icosphere per analysed region into a
-        single GLMeshItem (one draw call), colour-coded per class."""
-        verts_list, faces_list, cols_list = [], [], []
-        offset = 0
+        """Draw one transparent sphere per analysed region (one instanced call),
+        colour-coded per class."""
+        centers, radii, colors = [], [], []
         for cls, items in self._analysis_regions.items():
             rgb = self._ANALYSIS_COLORS.get(cls)
             if rgb is None:
                 continue
             for center, radius in items:
-                r = max(float(radius), 1e-4)
-                v = (_UNIT_VERTS * r
-                     + np.asarray(center, dtype=np.float32)[None, :])
-                verts_list.append(v.astype(np.float32))
-                faces_list.append(_UNIT_FACES + offset)
-                cols_list.append(np.tile(
-                    np.array([*rgb, 0.22], dtype=np.float32),
-                    (_UNIT_N_VERTS, 1)))
-                offset += _UNIT_N_VERTS
+                centers.append(np.asarray(center, dtype=np.float32).reshape(3))
+                radii.append(max(float(radius), 1e-4))
+                colors.append((*rgb, 0.22))
 
-        if not verts_list:
+        if not centers:
             if self._analysis_item is not None:
                 self._analysis_item.setVisible(False)
             return
 
-        verts = np.concatenate(verts_list, axis=0).astype(np.float32)
-        faces = np.concatenate(faces_list, axis=0).astype(np.int32)
-        cols = np.concatenate(cols_list, axis=0).astype(np.float32)
+        n = len(centers)
+        instances = primitive_gpu.instance_data(
+            np.stack(centers), np.repeat(np.asarray(radii, np.float32)[:, None], 3, axis=1),
+            np.tile(np.array([0, 0, 0, 1], np.float32), (n, 1)),
+            np.asarray(colors, np.float32), default_color=ellipsoid_color())
         if self._analysis_item is None:
-            self._analysis_item = gl.GLMeshItem(
-                vertexes=verts, faces=faces, vertexColors=cols,
-                drawFaces=True, drawEdges=False, smooth=True)
+            self._analysis_item = primitive_gpu.PrimitiveInstancesItem(
+                _UNIT_VERTS, _UNIT_FACES, _UNIT_EDGES, style=primitive_gpu.STYLE_UNLIT)
             self._analysis_item.setGLOptions("translucent")
             self._view.addItem(self._analysis_item)
-        else:
-            self._analysis_item.setMeshData(
-                vertexes=verts, faces=faces, vertexColors=cols)
+        self._analysis_item.set_instances(instances)
         self._analysis_item.setVisible(self._show_analysis)
 
     # ── slice plane ─────────────────────────────────────────────────────

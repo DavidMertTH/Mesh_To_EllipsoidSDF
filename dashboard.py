@@ -86,6 +86,11 @@ class DashboardPanel(QtWidgets.QWidget):
 
     def record(self, step: int, loss: float, n_ellipsoids: int,
                radii: np.ndarray | None = None) -> None:
+        if self._steps and int(step) <= self._steps[-1]:
+            # A state re-emitted at an earlier step (the restored best
+            # checkpoint) is no new point in time; keep the graphs monotonic.
+            self._set("ellipsoids", str(int(n_ellipsoids)))
+            return
         now = time.monotonic()
         if self._t0 is None:                  # first real step → start the clock
             self._t0, self._step0 = now, int(step)

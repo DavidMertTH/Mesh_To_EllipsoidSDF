@@ -31,6 +31,7 @@ VIEWS = (
     ("mesh", "Mesh"),
     ("dashboard", "Dashboard"),
     ("runs", "Runs"),
+    ("morph_curves", "Morph Curves"),
     ("options", "Options"),
 )
 VIEW_TITLES = tuple(title for _key, title in VIEWS)

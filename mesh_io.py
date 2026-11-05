@@ -34,6 +34,22 @@ class NormalizationTransform:
     center: np.ndarray   # (3,) AABB midpoint of the original mesh
     scale: float         # multiply original → normalized
 
+    def to_normalized_point(self, p: np.ndarray) -> np.ndarray:
+        """Original-space points → the shared mesh/skeleton working space."""
+        return (np.asarray(p, dtype=np.float64) - self.center) * self.scale
+
+    def to_normalized_bone_matrix(self, matrix: np.ndarray) -> np.ndarray:
+        """Map a bone frame to working space, scaling its local units too.
+
+        Both world and bone-local lengths use the normalization scale. This
+        preserves the affine basis and maps the origin with the exact same
+        transform as mesh vertices. Consequently current @ inverse(bind)
+        deforms normalized rest vertices into normalized posed vertices.
+        """
+        result = np.asarray(matrix, dtype=np.float64).reshape(4, 4).copy()
+        result[:3, 3] = self.to_normalized_point(result[:3, 3])
+        return result
+
     def to_original_point(self, p: np.ndarray) -> np.ndarray:
         """Normalized-space point(s) → original mesh space."""
         return np.asarray(p, dtype=np.float64) / self.scale + self.center
@@ -193,13 +209,11 @@ def normalize_mesh_capture(
     """
     v = mesh.vertices
     center = (v.min(axis=0) + v.max(axis=0)) * 0.5
-    v = v - center
     extent = float(np.max(v.max(axis=0) - v.min(axis=0)))
     scale = (2.0 * target_scale / extent) if extent > 0 else 1.0
-    v = v * scale
-    mesh.vertices = v.astype(np.float32, copy=False)
     transform = NormalizationTransform(
         center=np.asarray(center, dtype=np.float64).copy(), scale=float(scale))
+    mesh.vertices = transform.to_normalized_point(v).astype(np.float32, copy=False)
     return mesh, transform
 
 

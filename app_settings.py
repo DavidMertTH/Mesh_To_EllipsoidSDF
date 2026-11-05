@@ -17,8 +17,8 @@ Each *field* is a tuple::
 
     (key, label, kind, minimum, maximum, step, decimals, default, tooltip)
 
-with ``kind`` ``"bool"`` (→ QCheckBox), ``"int"`` (→ QSpinBox), or
-``"float"`` (→ QDoubleSpinBox).
+with ``kind`` ``"bool"`` (→ QCheckBox), ``"int"`` (→ QSpinBox),
+``"float"`` (→ QDoubleSpinBox), or ``"color"`` (→ colour picker).
 """
 
 from __future__ import annotations
@@ -124,6 +124,32 @@ SETTINGS_SPEC = [
              "Maximum factor by which each radius may grow or shrink during\n"
              "one local fit (symmetric in log space)."),
         ]),
+        ("Detail zones (thin features)", [
+            ("detail_zones", "Detail zones", "bool", 0, 1, 1, 0, True,
+             "Fit regions thinner than the SDF grid can resolve (fingers, toes)\n"
+             "in their own finer grid, in parallel with the main fit. The main\n"
+             "fit leaves these regions out; their primitives come only from the\n"
+             "zone fits."),
+            ("detail_zone_threshold_vox", "Zone threshold (vox)", "float",
+             0.5, 4.0, 0.1, 1, 1.5,
+             "A region becomes a detail zone where the local feature diameter\n"
+             "is below this many global SDF voxels."),
+            ("detail_zone_budget", "Zone budget weight", "float",
+             0.0, 4.0, 0.1, 2, 1.0,
+             "Share of the primitive budget for the zones. Every region gets\n"
+             "primitives in proportion to area / diameter^1.25; this weight\n"
+             "scales the zones' share."),
+            ("detail_zone_voxels_per_feature", "Zone voxels per feature", "float",
+             2.0, 24.0, 1.0, 1, 8.0,
+             "Zone grid resolution: a zone's median feature diameter spans this\n"
+             "many voxels (at least the global grid n)."),
+            ("detail_zone_max_grid", "Zone max grid n", "int", 64, 512, 16, 0, 320,
+             "Upper bound for a zone's grid resolution."),
+            ("detail_zone_processes", "Fit zones in parallel processes", "bool",
+             0, 1, 1, 0, True,
+             "Run every zone in its own process at the same time as the main\n"
+             "fit. Off: zones are fitted one after another after the main fit."),
+        ]),
         ("Final result", [
             ("use_best_validation_result", "Use best validation result", "bool",
              0, 1, 1, 0, True,
@@ -134,19 +160,51 @@ SETTINGS_SPEC = [
     ]),
 
     ("Pose refit", [
+        ("Live preview and size changes", [
+            ("pose_fit_live_preview", "Live pose-fitting preview", "bool",
+             0, 1, 1, 0, True,
+             "Show intermediate ellipsoids during pose fitting, including Unity\n"
+             "pose batches. Disable for faster batch processing."),
+            ("pose_fit_color_changes", "Color size changes", "bool",
+             0, 1, 1, 0, True,
+             "Color ellipsoids by their volume change relative to the base\n"
+             "configuration, during fitting and when viewing fitted poses."),
+            ("pose_fit_size_tolerance_pct", "Neutral volume tolerance (%)", "float",
+             0.0, 100.0, 0.1, 1, 1.0,
+             "Volume changes within this percentage of the base volume stay\n"
+             "neutral. Position and rotation changes do not affect the color."),
+            ("pose_fit_color_span_pct", "Color transition span (%)", "float",
+             0.1, 1000.0, 1.0, 1, 25.0,
+             "Outside the neutral tolerance, blend toward the growing/shrinking\n"
+             "color over this additional percentage of base volume change.\n"
+             "Larger values produce a more gradual color transition."),
+            ("pose_fit_growth_color", "Growing", "color",
+             0, 0, 0, 0, "#ef7d32", "Larger volume than the base configuration."),
+            ("pose_fit_shrink_color", "Shrinking", "color",
+             0, 0, 0, 0, "#398de3", "Smaller volume than the base configuration."),
+            ("pose_fit_neutral_color", "Unchanged", "color",
+             0, 0, 0, 0, "#a0a7b4", "Within the neutral volume tolerance."),
+        ]),
         ("Allowed changes after the base fit", [
             ("pose_fit_position", "Refit position", "bool", 0, 1, 1, 0, True,
-             "Allow primitive positions to be refined during /fit-pose.\n"
+             "Allow primitive positions to be refined during native pose fitting\n"
+             "and /fit-pose.\n"
              "With bone-local fitting, locked primitives still follow their\n"
              "bones. The initial base fit is unaffected."),
             ("pose_fit_rotation", "Refit rotation", "bool", 0, 1, 1, 0, True,
-             "Allow primitive rotations to be refined during /fit-pose.\n"
+             "Allow primitive rotations to be refined during native pose fitting\n"
+             "and /fit-pose.\n"
              "With bone-local fitting, locked primitives still rotate with\n"
              "their bones. The initial base fit is unaffected."),
             ("pose_fit_scale", "Refit scale", "bool", 0, 1, 1, 0, True,
              "Allow primitive radii (scale) to change during subsequent\n"
-             "/fit-pose operations. Superquadric shape exponents and bend\n"
+             "native pose fitting and /fit-pose operations. Shape exponents and bend\n"
              "remain controlled separately; the base fit is unaffected."),
+            ("pose_fit_exponents", "Refit exponents", "bool", 0, 1, 1, 0, True,
+             "Allow superquadric shape exponents to be refined during native\n"
+             "pose fitting and /fit-pose. Disable to keep each primitive's\n"
+             "fitted base exponents. This is independent of scale; the initial\n"
+             "base fit and the shape panel's exponent mode are unaffected."),
         ]),
     ]),
 

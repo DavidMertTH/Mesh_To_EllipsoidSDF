@@ -114,7 +114,6 @@ class ApiBatchThroughputTests(unittest.TestCase):
             _last_mesh_result=object(),
             _mesh_rot_center=None,
             _mesh_rotation=None,
-            _pending_rot_mesh=object(),
         )
         vertices = np.array(
             [[-2.0, 0.0, 1.0], [4.0, 2.0, -1.0]], dtype=np.float64)
@@ -126,7 +125,6 @@ class ApiBatchThroughputTests(unittest.TestCase):
         self.assertEqual(owner._base_verts.dtype, np.float32)
         np.testing.assert_allclose(owner._mesh_rot_center, [1.0, 1.0, 0.0])
         self.assertIsNone(owner._last_mesh_result)
-        self.assertIsNone(owner._pending_rot_mesh)
 
     def test_pose_mesh_reuses_only_identical_oriented_topology(self) -> None:
         owner = SimpleNamespace()

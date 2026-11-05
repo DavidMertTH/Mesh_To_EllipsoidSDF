@@ -2490,6 +2490,7 @@ class OptimizationWorker(QtCore.QThread):
         optimize_centers: bool = True,
         optimize_rotations: bool = True,
         optimize_radii: bool = True,
+        optimize_shape_exponents: bool = True,
         center_step_radius_frac: float = 0.5,
         center_step_min_vox: float = 0.25,
         center_step_max_vox: float = 4.0,
@@ -2547,6 +2548,10 @@ class OptimizationWorker(QtCore.QThread):
         parameter_neighbor_rotation_regularization: float = 0.0,
         parameter_center_trust_radius_factor: float = 0.0,
         parameter_radii_trust_factor: float = 0.0,
+        parameter_bound_centers: np.ndarray | None = None,
+        parameter_bound_radii: np.ndarray | None = None,
+        parameter_bound_center_radius_factor: float = 0.0,
+        parameter_bound_radii_factor: float = 0.0,
         emit_intermediate_progress: bool = True,
         parent: QtCore.QObject | None = None,
         thin_surface_fraction: float | None = None,
@@ -2666,6 +2671,20 @@ class OptimizationWorker(QtCore.QThread):
         radius_trust = max(0.0, float(parameter_radii_trust_factor))
         self._parameter_log_radius_limit = (
             float(np.log(max(radius_trust, 1.0))) if radius_trust > 1.0 else 0.0)
+        # Optional outer trust region, e.g. around a base fit while the anchor
+        # follows a chain of earlier fits: it keeps accumulated drift bounded.
+        self._parameter_bound = None
+        if parameter_bound_centers is not None or parameter_bound_radii is not None:
+            self._parameter_bound = _optional_parameter_set(
+                parameter_bound_centers, parameter_bound_radii,
+                np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+                        (int(self._num_ellipsoids), 1)),
+                "parameter bound")
+        self._parameter_bound_center_radius_factor = max(
+            0.0, float(parameter_bound_center_radius_factor))
+        bound_radius = max(0.0, float(parameter_bound_radii_factor))
+        self._parameter_bound_log_radius_limit = (
+            float(np.log(bound_radius)) if bound_radius > 1.0 else 0.0)
         self.optimized_parameter_result: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 
         self._maintenance_every = maintenance_every
@@ -2968,6 +2987,8 @@ class OptimizationWorker(QtCore.QThread):
             raise ValueError(
                 "sq_eps_mode must be 'fixed', 'shared' or 'per_primitive'")
         self._sq_eps_mode = mode
+        if not optimize_shape_exponents:
+            self._sq_eps_mode = "fixed"
         self._sq_unlock_frac = float(np.clip(sq_unlock_frac, 0.0, 1.0))
         self._sq_bend_unlock_frac = float(
             np.clip(sq_bend_unlock_frac, 0.0, 1.0))
@@ -2989,6 +3010,9 @@ class OptimizationWorker(QtCore.QThread):
         # ``source`` after every step.  These counts track the partition.
         self._sym_n_op = 0            # number of on-plane (trainable) ellipsoids
         self._sym_n_so = 0            # number of source off-plane ellipsoids
+        self._last_local_fit_changed_mask = None
+        self._last_local_fit_pre_centers = None
+        self._last_local_fit_origin_rows = None
         # Thin-feature loss weighting (built lazily on the device once).
         self._wp_thickness = None
         self._thick_ref = 1.0
@@ -4000,7 +4024,7 @@ class OptimizationWorker(QtCore.QThread):
         radii,
         num_e: int,
     ) -> None:
-        if self._superquadric:
+        if self._superquadric and self._sq_eps_mode != "fixed":
             wp.launch(
                 _decode_eps_parameter,
                 dim=2 * int(num_e),
@@ -4085,7 +4109,9 @@ class OptimizationWorker(QtCore.QThread):
 
     def _build_symmetric_layout(self, centers: np.ndarray, radii: np.ndarray,
                                 rotations: np.ndarray, eps: np.ndarray | None = None,
-                                bend: np.ndarray | None = None):
+                                bend: np.ndarray | None = None,
+                                source_sign: float | None = None,
+                                priority_source_rows: np.ndarray | None = None):
         """Re-order an ellipsoid set into the hard-mirror training layout.
 
         Output order is ``[on_plane | source | mirror]`` where:
@@ -4116,17 +4142,23 @@ class OptimizationWorker(QtCore.QThread):
 
         # Source half = the better-fitting side (resolved identically by
         # ``_symmetry_source_side`` so the local fit can pick the same half).
-        src_mask = pos if self._symmetry_source_side(c) >= 0.0 else neg
+        if source_sign is None:
+            source_sign = self._symmetry_source_side(c)
+        src_mask = pos if source_sign >= 0.0 else neg
 
         op_idx = np.where(on_plane)[0]
         so_idx = np.where(src_mask)[0]
         requested_count = int(op_idx.size + 2 * so_idx.size)
         max_count = max(1, int(self._max_ellipsoids))
         if requested_count > max_count:
-            # Preserve the stable prefix.  Densify/local-fit children are
-            # appended, so trimming the tail rejects only growth that did not
-            # fit into the user-visible global budget.  Source entries consume
-            # two slots because each requires a mirrored partner.
+            if priority_source_rows is not None and len(so_idx):
+                priority = np.zeros(len(c), dtype=bool)
+                priority[np.asarray(priority_source_rows, dtype=np.int64)] = True
+                so_idx = np.concatenate([so_idx[priority[so_idx]],
+                                         so_idx[~priority[so_idx]]])
+            # Normally preserve the stable prefix. Local edits take priority
+            # only when the population cap would otherwise drop their pair.
+            # Source entries consume two slots because each needs a mirror.
             if op_idx.size >= max_count:
                 op_idx = op_idx[:max_count]
                 so_idx = so_idx[:0]
@@ -4188,6 +4220,92 @@ class OptimizationWorker(QtCore.QThread):
         if return_bend:
             return out_c, out_r, out_q, out_e, out_b
         return out_c, out_r, out_q, out_e
+
+    def _carry_local_edits_to_mirror_source(
+            self, centers, radii, rotations, eps, bend, row_lineage,
+            changed_rows, old_partition, pre_local_centers=None,
+            origin_rows=None):
+        """Keep accepted Local Mode edits when the other side wins Mirror Mode.
+
+        The usual residual comparison still chooses the source half. Only an
+        ellipsoid changed by Local Mode may replace its counterpart on that
+        half; all other source ellipsoids keep the usual selection.
+        """
+        c, r, q, e, b = centers, radii, rotations, eps, bend
+        lineage = np.asarray(row_lineage, dtype=np.int64)
+        changed = np.asarray(changed_rows, dtype=bool)
+        source_sign = self._symmetry_source_side(c)
+        axis, plane = int(self._sym_axis), float(self._sym_plane)
+        signed = c[:, axis] - plane
+        off_plane = np.abs(signed) >= 1.5 * float(self._dx)
+        source = off_plane & ((signed >= 0.0) == (source_sign >= 0.0))
+        source_rows = np.flatnonzero(source)
+        priority: list[int] = []
+        claimed: set[int] = set()
+        old_on, old_source = (int(old_partition[0]), int(old_partition[1]))
+        pre = (None if pre_local_centers is None else
+               np.asarray(pre_local_centers, dtype=np.float32))
+        origins = (None if origin_rows is None else
+                   np.asarray(origin_rows, dtype=np.int64))
+
+        for edited in np.flatnonzero(changed & off_plane):
+            edited = int(edited)
+            if source[edited]:
+                priority.append(edited)
+                continue
+
+            reference = c[edited].copy()
+            origin = -1 if origins is None else int(origins[edited])
+            if pre is not None and 0 <= origin < len(pre):
+                reference = pre[origin].copy()
+            reference[axis] = 2.0 * plane - reference[axis]
+
+            old_row = int(lineage[edited])
+            partner = -1
+            if old_source > 0:
+                if old_on <= old_row < old_on + old_source:
+                    partner = old_row + old_source
+                elif old_on + old_source <= old_row < old_on + 2 * old_source:
+                    partner = old_row - old_source
+            candidates = [int(j) for j in source_rows
+                          if int(j) not in claimed and
+                          partner >= 0 and int(lineage[j]) == partner]
+            if not candidates and pre is not None and origins is not None:
+                # Newly spawned pairs have no old population lineage. Match
+                # their pre-local centres, before the local solve moved one.
+                tolerance = max(0.5 * float(self._dx), 1.0e-6)
+                candidates = [int(j) for j in source_rows
+                              if int(j) not in claimed
+                              and 0 <= int(origins[j]) < len(pre)
+                              and np.linalg.norm(
+                                  pre[int(origins[j])] - reference) <= tolerance]
+
+            if candidates:
+                target = min(candidates,
+                             key=lambda j: float(np.linalg.norm(c[j] - reference)))
+                claimed.add(target)
+            else:
+                # A local split can create an ellipsoid without a surviving
+                # source counterpart. Give it a source row so its pair exists.
+                target = len(c)
+                c = np.concatenate([c, c[edited:edited + 1]], axis=0)
+                r = np.concatenate([r, r[edited:edited + 1]], axis=0)
+                q = np.concatenate([q, q[edited:edited + 1]], axis=0)
+                e = np.concatenate([e, e[edited:edited + 1]], axis=0)
+                b = np.concatenate([b, b[edited:edited + 1]], axis=0)
+                lineage = np.append(lineage, partner)
+            c[target] = c[edited]
+            c[target, axis] = 2.0 * plane - c[edited, axis]
+            r[target] = r[edited]
+            q[target] = _mirror_quats(q[edited:edited + 1], axis)[0]
+            e[target] = e[edited]
+            b[target] = b[edited]
+            if axis in (0, 1):
+                b[target, axis] *= -1.0
+            priority.append(target)
+
+        return c, r, q, e, b, lineage, source_sign, np.asarray(
+            priority, dtype=np.int64)
 
     def _project_symmetry_inplace(self, pred_centers, pred_radii,
                                   pred_rot_flat, pred_eps=None,
@@ -4376,6 +4494,42 @@ class OptimizationWorker(QtCore.QThread):
                 ))
         return float(self._normal_loss_weight) * float(dx) * ramp
 
+    def _fill_report_loss(
+        self,
+        report_loss,
+        loss,
+        *,
+        normal_weight: float,
+        dx: float,
+        pred_normals,
+        target_normals,
+        sdf_target,
+        indices,
+        batch_size: int,
+    ) -> None:
+        """Copy ``loss`` into ``report_loss`` with the normal term at full weight.
+
+        The warm-up/ramp of the normal term only shapes the gradient.  Reporting
+        the ramped training loss made the live curve climb while the ramp ran
+        although the fit kept improving, so the reported value always uses the
+        final objective (the one the hold-out validation measures).  Call it
+        before ``tape.backward`` with ``pred_normals`` evaluated for this batch.
+        """
+        wp.copy(report_loss, loss)
+        missing = float(self._normal_loss_weight) * float(dx) - float(normal_weight)
+        if missing <= 0.0 or target_normals is None:
+            return
+        wp.launch(
+            _normal_loss_kernel_batch,
+            dim=batch_size,
+            inputs=[
+                pred_normals, target_normals, sdf_target, indices,
+                report_loss, batch_size, float(missing),
+                float(self._normal_band_vox) * float(dx),
+            ],
+            device=device,
+        )
+
     def _normal_shape_kind(self) -> int:
         if self._isotropic:
             return 1
@@ -4403,6 +4557,7 @@ class OptimizationWorker(QtCore.QThread):
         nx: int | None = None,
         ny: int | None = None,
         nz: int | None = None,
+        record_tape: bool = True,
     ) -> None:
         if points is not None:
             wp.launch(
@@ -4414,6 +4569,7 @@ class OptimizationWorker(QtCore.QThread):
                     self._normal_shape_kind(), points, indices, pred_normals,
                 ],
                 device=device,
+                record_tape=record_tape,
             )
             return
         wp.launch(
@@ -4426,6 +4582,7 @@ class OptimizationWorker(QtCore.QThread):
                 int(nx), int(ny), int(nz), indices, pred_normals,
             ],
             device=device,
+            record_tape=record_tape,
         )
 
     def _alloc_buffers(
@@ -8685,6 +8842,9 @@ class OptimizationWorker(QtCore.QThread):
         n_before = len(centers)
         lineage = np.arange(n_before, dtype=np.int64)
         self._last_population_lineage = None
+        self._last_local_fit_changed_mask = None
+        self._last_local_fit_pre_centers = None
+        self._last_local_fit_origin_rows = None
 
         # Operation gizmo events for the 3-D viewport: each is
         # ``(op, center_world, radius_world)`` recorded at the spot the move
@@ -9030,8 +9190,15 @@ class OptimizationWorker(QtCore.QThread):
         # step.  New densify children, when local fit is NOT due, are simply left
         # for the global optimiser to refine.
         did_local = False
+        pre_local_state = None
+        local_map = None
         if local_active:
             self._last_local_fit_step = step
+            if (region_sites and self._symmetry_enabled
+                    and self._sym_axis is not None):
+                pre_local_state = tuple(np.asarray(values, np.float32).copy()
+                                        for values in (centers, radii, rotations,
+                                                       eps, bend))
             if region_sites and self._sdf_computer is not None \
                     and self._sdf_computer.is_ready:
                 # Re-fit every ellipsoid centred in each region against a fresh
@@ -9081,8 +9248,27 @@ class OptimizationWorker(QtCore.QThread):
                     centers, radii, rotations, offset, union_pool, step,
                     eps=eps, bend=bend,
                 )
+                local_map = np.arange(len(centers), dtype=np.int64)
                 self.phase_changed.emit("global")
                 did_local = True
+
+        if did_local and pre_local_state is not None:
+            local_map = np.asarray(local_map, dtype=np.int64)
+            if len(local_map) != len(centers):
+                local_map = np.full(len(centers), -1, dtype=np.int64)
+            current_state = (centers, radii, rotations, eps, bend)
+            changed = np.ones(len(centers), dtype=bool)
+            valid = ((local_map >= 0)
+                     & (local_map < len(pre_local_state[0])))
+            for before, after in zip(pre_local_state, current_state):
+                before_rows = before[local_map[valid]]
+                after_rows = np.asarray(after, np.float32)[valid]
+                changed[valid] &= np.isclose(
+                    before_rows, after_rows, rtol=1.0e-6,
+                    atol=1.0e-7).all(axis=1)
+            self._last_local_fit_changed_mask = ~changed
+            self._last_local_fit_pre_centers = pre_local_state[0]
+            self._last_local_fit_origin_rows = local_map
 
         if ops:
             self.op_events.emit(step, ops)
@@ -9270,6 +9456,7 @@ class OptimizationWorker(QtCore.QThread):
         )
         wp_origin = wp.vec3(float(origin[0]), float(origin[1]), float(origin[2]))
         lr = 0.01
+        report_loss = wp.zeros(1, dtype=wp.float32, device=device)
 
         for step in range(self._num_steps):
             if self._stop_flag:
@@ -9311,6 +9498,7 @@ class OptimizationWorker(QtCore.QThread):
 
             wp_indices.assign(sampler.next_batch())
             normal_weight = self._normal_weight_at(step, dx=float(dx))
+            report_due = (step % self._report_every == 0)
 
             tape = wp.Tape()
             with tape:
@@ -9357,7 +9545,10 @@ class OptimizationWorker(QtCore.QThread):
                                 wp_indices, sdf_pred],
                         device=device,
                     )
-                if normal_weight > 0.0:
+                # Reported steps also need the normals while their weight is
+                # still warming up (see _fill_report_loss).
+                if normal_weight > 0.0 or (
+                        report_due and wp_target_normals is not None):
                     self._launch_predicted_normals(
                         centers=pred_centers,
                         radii=pred_radii,
@@ -9370,6 +9561,8 @@ class OptimizationWorker(QtCore.QThread):
                         indices=wp_indices,
                         origin=wp_origin,
                         dx=float(dx), nx=nx, ny=ny, nz=nz,
+                        # Warm-up report steps: display only, keep off the tape.
+                        record_tape=normal_weight > 0.0,
                     )
                 loss.zero_()
                 wp.launch(
@@ -9404,6 +9597,12 @@ class OptimizationWorker(QtCore.QThread):
                         device=device,
                     )
 
+            if report_due:
+                self._fill_report_loss(
+                    report_loss, loss, normal_weight=normal_weight,
+                    dx=float(dx), pred_normals=pred_normals,
+                    target_normals=wp_target_normals, sdf_target=sdf_target,
+                    indices=wp_indices, batch_size=bs)
             tape.backward(loss)
 
             if self._optimize_centers:
@@ -9457,11 +9656,11 @@ class OptimizationWorker(QtCore.QThread):
 
             tape.zero()
 
-            if step % self._report_every == 0:
+            if report_due:
                 self._decode_shape_parameters(
                     pred_eps_raw, pred_eps, pred_bend_raw, pred_bend,
                     pred_radii, num_e)
-                self._emit_progress(step, loss, pred_centers, pred_radii,
+                self._emit_progress(step, report_loss, pred_centers, pred_radii,
                                     pred_rot_flat, num_e, origin, dx, n,
                                     pred_eps=pred_eps if self._superquadric else None,
                                     pred_bend=pred_bend if self._bent else None)
@@ -9632,6 +9831,7 @@ class OptimizationWorker(QtCore.QThread):
 
         parameter_anchor_wp = _upload_parameter_anchor(self._parameter_anchor)
         parameter_neighbor_wp = _upload_parameter_anchor(self._parameter_neighbor)
+        parameter_bound_wp = _upload_parameter_anchor(self._parameter_bound)
         # Second scan buffer for the soft-min (LogSumExp) union.
         soft_s_cache = wp.zeros(
             (bs, num_e + 1), dtype=wp.float32, device=device, requires_grad=True)
@@ -9695,6 +9895,7 @@ class OptimizationWorker(QtCore.QThread):
         last_discontinuity_step = -10**9
         wp_origin = wp.vec3(float(origin[0]), float(origin[1]), float(origin[2]))
         lr = self._lr_init
+        report_loss = wp.zeros(1, dtype=wp.float32, device=device)
 
         # Generous parameter bounds (safety net for superquadric / bent fits):
         # radii ∈ [0.25·dx, grid extent], centres within the (slightly padded) grid.
@@ -9899,6 +10100,8 @@ class OptimizationWorker(QtCore.QThread):
             # there whenever either is enabled (local fit can run with
             # densification off).  Plain maintenance only when neither is on.
             self._last_population_lineage = None
+            self._last_local_fit_changed_mask = None
+            old_sym_partition = (int(self._sym_n_op), int(self._sym_n_so))
             if self._parameterized:
                 result = None
             elif self._superfit or self._local_fit_enabled:
@@ -9934,6 +10137,20 @@ class OptimizationWorker(QtCore.QThread):
                 row_lineage = np.asarray(row_lineage, dtype=np.int64).reshape(-1)
                 if len(row_lineage) != len(c_np):
                     row_lineage = np.full(len(c_np), -1, dtype=np.int64)
+                local_changed = getattr(
+                    self, "_last_local_fit_changed_mask", None)
+                local_changed = (np.asarray(local_changed, dtype=bool).reshape(-1)
+                                 if local_changed is not None else
+                                 np.zeros(len(c_np), dtype=bool))
+                if len(local_changed) != len(c_np):
+                    local_changed = np.zeros(len(c_np), dtype=bool)
+                local_origins = getattr(
+                    self, "_last_local_fit_origin_rows", None)
+                if local_origins is not None:
+                    local_origins = np.asarray(
+                        local_origins, dtype=np.int64).reshape(-1)
+                    if len(local_origins) != len(c_np):
+                        local_origins = None
                 # Sanitise BEFORE the maintained set re-enters global Adam.
                 # A non-finite survivor is restored from its lineage row; a
                 # non-finite genuinely new row is dropped.  Mapping NaN centres
@@ -9962,16 +10179,22 @@ class OptimizationWorker(QtCore.QThread):
                         eps_np[bad_row] = old_eps_np[source]
                         bend_np[bad_row] = old_bend_np[source]
                         bad_rows[bad_row] = False
+                        local_changed[bad_row] = False
                 if np.any(bad_rows):
                     keep = ~bad_rows
                     c_np, r_np, q_np = c_np[keep], r_np[keep], q_np[keep]
                     eps_np, bend_np = eps_np[keep], bend_np[keep]
                     row_lineage = row_lineage[keep]
+                    local_changed = local_changed[keep]
+                    if local_origins is not None:
+                        local_origins = local_origins[keep]
                 if len(c_np) == 0:
                     c_np, r_np, q_np = (
                         old_c_np.copy(), old_r_np.copy(), old_q_np.copy())
                     eps_np, bend_np = old_eps_np.copy(), old_bend_np.copy()
                     row_lineage = np.arange(old_num_e, dtype=np.int64)
+                    local_changed = np.zeros(old_num_e, dtype=bool)
+                    local_origins = None
 
                 c_np = np.clip(c_np, _c_lo_np, _c_hi_np).astype(np.float32)
                 r_np = np.clip(r_np, _r_min, _r_max).astype(np.float32)
@@ -9994,8 +10217,20 @@ class OptimizationWorker(QtCore.QThread):
                 # Maintenance edits the full set (both halves); re-impose the
                 # hard-mirror layout so only the source half stays trainable.
                 if self._symmetry_enabled and self._sym_axis is not None:
+                    source_sign = None
+                    priority_rows = None
+                    if np.any(local_changed):
+                        (c_np, r_np, q_np, eps_np, bend_np, row_lineage,
+                         source_sign, priority_rows) = \
+                            self._carry_local_edits_to_mirror_source(
+                                c_np, r_np, q_np, eps_np, bend_np,
+                                row_lineage, local_changed, old_sym_partition,
+                                getattr(self, "_last_local_fit_pre_centers", None),
+                                local_origins)
                     c_np, r_np, q_np, eps_np, bend_np = self._build_symmetric_layout(
-                        c_np, r_np, q_np, eps_np, bend_np)
+                        c_np, r_np, q_np, eps_np, bend_np,
+                        source_sign=source_sign,
+                        priority_source_rows=priority_rows)
                     symmetry_map = np.asarray(
                         getattr(self, "_last_symmetry_lineage",
                                 np.arange(len(c_np))),
@@ -10073,6 +10308,13 @@ class OptimizationWorker(QtCore.QThread):
 
             wp_indices.assign(sampler.next_batch())
             normal_weight = self._normal_weight_at(step, dx=float(dx))
+            report_due = (step % self._report_every == 0)
+            validation_due = (
+                step % self._validation_every == 0
+                or step == self._num_steps - 1)
+            # Also covers the steps a run can end on (last step, patience stop)
+            # so the final frame reports the same objective as the curve.
+            report_loss_due = report_due or validation_due
 
             tape = wp.Tape()
             with tape:
@@ -10234,7 +10476,10 @@ class OptimizationWorker(QtCore.QThread):
                                     nx, ny, nz, wp_indices, sdf_pred],
                             device=device,
                         )
-                if normal_weight > 0.0:
+                # Reported steps also need the normals while their weight is
+                # still warming up (see _fill_report_loss).
+                if normal_weight > 0.0 or (
+                        report_loss_due and wp_target_normals is not None):
                     self._launch_predicted_normals(
                         centers=fit_centers,
                         radii=pred_radii,
@@ -10249,6 +10494,8 @@ class OptimizationWorker(QtCore.QThread):
                                 if use_sample_targets else None),
                         origin=wp_origin,
                         dx=float(dx), nx=nx, ny=ny, nz=nz,
+                        # Warm-up report steps: display only, keep off the tape.
+                        record_tape=normal_weight > 0.0,
                     )
                 loss.zero_()
                 wp.launch(
@@ -10349,6 +10596,12 @@ class OptimizationWorker(QtCore.QThread):
                         device=device,
                     )
 
+            if report_loss_due:
+                self._fill_report_loss(
+                    report_loss, loss, normal_weight=normal_weight,
+                    dx=float(dx), pred_normals=pred_normals,
+                    target_normals=wp_target_normals, sdf_target=sdf_target,
+                    indices=wp_indices, batch_size=bs)
             tape.backward(loss)
             # Per-group learning rates (centres / log-radii / rotation).
             opt_c.lr = lr * self._lr_mult_centers
@@ -10403,6 +10656,24 @@ class OptimizationWorker(QtCore.QThread):
                     ],
                     device=device,
                 )
+            bound_center = (self._parameter_bound_center_radius_factor
+                            if self._optimize_centers else 0.0)
+            bound_radius = (self._parameter_bound_log_radius_limit
+                            if self._optimize_radii else 0.0)
+            if parameter_bound_wp is not None and (
+                    bound_center > 0.0 or bound_radius > 0.0):
+                wp.launch(
+                    _project_parameter_trust_region_kernel,
+                    dim=num_e,
+                    inputs=[
+                        pred_centers, pred_log_radii,
+                        parameter_bound_wp[0], parameter_bound_wp[1],
+                        parameter_bound_wp[3],
+                        float(bound_center),
+                        float(bound_radius),
+                    ],
+                    device=device,
+                )
 
             # Re-normalise the trained quaternions back to unit length.  The
             # batch SDF kernel normalises internally so the fit is unaffected,
@@ -10450,10 +10721,6 @@ class OptimizationWorker(QtCore.QThread):
                     wp.launch(_clamp_centers_range, dim=num_e,
                               inputs=[pred_centers, _c_lo, _c_hi, 0], device=device)
 
-            report_due = (step % self._report_every == 0)
-            validation_due = (
-                step % self._validation_every == 0
-                or step == self._num_steps - 1)
             if report_due or validation_due:
                 # Refresh all derived world parameters once for reporting and
                 # deterministic hold-out evaluation.
@@ -10476,7 +10743,7 @@ class OptimizationWorker(QtCore.QThread):
             if report_due:
                 if self._emit_intermediate_progress:
                     self._emit_progress(
-                        step, loss, fit_centers, pred_radii,
+                        step, report_loss, fit_centers, pred_radii,
                         fit_rot_flat, num_e, origin, dx, n,
                         pred_eps=(pred_eps
                                   if self._superquadric else None),
@@ -10484,7 +10751,7 @@ class OptimizationWorker(QtCore.QThread):
                     )
 
                 wp.synchronize_device(device)
-                loss_val = float(loss.numpy()[0])
+                loss_val = float(report_loss.numpy()[0])
                 self.step_status.emit(int(step), loss_val)
                 if loss_val < 1e-10:
                     break
@@ -10550,7 +10817,7 @@ class OptimizationWorker(QtCore.QThread):
                 pred_radii, num_e)
             _refresh_parameter_world()
             self._emit_progress(
-                final_step, loss, fit_centers, pred_radii, fit_rot_flat,
+                final_step, report_loss, fit_centers, pred_radii, fit_rot_flat,
                 num_e, origin, dx, n,
                 pred_eps=pred_eps if self._superquadric else None,
                 pred_bend=pred_bend if self._bent else None)

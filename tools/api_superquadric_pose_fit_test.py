@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -82,6 +83,7 @@ class ApiSuperquadricPoseFitTest(unittest.TestCase):
             "optimize_centers": True,
             "optimize_rotations": True,
             "optimize_radii": True,
+            "optimize_shape_exponents": True,
         })
         resolved = MainWindow._api_pose_fit_transform_flags(
             {
@@ -95,6 +97,7 @@ class ApiSuperquadricPoseFitTest(unittest.TestCase):
             "optimize_centers": False,
             "optimize_rotations": True,
             "optimize_radii": False,
+            "optimize_shape_exponents": True,
         })
         self.assertEqual(MainWindow._optimizer_settings({
             "pose_fit_position": False,
@@ -313,7 +316,11 @@ class ApiSuperquadricPoseFitTest(unittest.TestCase):
             _api_initial_ellipsoids=(centers, radii, rotations, eps),
             _api_existing_local_parameterization=lambda: None,
             _api_batch_pipeline=False,
+            _api_fit_existing=True,
             _api_primitive_type="superquadric",
+            _viewer=mock.Mock(),
+            _shapes_by_id={},
+            _shape=mock.Mock(),
             _settings={
                 "pose_fit_position": False,
                 "pose_fit_rotation": True,
@@ -334,6 +341,8 @@ class ApiSuperquadricPoseFitTest(unittest.TestCase):
             "optimize_centers": False,
             "optimize_rotations": True,
             "optimize_radii": False,
+            "emit_intermediate_progress": True,
+            "optimize_shape_exponents": True,
         })
         np.testing.assert_allclose(calls[0]["initial_eps"], eps)
         np.testing.assert_allclose(owner._api_last[3], eps)

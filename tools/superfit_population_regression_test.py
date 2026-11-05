@@ -21,7 +21,8 @@ from ellipsoid import best_device  # noqa: E402
 from mesh_io import load_and_prepare  # noqa: E402
 from optimization import OptimizationWorker  # noqa: E402
 from sdf_compute import SdfComputer  # noqa: E402
-from viewer3d import SceneViewer3D, build_concatenated_mesh  # noqa: E402
+import primitive_gpu  # noqa: E402
+from viewer3d import _UNIT_VERTS, SceneViewer3D, build_concatenated_mesh  # noqa: E402
 
 
 def _union_sdf(
@@ -168,10 +169,14 @@ def test_viewer_legacy_population_mismatch() -> None:
     assert len(viewer._ell_centers) == count
     assert len(viewer._ell_radii) == count
     assert len(viewer._ell_rotations) == count
-    normals = viewer._smooth_vertex_normals(verts, faces)
+    instances = primitive_gpu.instance_data(
+        viewer._ell_centers, viewer._ell_radii, viewer._ell_rotations, None,
+        default_color=np.ones(4, np.float32))
+    points, normals = primitive_gpu.surface_reference(_UNIT_VERTS, instances)
 
-    assert normals.shape == verts.shape
-    assert np.isfinite(normals).all()
+    assert points.shape == (count, len(_UNIT_VERTS), 3)
+    assert np.isfinite(points).all() and np.isfinite(normals).all()
+    assert len(verts) == count * len(_UNIT_VERTS)
     print("legacy viewer population mismatch: recovered")
 
 
